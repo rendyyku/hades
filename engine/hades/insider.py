@@ -13,7 +13,8 @@ Tags wallets that are likely insiders of a token:
 Every tag carries evidence with non-empty, equal-length ``signatures`` and
 ``slots`` lists; :func:`persist_tags` refuses anything else. Funding hops are
 backed by ``Wallet.funding_signature``/``funding_slot`` so evidence survives
-across processes. Nothing in this module commits except :func:`tag_token`.
+across processes. Nothing in this module commits except :func:`tag_token`, which returns
+only the tags actually persisted.
 """
 
 from __future__ import annotations
@@ -33,6 +34,8 @@ HUB_SIG_THRESHOLD = 3000
 REPEAT_EARLY_TOP_N = 50
 REPEAT_EARLY_MIN_RUNNERS = 3
 SNIPER_MAX_SLOTS = 2
+# per-token tags owned (and recomputed) by tag_token
+TOKEN_TAGS = ("sniper", "bundle", "deployer_link")
 BUNDLE_MIN_WALLETS = 3
 
 log = logging.getLogger(__name__)
@@ -323,12 +326,12 @@ def _valid_evidence(ev: dict) -> bool:
     )
 
 
-def persist_tags(session: Session, tags: Iterable[Tag]) -> int:
+def persist_tags_accepted(session: Session, tags: Iterable[Tag]) -> list[Tag]:
     """Replace WalletTag rows keyed by (address, tag, mint). Never commits.
 
     Refuses (skips with a warning, leaving any existing row untouched) a tag
     whose evidence ``signatures`` is missing/empty, contains an empty string, or
-    differs in length from ``slots``. Returns the number of rows inserted.
+    differs in length from ``slots``. Returns the tags actually written.
     """
     accepted: list[Tag] = []
     for t in tags:
@@ -337,21 +340,42 @@ def persist_tags(session: Session, tags: Iterable[Tag]) -> int:
         else:
             log.warning("refusing %s tag for %s (mint %s): bad evidence %r",
                         t.tag, t.address, t.mint, t.evidence)
-    tags = accepted
-    keys = {(t.address, t.tag, t.mint) for t in tags}
+    keys = {(t.address, t.tag, t.mint) for t in accepted}
     for address, tag, mint in keys:
         mint_cond = WalletTag.mint.is_(None) if mint is None else WalletTag.mint == mint
         session.execute(
             delete(WalletTag).where(WalletTag.address == address, WalletTag.tag == tag, mint_cond)
         )
-    for t in tags:
+    for t in accepted:
         _wallet(session, t.address)
         session.add(WalletTag(address=t.address, tag=t.tag, mint=t.mint, evidence_json=dict(t.evidence)))
     session.flush()
-    return len(tags)
+    return accepted
+
+
+def persist_tags(session: Session, tags: Iterable[Tag]) -> int:
+    """:func:`persist_tags_accepted`, returning the number of rows inserted."""
+    return len(persist_tags_accepted(session, tags))
+
+
+def replace_repeat_early(session: Session) -> list[Tag]:
+    """Recompute repeat_early globally (R20b). Never commits.
+
+    Deletes ALL existing ``repeat_early`` rows first so wallets that no longer
+    qualify lose the tag, then persists :func:`tag_repeat_early`. Returns the
+    persisted tags.
+    """
+    tags = tag_repeat_early(session)
+    session.execute(delete(WalletTag).where(WalletTag.tag == "repeat_early"))
+    return persist_tags_accepted(session, tags)
 
 
 async def tag_token(session: Session, helius: Any, token: Token) -> list[Tag]:
+    """Detect sniper/bundle/deployer_link tags for ``token``, persist, commit.
+
+    Stored per-token tags no longer detected are deleted (R20a); a refused new
+    tag leaves its old row in place. Returns only the persisted tags.
+    """
     swaps = session.scalars(
         select(Swap)
         .where(Swap.mint == token.mint, Swap.side == "buy")
@@ -376,6 +400,16 @@ async def tag_token(session: Session, helius: Any, token: Token) -> list[Tag]:
 
     tags += detect_bundles(token, swaps, funders, hubs, funding)
     tags += await detect_deployer_link(session, helius, token, buyers, hubs, swaps=swaps)
-    persist_tags(session, tags)
+
+    # R20a: drop stored per-token tags the new run no longer produces. A key whose
+    # new version is refused keeps its old (valid) row: no evidence is lost.
+    current = {(t.address, t.tag) for t in tags}
+    for row in session.scalars(
+        select(WalletTag).where(WalletTag.mint == token.mint, WalletTag.tag.in_(TOKEN_TAGS))
+    ).all():
+        if (row.address, row.tag) not in current:
+            session.delete(row)
+    session.flush()
+    accepted = persist_tags_accepted(session, tags)
     session.commit()
-    return tags
+    return accepted

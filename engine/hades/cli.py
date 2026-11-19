@@ -1,4 +1,4 @@
-"""HADES command line: `hades init-db | seed | discover | backfill | rescore | serve`."""
+"""HADES command line: `hades init-db | seed | discover | backfill | tag | rescore | serve`."""
 
 from __future__ import annotations
 
@@ -8,12 +8,13 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Optional
 
 import typer
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from hades import pipeline
 from hades.config import Settings, get_settings
-from hades.db import Swap, Token, WalletStats, init_db, make_engine
+from hades.db import Swap, Token, Wallet, WalletStats, init_db, make_engine
+from hades.insider import TOKEN_TAGS, Tag, tag_token
 from hades.sources.dexscreener import DexScreener
 from hades.sources.helius import HeliusClient, HeliusError
 
@@ -56,9 +57,31 @@ def _session(settings: Settings) -> Session:
 
 
 def _swap_count(session: Session) -> int:
-    from sqlalchemy import func
-
     return session.scalar(select(func.count()).select_from(Swap)) or 0
+
+
+def _hub_count(session: Session) -> int:
+    return session.scalar(select(func.count()).select_from(Wallet).where(Wallet.label == "hub")) or 0
+
+
+async def _tag(session: Session, helius: Any, tok: Token) -> tuple[list[Tag], int] | None:
+    """Run tag_token; on HeliusError roll back, log the error type, return None."""
+    mint = tok.mint
+    try:
+        tags = await tag_token(session, helius, tok)
+    except HeliusError as e:  # never log the message (may carry a URL/key)
+        session.rollback()
+        log.error("tagging %s failed: %s", mint, type(e).__name__)
+        return None
+    return tags, _hub_count(session)
+
+
+def _echo_tags(result: tuple[list[Tag], int]) -> None:
+    tags, hubs = result
+    counts = {k: 0 for k in TOKEN_TAGS}
+    for t in tags:
+        counts[t.tag] = counts.get(t.tag, 0) + 1
+    typer.echo("tags: " + "  ".join(f"{k}={v}" for k, v in counts.items()) + f"  (hubs labelled: {hubs})")
 
 
 # -- commands ------------------------------------------------------------------
@@ -125,7 +148,7 @@ def backfill(
         raise typer.BadParameter("pass exactly one of --wallet or --token")
     settings = get_settings()
 
-    async def run() -> tuple[int, int, int, int, int]:
+    async def run() -> tuple[int, int, int, int, int, tuple[list[Tag], int] | None]:
         async with _closing(make_helius(settings)) as helius:
             with _session(settings) as session:
                 if wallet is not None:
@@ -151,10 +174,42 @@ def backfill(
                         session.rollback()
                         failed += 1
                         log.warning("backfill %s failed: %s", addr, type(e).__name__)
-                return n_buyers, len(addresses), saved, failed, _swap_count(session)
+                total = _swap_count(session)
+                tagged = None
+                if token is not None:
+                    tagged = await _tag(session, helius, tok)
+                return n_buyers, len(addresses), saved, failed, total, tagged
 
-    n_buyers, n_wallets, saved, failed, total = asyncio.run(run())
+    n_buyers, n_wallets, saved, failed, total, tagged = asyncio.run(run())
     typer.echo(f"wallets: {n_wallets}  swaps saved: {saved}  failed: {failed}  swaps in db: {total}")
+    if token is not None:
+        if tagged is None:
+            typer.echo("insider tagging failed (see log)", err=True)
+            raise typer.Exit(1)
+        _echo_tags(tagged)
+
+
+@app.command()
+def tag(mint: str) -> None:
+    """Tag insiders (sniper, bundle, deployer_link) of an already-seeded token."""
+    settings = get_settings()
+
+    async def run() -> tuple[list[Tag], int] | None | bool:
+        async with _closing(make_helius(settings)) as helius:
+            with _session(settings) as session:
+                tok = session.get(Token, mint)
+                if tok is None:
+                    return False
+                return await _tag(session, helius, tok)
+
+    res = asyncio.run(run())
+    if res is False:
+        typer.echo(f"error: token {mint} not seeded; run `hades seed {mint}`", err=True)
+        raise typer.Exit(1)
+    if res is None:
+        typer.echo("insider tagging failed (see log)", err=True)
+        raise typer.Exit(1)
+    _echo_tags(res)
 
 
 @app.command()

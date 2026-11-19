@@ -9,7 +9,7 @@ from typer.testing import CliRunner
 
 from hades import cli
 from hades.config import get_settings
-from hades.db import Swap, Token, init_db, make_engine
+from hades.db import Swap, Token, WalletTag, init_db, make_engine
 from hades.sources.helius import HeliusError
 
 runner = CliRunner()
@@ -50,6 +50,9 @@ class FakeHelius:
             raise HeliusError("down")
         return [buy_tx("w1", 50, address)]
 
+    async def first_incoming_sol(self, address, max_pages=5):
+        return None  # no funder known: no bundle / deployer_link
+
     async def aclose(self):
         FakeHelius.closed = True
 
@@ -79,7 +82,7 @@ def use_db(tmp_path, monkeypatch):
 
 def test_help_lists_commands():
     out = runner.invoke(cli.app, ["--help"]).output
-    for cmd in ("init-db", "seed", "discover", "backfill", "rescore", "serve"):
+    for cmd in ("init-db", "seed", "discover", "backfill", "rescore", "tag", "serve"):
         assert cmd in out
 
 
@@ -180,3 +183,87 @@ def test_backfill_continues_on_generic_error_and_rolls_back(tmp_path, monkeypatc
     with Session(eng) as s:
         sigs = {(x.signature, x.wallet) for x in s.scalars(select(Swap))}
     assert ("w1", "WalletB") in sigs
+
+
+# -- insider tagging (Task 7b) -------------------------------------------------
+
+
+def seed_tagged_token(url, pool_created_slot=10, swaps=True):
+    eng = make_engine(url)
+    init_db(eng)
+    with Session(eng) as s:
+        s.add(Token(mint=MINT, pool_address=POOL, pool_created_slot=pool_created_slot,
+                    pool_created_at=datetime.now(timezone.utc)))
+        if swaps:
+            for sig, slot, w in [("p1", 10, "WalletA"), ("p2", 11, "WalletB"), ("p3", 20, "WalletC")]:
+                s.add(Swap(signature=sig, wallet=w, mint=MINT, slot=slot, side="buy",
+                           block_time=datetime.now(timezone.utc), token_amount=10.0, sol_amount=1.0,
+                           source="backfill"))
+        s.commit()
+    return eng
+
+
+def _tags(eng):
+    with Session(eng) as s:
+        return {(t.address, t.tag, t.mint) for t in s.scalars(select(WalletTag))}
+
+
+def test_cli_tag_command_prints_counts(tmp_path, monkeypatch):
+    url = use_db(tmp_path, monkeypatch)
+    eng = seed_tagged_token(url)
+    FakeHelius.closed = False
+
+    res = runner.invoke(cli.app, ["tag", MINT])
+
+    assert res.exit_code == 0, res.output
+    assert "sniper=2" in res.output and "bundle=0" in res.output and "deployer_link=0" in res.output
+    assert _tags(eng) == {("WalletA", "sniper", MINT), ("WalletB", "sniper", MINT)}
+    assert FakeHelius.closed
+
+
+def test_cli_tag_unknown_mint_exit1(tmp_path, monkeypatch):
+    url = use_db(tmp_path, monkeypatch)
+    init_db(make_engine(url))
+    res = runner.invoke(cli.app, ["tag", "NoSuchMint"])
+    assert res.exit_code == 1
+    assert "NoSuchMint" in res.output and "not seeded" in res.output
+
+
+def test_cli_tag_helius_error_exit1_rollback(tmp_path, monkeypatch, caplog):
+    url = use_db(tmp_path, monkeypatch)
+    eng = seed_tagged_token(url)
+
+    class DownHelius(FakeHelius):
+        async def first_incoming_sol(self, address, max_pages=5):
+            raise HeliusError("down https://x/?api-key=SECRETKEY")
+
+    monkeypatch.setattr(cli, "make_helius", lambda s: DownHelius())
+    rollbacks = []
+    orig_rollback = Session.rollback
+
+    def spy_rollback(self):
+        rollbacks.append(True)
+        return orig_rollback(self)
+
+    monkeypatch.setattr(Session, "rollback", spy_rollback)
+    with caplog.at_level("WARNING", logger="hades.cli"):
+        res = runner.invoke(cli.app, ["tag", MINT])
+
+    assert res.exit_code == 1
+    assert rollbacks
+    msgs = [r.getMessage() for r in caplog.records if r.name == "hades.cli"]
+    assert any("HeliusError" in m for m in msgs)
+    assert "SECRETKEY" not in res.output and not any("SECRETKEY" in m for m in msgs)
+    assert _tags(eng) == set()
+
+
+def test_backfill_token_runs_tagging(tmp_path, monkeypatch):
+    url = use_db(tmp_path, monkeypatch)
+    eng = seed_tagged_token(url, swaps=False)
+
+    res = runner.invoke(cli.app, ["backfill", "--token", MINT])
+
+    assert res.exit_code == 0, res.output
+    assert "early buyers: 2" in res.output
+    assert "sniper=2" in res.output
+    assert _tags(eng) == {("WalletA", "sniper", MINT), ("WalletB", "sniper", MINT)}

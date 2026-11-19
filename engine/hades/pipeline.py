@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from hades.config import Settings, get_settings
 from hades.db import Swap, Token, Wallet
 from hades.ingest.parse import ParsedSwap, parse_swaps
+from hades.insider import replace_repeat_early
 from hades.pnl import compute_positions
 from hades.scoring import persist_stats, score_wallets, wallet_stats
 from hades.sources.dexscreener import _num, base_address, best_pair, is_runner, sol_price_native
@@ -251,7 +252,10 @@ async def discover(
 
 
 async def rescore(session: Session, dex: Any, now: datetime | None = None) -> int:
-    """Recompute and persist stats + scores for every wallet with swaps."""
+    """Recompute and persist stats + scores for every wallet with swaps.
+
+    Also recomputes the global ``repeat_early`` tags (stale ones are removed).
+    """
     now = _now(now)
     start = now - timedelta(days=WINDOW_DAYS)
     wallets = session.scalars(select(Swap.wallet).distinct().order_by(Swap.wallet)).all()
@@ -283,5 +287,6 @@ async def rescore(session: Session, dex: Any, now: datetime | None = None) -> in
             log.warning("skipping wallet %s: %s", w, e)
     scored = score_wallets(stats)
     persist_stats(session, scored)
+    replace_repeat_early(session)
     session.commit()
     return len(scored)

@@ -7,7 +7,7 @@ from sqlalchemy import func, select
 
 from hades import pipeline
 from hades.config import Settings
-from hades.db import Swap, Token, Wallet, WalletStats
+from hades.db import Swap, Token, Wallet, WalletStats, WalletTag
 from hades.sources.helius import HeliusError, HeliusRateLimited
 
 NOW = datetime(2026, 11, 19, 12, 0, tzinfo=timezone.utc)
@@ -429,3 +429,25 @@ async def test_early_buyers_saves_only_selected_buyers_swaps(session):
     assert buyers == ["WalletA", "WalletB"]
     saved = {(s.signature, s.wallet) for s in session.scalars(select(Swap))}
     assert saved == {("s01", "WalletA"), ("s03", "WalletB"), ("s04", "WalletA")}
+
+
+async def test_rescore_replaces_repeat_early(session):
+    # R20b: repeat_early is recomputed globally; stale rows disappear, other tags stay.
+    t0 = NOW - timedelta(days=1)
+    for i, m in enumerate(["R1", "R2", "R3"]):
+        session.add(Token(mint=m, is_runner=True))
+        add_swap(session, f"rep-{m}", "Rep", m, "buy", 100, 1.0, t0)
+    session.add(Wallet(address="Old"))
+    session.add(WalletTag(address="Old", tag="repeat_early", mint=None,
+                          evidence_json={"signatures": ["o"], "slots": [1]}))
+    session.add(WalletTag(address="Old", tag="sniper", mint="R1",
+                          evidence_json={"signatures": ["o2"], "slots": [2]}))
+    session.commit()
+
+    await pipeline.rescore(session, FakeDex(), now=NOW)
+    await pipeline.rescore(session, FakeDex(), now=NOW)  # idempotent
+
+    session.expire_all()
+    rows = {(r.address, r.tag, r.mint): r.evidence_json for r in session.scalars(select(WalletTag))}
+    assert set(rows) == {("Rep", "repeat_early", None), ("Old", "sniper", "R1")}
+    assert rows[("Rep", "repeat_early", None)]["mints"] == ["R1", "R2", "R3"]

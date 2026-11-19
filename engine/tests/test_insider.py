@@ -466,3 +466,69 @@ async def test_tag_token_rerun_with_fresh_client_keeps_evidence(session):
     assert second[("B1", "bundle", MINT)]["signatures"] == ["b1", "f1"]
     # every funded hop came from the DB: no re-fetch of known funders
     assert not set(fresh.fund_calls) & set(funders)
+
+
+# -- stale tags & persisted-only return (Task 7b, R20a / W4) -------------------
+
+
+def _store(session, address, tag, mint, sigs, slots):
+    session.add(Wallet(address=address)) if session.get(Wallet, address) is None else None
+    session.add(WalletTag(address=address, tag=tag, mint=mint,
+                          evidence_json={"signatures": sigs, "slots": slots}))
+
+
+async def test_tag_token_removes_stale_tags(session):
+    tok = token()
+    session.add(tok)
+    session.add(buy("s1", "S1", 1001))
+    _store(session, "Stale", "sniper", MINT, ["old1"], [1000])
+    _store(session, "Stale", "bundle", MINT, ["old2", "old3"], [1010, 900])
+    _store(session, "Stale", "deployer_link", MINT, ["old4"], [800])
+    _store(session, "Stale", "sniper", "OtherMint", ["x1"], [5])  # other token: kept
+    _store(session, "Stale", "repeat_early", None, ["r1"], [7])  # global tag: kept
+    _store(session, "Stale", "bot", MINT, ["b1"], [7])  # not a per-token insider tag: kept
+    session.commit()
+
+    tags = await tag_token(session, FakeHelius(), tok)
+
+    assert [(t.address, t.tag) for t in tags] == [("S1", "sniper")]
+    assert set(_persisted(session)) == {
+        ("S1", "sniper", MINT),
+        ("Stale", "sniper", "OtherMint"),
+        ("Stale", "repeat_early", None),
+        ("Stale", "bot", MINT),
+    }
+
+
+async def test_tag_token_keeps_old_row_when_new_refused(session, monkeypatch):
+    tok = token()
+    session.add(tok)
+    session.add(buy("s1", "S1", 1001))
+    _store(session, "S1", "sniper", MINT, ["good-old"], [1001])
+    session.commit()
+    monkeypatch.setattr(
+        insider, "detect_snipers",
+        lambda token, swaps: [Tag("S1", "sniper", MINT, {"signatures": [], "slots": []})],
+    )
+
+    tags = await tag_token(session, FakeHelius(), tok)
+
+    assert tags == []
+    assert _persisted(session) == {
+        ("S1", "sniper", MINT): {"signatures": ["good-old"], "slots": [1001]},
+    }
+
+
+async def test_tag_token_returns_only_persisted(session, monkeypatch):
+    tok = token()
+    session.add(tok)
+    session.add(buy("s1", "S1", 1001))
+    session.commit()
+    good = Tag("S1", "sniper", MINT, {"signatures": ["s1"], "slots": [1001], "delta_slots": 1})
+    bad = Tag("S2", "sniper", MINT, {"signatures": ["s2"], "slots": []})
+    monkeypatch.setattr(insider, "detect_snipers", lambda token, swaps: [good, bad])
+
+    tags = await tag_token(session, FakeHelius(), tok)
+
+    assert tags == [good]
+    assert set(_persisted(session)) == {("S1", "sniper", MINT)}
