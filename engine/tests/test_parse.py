@@ -140,6 +140,84 @@ def test_parse_usdc_quote_with_token_account_rent_is_not_sol_quoted():
     assert swaps[0].sol_amount is None
 
 
+@pytest.mark.parametrize(
+    ("fixture", "dex", "token_amount"),
+    [
+        ("real_pumpamm_rent_only_receipt", "PUMP_AMM", 83.449808),
+        ("real_ata_rent_only_receipt", "ASSOCIATED_TOKEN_PROGRAM", 53.434838),
+    ],
+)
+def test_real_rent_only_receipt_is_not_sol_quoted(fixture, dex, token_amount):
+    # R12, real data: the wallet receives tokens and only pays ~0.0015 SOL of
+    # ATA rent. That is a receipt (transfer/airdrop/LP), not a purchase.
+    swaps = parse_swaps(load(fixture))
+    assert len(swaps) == 1
+    s = swaps[0]
+    assert s.side == "buy"
+    assert s.dex == dex
+    assert s.token_amount == pytest.approx(token_amount, abs=1e-6)
+    assert s.sol_amount is None
+
+
+def _simple_buy_with_sol(lamports: int) -> dict:
+    tx = copy.deepcopy(load("helius_swap_simple"))
+    tx["nativeTransfers"][0]["amount"] = lamports
+    tx["accountData"][0]["nativeBalanceChange"] = -lamports - int(tx["fee"])
+    tx["accountData"][1]["nativeBalanceChange"] = lamports
+    return tx
+
+
+def test_rent_only_threshold_boundary():
+    from hades.ingest.parse import RENT_ONLY_MAX_SOL
+
+    assert RENT_ONLY_MAX_SOL == 0.0025
+    below = parse_swaps(_simple_buy_with_sol(2_499_999))[0]
+    at = parse_swaps(_simple_buy_with_sol(2_500_000))[0]
+    assert below.sol_amount is None
+    assert at.sol_amount == pytest.approx(0.0025, abs=1e-12)
+
+
+def test_small_sell_is_not_rent_filtered():
+    # R12 applies to buys only: a tiny SOL-in sell stays SOL-quoted.
+    tx = copy.deepcopy(load("helius_swap_simple"))
+    tt = tx["tokenTransfers"][0]
+    tt["fromUserAccount"], tt["toUserAccount"] = tt["toUserAccount"], tt["fromUserAccount"]
+    nt = tx["nativeTransfers"][0]
+    nt["fromUserAccount"], nt["toUserAccount"] = nt["toUserAccount"], nt["fromUserAccount"]
+    nt["amount"] = 1_000_000
+    tx["accountData"][0]["nativeBalanceChange"] = 1_000_000 - 5000
+    tx["accountData"][1]["nativeBalanceChange"] = -1_000_000
+    s = parse_swaps(tx)[0]
+    assert s.side == "sell"
+    assert s.sol_amount == pytest.approx(0.001, abs=1e-12)
+
+
+def test_buy_with_sol_inflow_is_not_sol_quoted():
+    # R14: LP-withdraw-like tx: the wallet gains tokens AND SOL. A buy must
+    # spend SOL, so this is not a SOL-quoted buy.
+    tx = copy.deepcopy(load("helius_swap_simple"))
+    nt = tx["nativeTransfers"][0]
+    nt["fromUserAccount"], nt["toUserAccount"] = nt["toUserAccount"], nt["fromUserAccount"]
+    tx["accountData"][0]["nativeBalanceChange"] = 1_500_000_000 - 5000
+    tx["accountData"][1]["nativeBalanceChange"] = -1_500_000_000
+    swaps = parse_swaps(tx)
+    assert len(swaps) == 1
+    assert swaps[0].side == "buy"
+    assert swaps[0].sol_amount is None
+
+
+def test_sell_with_sol_outflow_is_not_sol_quoted():
+    # R14: LP-deposit-like tx: the wallet sends tokens AND SOL out. A sell
+    # must receive SOL, so this is not a SOL-quoted sell.
+    tx = copy.deepcopy(load("helius_swap_simple"))
+    tt = tx["tokenTransfers"][0]
+    tt["fromUserAccount"], tt["toUserAccount"] = tt["toUserAccount"], tt["fromUserAccount"]
+    swaps = parse_swaps(tx)  # SOL still flows wallet -> pool (1.5 SOL out)
+    assert len(swaps) == 1
+    assert swaps[0].side == "sell"
+    assert swaps[0].sol_amount is None
+
+
 def test_parse_multi_token_legs_have_no_sol_amount():
     # Real-data case: one tx buys two different tokens for 1.5 SOL. The SOL
     # cannot be attributed per leg, so neither leg may feed SOL PnL.

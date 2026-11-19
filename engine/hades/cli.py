@@ -147,6 +147,10 @@ def backfill(
                     except HeliusError as e:
                         failed += 1
                         log.warning("backfill %s failed: %s", addr, e)
+                    except Exception as e:  # keep going; never log the message (may carry a URL/key)
+                        session.rollback()
+                        failed += 1
+                        log.warning("backfill %s failed: %s", addr, type(e).__name__)
                 return n_buyers, len(addresses), saved, failed, _swap_count(session)
 
     n_buyers, n_wallets, saved, failed, total = asyncio.run(run())

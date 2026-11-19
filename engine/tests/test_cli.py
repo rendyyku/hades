@@ -138,3 +138,45 @@ def test_seed_prints_summary(tmp_path, monkeypatch):
     res = runner.invoke(cli.app, ["seed", MINT])
     assert res.exit_code == 0, res.output
     assert f"seeded MEME {MINT}: pool={POOL}" in res.output
+
+
+def test_backfill_continues_on_generic_error_and_rolls_back(tmp_path, monkeypatch, caplog):
+    # Finding 6: any per-wallet exception is caught, the session rolled back,
+    # `wallet + error type` logged, and the loop continues.
+    url = use_db(tmp_path, monkeypatch)
+    eng = make_engine(url)
+    init_db(eng)
+    with Session(eng) as s:
+        s.add(Token(mint=MINT, pool_address=POOL, pool_created_at=datetime.now(timezone.utc)))
+        s.commit()
+
+    from hades import pipeline
+
+    real = pipeline.backfill_wallet
+    rollbacks = []
+    orig_rollback = Session.rollback
+
+    def spy_rollback(self):
+        rollbacks.append(True)
+        return orig_rollback(self)
+
+    async def flaky(session, helius, address, settings, force=False, now=None):
+        if address == "WalletA":
+            raise RuntimeError("secret-ish detail")
+        return await real(session, helius, address, settings, force=force, now=now)
+
+    monkeypatch.setattr(pipeline, "backfill_wallet", flaky)
+    monkeypatch.setattr(Session, "rollback", spy_rollback)
+
+    with caplog.at_level("WARNING", logger="hades.cli"):
+        res = runner.invoke(cli.app, ["backfill", "--token", MINT])
+
+    assert res.exit_code == 0, res.output
+    assert "failed: 1" in res.output
+    assert rollbacks
+    msgs = [r.getMessage() for r in caplog.records if r.name == "hades.cli"]
+    assert any("WalletA" in m and "RuntimeError" in m for m in msgs)
+    assert not any("secret-ish detail" in m for m in msgs)
+    with Session(eng) as s:
+        sigs = {(x.signature, x.wallet) for x in s.scalars(select(Swap))}
+    assert ("w1", "WalletB") in sigs

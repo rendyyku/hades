@@ -251,3 +251,20 @@ async def test_price_native_ignores_non_sol_quoted_pairs():
     async with make_client() as dex:
         assert await dex.price_native(MEME) == pytest.approx(0.02)
         assert await dex.price_native("Y") is None
+
+
+def test_sol_price_requires_min_liquidity():
+    # R13: a WSOL-quoted price is only trusted when the best pair has
+    # liquidity.usd >= MIN_PRICE_LIQUIDITY_USD; illiquid pairs give None.
+    from hades.sources.dexscreener import MIN_PRICE_LIQUIDITY_USD, sol_price_native
+
+    wsol = "So11111111111111111111111111111111111111112"
+
+    def p(liq):
+        return {"baseToken": {"address": MEME}, "quoteToken": {"address": wsol},
+                "liquidity": {"usd": liq}, "priceNative": "0.02"}
+
+    assert MIN_PRICE_LIQUIDITY_USD == 10_000
+    assert sol_price_native([p(10_000)], MEME) == pytest.approx(0.02)
+    assert sol_price_native([p(9_999)], MEME) is None
+    assert sol_price_native([{**p(None), "liquidity": None}], MEME) is None

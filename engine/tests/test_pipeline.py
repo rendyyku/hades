@@ -396,3 +396,36 @@ async def test_rescore_prices_only_from_sol_quoted_pairs(session):
 
     a = session.get(WalletStats, "WalletA")
     assert a.unrealized_pnl_sol == pytest.approx(100 * 0.02 - 1.0)  # MintZ has no SOL price -> 0
+
+
+async def test_rescore_ignores_price_from_illiquid_pair(session):
+    # R13: an open position marked at an illiquid pair's price must not
+    # create unrealized PnL (real data: +434 SOL phantom from such pairs).
+    t0 = NOW - timedelta(days=1)
+    add_swap(session, "a1", "WalletA", "MintY", "buy", 100, 1.0, t0)
+    session.commit()
+    dex = FakeDex(pairs=[pair(mint="MintY", address="PY", liq=9_999, price="50.0")])
+
+    await pipeline.rescore(session, dex, now=NOW)
+
+    assert session.get(WalletStats, "WalletA").unrealized_pnl_sol == pytest.approx(0.0)
+
+
+async def test_early_buyers_saves_only_selected_buyers_swaps(session):
+    # R15: swaps of wallets that are not among the selected early buyers
+    # (sellers, buyers past n) are not saved; their histories would be partial.
+    tok = make_token(session)
+    txs = [
+        swap_tx("s01", 101, "WalletA"),
+        swap_tx("s02", 102, "WalletS", side="sell"),  # seller, never a buyer
+        swap_tx("s03", 103, "WalletB"),
+        swap_tx("s04", 104, "WalletA", side="sell"),  # selected buyer's later sell
+        swap_tx("s05", 105, "WalletLate"),  # buyer past n
+    ]
+    helius = FakeHelius(sigs={POOL: [t["signature"] for t in txs]}, txs={t["signature"]: t for t in txs})
+
+    buyers = await pipeline.early_buyers(session, helius, tok, 2, sig_max_pages=1)
+
+    assert buyers == ["WalletA", "WalletB"]
+    saved = {(s.signature, s.wallet) for s in session.scalars(select(Swap))}
+    assert saved == {("s01", "WalletA"), ("s03", "WalletB"), ("s04", "WalletA")}

@@ -25,6 +25,7 @@ RUNNER_MIN_LIQ_USD = 30_000
 RUNNER_MIN_H24_PCT = 300
 RUNNER_MIN_FDV = 1_000_000
 RUNNER_MAX_AGE_DAYS = 7
+MIN_PRICE_LIQUIDITY_USD = 10_000  # R13: below this a pair's price is not used for valuation
 
 SleepFn = Callable[[float], Awaitable[Any]]
 
@@ -65,13 +66,17 @@ def sol_price_native(pairs: Iterable[dict], mint: str) -> float | None:
 
     priceNative is expressed in quote-token units, so pairs quoted in anything
     other than WSOL (USDC, other memecoins) are not SOL prices and are ignored.
+    R13: the price is only trusted when that pair has liquidity.usd >=
+    MIN_PRICE_LIQUIDITY_USD; an illiquid pair's price can be anything.
     """
     sol_pairs = [
         p for p in pairs
         if isinstance(p, dict) and base_address(p) == mint and _sub(p, "quoteToken").get("address") == WSOL
     ]
     best = best_pair(sol_pairs)
-    return None if best is None else _num(best.get("priceNative"))
+    if best is None or liquidity_usd(best) < MIN_PRICE_LIQUIDITY_USD:
+        return None
+    return _num(best.get("priceNative"))
 
 
 def best_pair(pairs: Iterable[dict]) -> dict | None:

@@ -133,8 +133,12 @@ async def early_buyers(
     """First n unique buy wallets of token's pool, ordered by (slot, signature).
 
     Parses the pool's signatures oldest-first in chunks of 100 and stops once
-    n buyers are found. Every SOL-quoted swap of the token seen on the way is
-    saved (source='backfill').
+    n buyers are found. Only the SOL-quoted swaps of the token made by the
+    selected buyers are saved (source='backfill', R15); other wallets seen in
+    the pool are not saved, since their histories would be partial.
+
+    Multi-leg buys (one tx buying several tokens) have sol_amount=None and so
+    never make a wallet an early buyer (deferred minor 7).
     """
     if not token.pool_address:
         raise ValueError(f"token {token.mint} has no pool_address; seed it first")
@@ -144,18 +148,22 @@ async def early_buyers(
 
     buyers: list[str] = []
     seen: set[str] = set()
+    pool_swaps: list[ParsedSwap] = []
     for i in range(0, len(sigs), PARSE_CHUNK):
         if len(buyers) >= n:
             break
         txs = await helius.parse_transactions(sigs[i : i + PARSE_CHUNK])
         swaps = [s for s in _parse_all(txs) if s.mint == token.mint and s.sol_amount is not None]
         swaps.sort(key=lambda s: (s.slot, s.signature))
+        pool_swaps.extend(swaps)
         for s in swaps:
-            session.merge(_to_swap(s))
             if s.side == "buy" and s.wallet not in seen and len(buyers) < n:
                 seen.add(s.wallet)
                 buyers.append(s.wallet)
 
+    for s in pool_swaps:
+        if s.wallet in seen:
+            session.merge(_to_swap(s))
     for w in buyers:
         _ensure_wallet(session, w)
     session.commit()

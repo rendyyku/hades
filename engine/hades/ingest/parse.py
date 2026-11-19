@@ -15,6 +15,7 @@ LAMPORTS_PER_SOL = 1_000_000_000
 EPS_SOL = 1e-6
 EPS_TOKEN = 1e-12
 RENT_SIZED_SOL = 0.01  # below this, SOL movement next to a stable leg is rent/fees
+RENT_ONLY_MAX_SOL = 0.0025  # R12: a buy spending less than this is a rent-only token receipt
 
 
 @dataclass(frozen=True)
@@ -109,6 +110,7 @@ def parse_swaps(tx: dict[str, Any]) -> list[ParsedSwap]:
 
     sol_net = _wallet_sol_net(tx, wallet)
     sol_amount: float | None = abs(sol_net)
+    is_buy = next(iter(legs.values())) > 0  # only meaningful for a single leg
     if len(legs) > 1:
         # Several tokens moved in one tx (route/bundle): the SOL cannot be
         # attributed per leg, so no leg may feed SOL PnL.
@@ -116,6 +118,15 @@ def parse_swaps(tx: dict[str, Any]) -> list[ParsedSwap]:
     elif abs(sol_net) < EPS_SOL:
         # No SOL moved: stable-quoted or token-to-token swap. Not SOL-quoted,
         # so it must not feed SOL PnL.
+        sol_amount = None
+    elif (sol_net > 0) == is_buy:
+        # R14: a buy must spend SOL (sol_net < 0) and a sell must receive SOL
+        # (sol_net > 0). Tokens and SOL moving the same way (LP withdraw or
+        # deposit, receipts) is not a SOL-quoted trade.
+        sol_amount = None
+    elif is_buy and abs(sol_net) < RENT_ONLY_MAX_SOL:
+        # R12: tokens received for only ATA rent (~0.0015-0.002 SOL) is a
+        # receipt (transfer/airdrop/LP), not a purchase. Sells are unaffected.
         sol_amount = None
     elif _moves_for_wallet(tx, wallet, STABLES) and (
         not _moves_for_wallet(tx, wallet, frozenset({WSOL})) or abs(sol_net) < RENT_SIZED_SOL
