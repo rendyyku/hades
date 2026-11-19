@@ -138,3 +138,15 @@ def test_parse_usdc_quote_with_token_account_rent_is_not_sol_quoted():
     assert len(swaps) == 1
     assert swaps[0].side == "buy"
     assert swaps[0].sol_amount is None
+
+
+def test_parse_multi_token_legs_have_no_sol_amount():
+    # Real-data case: one tx buys two different tokens for 1.5 SOL. The SOL
+    # cannot be attributed per leg, so neither leg may feed SOL PnL.
+    tx = copy.deepcopy(load("helius_swap_simple"))
+    tx["tokenTransfers"].append(
+        {"fromUserAccount": "PooLOther", "toUserAccount": WALLET, "tokenAmount": 42.0, "mint": "OtherMint111"}
+    )
+    swaps = parse_swaps(tx)
+    assert {s.mint for s in swaps} == {MEME, "OtherMint111"}
+    assert all(s.sol_amount is None for s in swaps)

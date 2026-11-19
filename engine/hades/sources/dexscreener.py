@@ -11,6 +11,7 @@ from typing import Any
 
 import httpx
 
+from hades.ingest.parse import WSOL
 from hades.sources.helius import TokenBucket
 
 log = logging.getLogger(__name__)
@@ -57,6 +58,20 @@ def liquidity_usd(pair: dict) -> float:
 def base_address(pair: dict) -> str | None:
     addr = _sub(pair, "baseToken").get("address")
     return addr if isinstance(addr, str) else None
+
+
+def sol_price_native(pairs: Iterable[dict], mint: str) -> float | None:
+    """priceNative (SOL per token) of the most liquid WSOL-quoted pair with base `mint`.
+
+    priceNative is expressed in quote-token units, so pairs quoted in anything
+    other than WSOL (USDC, other memecoins) are not SOL prices and are ignored.
+    """
+    sol_pairs = [
+        p for p in pairs
+        if isinstance(p, dict) and base_address(p) == mint and _sub(p, "quoteToken").get("address") == WSOL
+    ]
+    best = best_pair(sol_pairs)
+    return None if best is None else _num(best.get("priceNative"))
 
 
 def best_pair(pairs: Iterable[dict]) -> dict | None:
@@ -180,9 +195,5 @@ class DexScreener:
         return list(seen)
 
     async def price_native(self, mint: str) -> float | None:
-        """priceNative of the most liquid pair where `mint` is the base token."""
-        pairs = [p for p in await self.token_pairs([mint]) if base_address(p) == mint]
-        best = best_pair(pairs)
-        if best is None:
-            return None
-        return _num(best.get("priceNative"))
+        """SOL price of `mint` from its most liquid WSOL-quoted base pair (see sol_price_native)."""
+        return sol_price_native(await self.token_pairs([mint]), mint)

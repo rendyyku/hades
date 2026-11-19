@@ -109,7 +109,11 @@ def parse_swaps(tx: dict[str, Any]) -> list[ParsedSwap]:
 
     sol_net = _wallet_sol_net(tx, wallet)
     sol_amount: float | None = abs(sol_net)
-    if abs(sol_net) < EPS_SOL:
+    if len(legs) > 1:
+        # Several tokens moved in one tx (route/bundle): the SOL cannot be
+        # attributed per leg, so no leg may feed SOL PnL.
+        sol_amount = None
+    elif abs(sol_net) < EPS_SOL:
         # No SOL moved: stable-quoted or token-to-token swap. Not SOL-quoted,
         # so it must not feed SOL PnL.
         sol_amount = None

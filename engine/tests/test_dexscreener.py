@@ -236,3 +236,18 @@ async def test_custom_base_url():
 def test_default_rate_is_4_rps():
     dex = DexScreener(sleep=FakeSleep())
     assert dex.rps == 4
+
+
+@respx.mock
+async def test_price_native_ignores_non_sol_quoted_pairs():
+    wsol = "So11111111111111111111111111111111111111112"
+    usdc_pair = {"baseToken": {"address": MEME}, "quoteToken": {"address": "USDCmint"},
+                 "liquidity": {"usd": 900_000}, "priceNative": "5.0"}
+    sol_pair = {"baseToken": {"address": MEME}, "quoteToken": {"address": wsol},
+                "liquidity": {"usd": 10_000}, "priceNative": "0.02"}
+    respx.get(f"{BASE}/tokens/v1/solana/{MEME}").mock(return_value=httpx.Response(200, json=[usdc_pair, sol_pair]))
+    respx.get(f"{BASE}/tokens/v1/solana/Y").mock(return_value=httpx.Response(200, json=[
+        {**usdc_pair, "baseToken": {"address": "Y"}}]))
+    async with make_client() as dex:
+        assert await dex.price_native(MEME) == pytest.approx(0.02)
+        assert await dex.price_native("Y") is None

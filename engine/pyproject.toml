@@ -17,6 +17,9 @@ dependencies = [
     "typer",
 ]
 
+[project.scripts]
+hades = "hades.cli:app"
+
 [project.optional-dependencies]
 dev = [
     "pytest",
