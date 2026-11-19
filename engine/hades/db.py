@@ -14,6 +14,8 @@ from sqlalchemy import (
     TypeDecorator,
     create_engine,
     event,
+    inspect,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 from sqlalchemy.pool import StaticPool
@@ -91,6 +93,9 @@ class Wallet(Base):
     address: Mapped[str] = mapped_column(String, primary_key=True)
     first_funder: Mapped[str | None] = mapped_column(String, index=True)
     funded_at: Mapped[datetime | None] = mapped_column(TZDateTime)
+    # first_funder -> address SOL transfer backing ``first_funder`` (evidence)
+    funding_signature: Mapped[str | None] = mapped_column(String)
+    funding_slot: Mapped[int | None] = mapped_column(Integer)
     label: Mapped[str | None] = mapped_column(String)
     is_bot: Mapped[bool] = mapped_column(Boolean, default=False)
     last_backfilled_at: Mapped[datetime | None] = mapped_column(TZDateTime)
@@ -168,8 +173,26 @@ def make_engine(url: str) -> Engine:
     return engine
 
 
+# Columns added after the initial schema: (table, column, SQL type).
+_ADDED_COLUMNS = (
+    ("wallets", "funding_signature", "VARCHAR"),
+    ("wallets", "funding_slot", "INTEGER"),
+)
+
+
+def _existing_columns(conn, table: str) -> set[str]:
+    if conn.dialect.name == "sqlite":
+        return {r[1] for r in conn.execute(text(f"PRAGMA table_info({table})"))}
+    return {c["name"] for c in inspect(conn).get_columns(table)}
+
+
 def init_db(engine: Engine) -> None:
+    """Create missing tables, then add columns missing from older databases."""
     Base.metadata.create_all(engine)
+    with engine.begin() as conn:
+        for table, column, sql_type in _ADDED_COLUMNS:
+            if column not in _existing_columns(conn, table):
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}"))
 
 
 @contextmanager

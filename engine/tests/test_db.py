@@ -141,3 +141,25 @@ def test_datetimes_roundtrip_utc_aware(engine):
         got = s.get(Watchlist, "W1").added_at
     assert got.tzinfo is not None
     assert got == NOW
+
+
+def test_init_db_migrates_wallets_funding_columns():
+    from sqlalchemy import text
+
+    eng = make_engine("sqlite:///:memory:")
+    with eng.begin() as c:
+        c.execute(text(
+            "CREATE TABLE wallets (address VARCHAR PRIMARY KEY, first_funder VARCHAR, "
+            "funded_at DATETIME, label VARCHAR, is_bot BOOLEAN, last_backfilled_at DATETIME)"
+        ))
+        c.execute(text("INSERT INTO wallets (address, first_funder) VALUES ('A', 'B')"))
+    init_db(eng)
+    init_db(eng)  # idempotent
+    with eng.connect() as c:
+        cols = {r[1] for r in c.execute(text("PRAGMA table_info(wallets)"))}
+        row = c.execute(text(
+            "SELECT first_funder, funding_signature, funding_slot FROM wallets WHERE address='A'"
+        )).one()
+    assert {"funding_signature", "funding_slot"} <= cols
+    assert tuple(row) == ("B", None, None)
+    eng.dispose()

@@ -116,15 +116,29 @@ def test_bundle_needs_3_same_funder():
         "W6": "X1", "W7": "X2", "W8": "X3",
         "W9": "FunderH111", "W10": "FunderH111",
     }
-    tags = detect_bundles(tok, swaps, funders, set())
+    funding = {w: (f"fund-{w}", 100 + i) for i, w in enumerate(funders)}
+    tags = detect_bundles(tok, swaps, funders, set(), funding=funding)
     assert sorted(t.address for t in tags) == ["W1", "W2", "W3"]
     clusters = {t.evidence["cluster"] for t in tags}
     assert clusters == {f"{MINT[:6]}-500-Funder"}
     for t in tags:
         assert t.tag == "bundle" and t.mint == MINT
         assert t.evidence["funder"] == "FunderF111"
-        assert t.evidence["slots"] == [500]
-        assert t.evidence["signatures"] == [t.address.lower()]
+        # buy sig/slot + funder->wallet funding sig/slot
+        sig, fslot = funding[t.address]
+        assert t.evidence["signatures"] == [t.address.lower(), sig]
+        assert t.evidence["slots"] == [500, fslot]
+        assert_evidence(t)
+
+
+def test_bundle_excludes_wallet_without_funding_sig():
+    tok = token()
+    swaps = [buy("w1", "W1", 500), buy("w2", "W2", 500), buy("w3", "W3", 500)]
+    funders = {"W1": "FunderF111", "W2": "FunderF111", "W3": "FunderF111"}
+    # W3's funding transfer is unknown -> only 2 provable wallets -> no bundle
+    funding = {"W1": ("fw1", 1), "W2": ("fw2", 2)}
+    assert detect_bundles(tok, swaps, funders, set(), funding=funding) == []
+    assert detect_bundles(tok, swaps, funders, set()) == []
 
 
 # -- deployer link -------------------------------------------------------------
@@ -163,6 +177,13 @@ async def test_deployer_self_buy_tagged(session):
     tags = await detect_deployer_link(session, helius, tok, [DEPLOYER], swaps=swaps)
     assert len(tags) == 1
     assert tags[0].evidence == {"signatures": ["d1"], "slots": [1003], "chain": [DEPLOYER]}
+
+
+async def test_deployer_self_buy_skipped_without_sig(session):
+    helius = FakeHelius()
+    assert await detect_deployer_link(session, helius, token(), [DEPLOYER]) == []
+    other = [buy("x1", "Someone", 1003)]
+    assert await detect_deployer_link(session, helius, token(), [DEPLOYER], swaps=other) == []
 
 
 # -- repeat early --------------------------------------------------------------
@@ -211,7 +232,10 @@ async def test_evidence_has_signatures(session):
     ]
     helius = FakeHelius({"L": ("X", "sigL", 7), "X": (DEPLOYER, "sigX", 6)})
     tags = detect_snipers(tok, swaps)
-    tags += detect_bundles(tok, swaps, {"B1": "F", "B2": "F", "B3": "F"}, set())
+    tags += detect_bundles(
+        tok, swaps, {"B1": "F", "B2": "F", "B3": "F"}, set(),
+        funding={"B1": ("fb1", 1), "B2": ("fb2", 2), "B3": ("fb3", 3)},
+    )
     tags += await detect_deployer_link(session, helius, tok, ["L", DEPLOYER], swaps=swaps)
     for m in ("R1", "R2", "R3"):
         session.add(Token(mint=m, is_runner=True))
@@ -281,22 +305,46 @@ def test_persist_tags_idempotent(session):
     assert session.get(Wallet, "A") is not None and session.get(Wallet, "W") is not None
 
 
+def test_persist_tags_refuses_bad_evidence(session, caplog):
+    good = Tag("A", "sniper", MINT, {"signatures": ["a1"], "slots": [1001]})
+    assert persist_tags(session, [good]) == 1
+    session.commit()
+    bad = [
+        Tag("A", "sniper", MINT, {"signatures": [], "slots": []}),
+        Tag("B", "deployer_link", MINT, {"signatures": ["x", ""], "slots": [1, 2]}),
+        Tag("C", "bundle", MINT, {"signatures": ["x", "y"], "slots": [1]}),
+        Tag("D", "sniper", MINT, {"slots": [1]}),
+    ]
+    ok = Tag("E", "sniper", MINT, {"signatures": ["e1"], "slots": [1002]})
+    with caplog.at_level("WARNING", logger="hades.insider"):
+        assert persist_tags(session, bad + [ok]) == 1
+    session.commit()
+    rows = {(r.address, r.tag): r for r in session.scalars(select(WalletTag))}
+    assert set(rows) == {("A", "sniper"), ("E", "sniper")}
+    # refused tag must not wipe the existing good row
+    assert rows[("A", "sniper")].evidence_json["signatures"] == ["a1"]
+    assert sum("refus" in r.getMessage() for r in caplog.records) == 4
+
+
 # -- tracing -------------------------------------------------------------------
 
 
 async def test_trace_uses_cache(session):
-    session.add(Wallet(address="A", first_funder="B"))
+    session.add(Wallet(address="A", first_funder="B", funding_signature="sigA", funding_slot=9))
     session.commit()
     helius = FakeHelius({"A": ("WRONG", "x", 1), "B": ("C", "sigC", 3)})
     chain, sigs, slots = await trace_funder_detailed(session, helius, "A", hops=2)
     assert chain == ["A", "B", "C"]
-    assert sigs == ["", "sigC"]
-    assert slots == [-1, 3]
+    assert sigs == ["sigA", "sigC"]
+    assert slots == [9, 3]
     assert helius.fund_calls == ["B"]
-    assert session.get(Wallet, "B").first_funder == "C"
+    b = session.get(Wallet, "B")
+    assert (b.first_funder, b.funding_signature, b.funding_slot) == ("C", "sigC", 3)
 
     fresh = FakeHelius({"A": ("WRONG", "x", 1), "B": ("WRONG", "y", 1)})
-    assert await trace_funder(session, fresh, "A", hops=2) == ["A", "B", "C"]
+    assert await trace_funder_detailed(session, fresh, "A", hops=2) == (
+        ["A", "B", "C"], ["sigA", "sigC"], [9, 3]
+    )
     assert fresh.fund_calls == []
 
     # no funder -> chain stops
@@ -312,6 +360,23 @@ async def test_trace_uses_cache(session):
     assert await is_hub(session, none, "N") is False
     assert await is_hub(session, none, "N") is False
     assert none.sig_calls == ["N"]
+
+
+async def test_trace_refetches_legacy_row_without_sig(session):
+    # legacy row: first_funder known but no funding sig/slot stored
+    session.add(Wallet(address="A", first_funder="B"))
+    session.commit()
+    helius = FakeHelius({"A": ("B", "sigA", 4)})
+    chain, sigs, slots = await trace_funder_detailed(session, helius, "A", hops=1)
+    assert (chain, sigs, slots) == (["A", "B"], ["sigA"], [4])
+    assert helius.fund_calls == ["A"]
+    a = session.get(Wallet, "A")
+    assert (a.first_funder, a.funding_signature, a.funding_slot) == ("B", "sigA", 4)
+
+    # legacy row whose re-fetch finds nothing: no sentinel hop is returned
+    session.add(Wallet(address="Q", first_funder="R"))
+    session.commit()
+    assert await trace_funder_detailed(session, FakeHelius(), "Q", hops=2) == (["Q"], [], [])
 
 
 # -- end to end ----------------------------------------------------------------
@@ -347,9 +412,57 @@ async def test_tag_token_end_to_end(session):
     assert link["L"].evidence["chain"] == ["L", "X", DEPLOYER]
     assert link["L"].evidence["signatures"] == ["sigL", "sigX"]
     assert link[DEPLOYER].evidence["chain"] == [DEPLOYER]
+    bundle = {t.address: t for t in tags if t.tag == "bundle"}
+    assert bundle["B1"].evidence["signatures"] == ["b1", "f1"]
+    assert bundle["B1"].evidence["slots"] == [1010, 900]
     assert session.scalar(select(func.count()).select_from(WalletTag)) == 6
 
     # rerun: idempotent, no duplicate rows
     await tag_token(session, helius, tok)
     assert session.scalar(select(func.count()).select_from(WalletTag)) == 6
     assert session.get(Wallet, "B1").first_funder == "Fund"
+
+
+def _persisted(session):
+    session.expire_all()
+    return {
+        (r.address, r.tag, r.mint): r.evidence_json
+        for r in session.scalars(select(WalletTag).order_by(WalletTag.address, WalletTag.tag))
+    }
+
+
+async def test_tag_token_rerun_with_fresh_client_keeps_evidence(session):
+    tok = token()
+    session.add(tok)
+    for s in [
+        buy("d1", DEPLOYER, 1005),
+        buy("b1", "B1", 1010), buy("b2", "B2", 1010), buy("b3", "B3", 1010),
+        buy("l1", "L", 1020),
+        buy("m1", "M", 1030),
+    ]:
+        session.add(s)
+    session.commit()
+    funders = {
+        "B1": ("Fund", "f1", 900), "B2": ("Fund", "f2", 901), "B3": ("Fund", "f3", 902),
+        "L": ("X", "sigL", 800), "X": (DEPLOYER, "sigX", 700),
+        "M": ("S", "sigM", 650), DEPLOYER: ("S", "sigD", 640),
+    }
+    await tag_token(session, FakeHelius(funders), tok)
+    first = _persisted(session)
+    links = {k: v for k, v in first.items() if k[1] == "deployer_link"}
+    assert set(k[0] for k in links) == {"L", "M", DEPLOYER}
+
+    # new process: fresh client, same DB. Must not lose or blank any evidence.
+    fresh = FakeHelius(funders)
+    tags2 = await tag_token(session, fresh, tok)
+    second = _persisted(session)
+    assert second == first
+    for t in tags2:
+        assert_evidence(t)
+    for k, ev in second.items():
+        assert_evidence(Tag(k[0], k[1], k[2], ev))
+    assert second[("L", "deployer_link", MINT)]["signatures"] == ["sigL", "sigX"]
+    assert second[("M", "deployer_link", MINT)]["signatures"] == ["sigM", "sigD"]
+    assert second[("B1", "bundle", MINT)]["signatures"] == ["b1", "f1"]
+    # every funded hop came from the DB: no re-fetch of known funders
+    assert not set(fresh.fund_calls) & set(funders)

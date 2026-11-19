@@ -10,12 +10,15 @@ Tags wallets that are likely insiders of a token:
 - ``repeat_early``  wallet among the first ``REPEAT_EARLY_TOP_N`` buyers of
                     >= ``REPEAT_EARLY_MIN_RUNNERS`` runners.
 
-Every tag carries evidence with ``signatures`` and ``slots`` lists.
-Nothing in this module commits except :func:`tag_token`.
+Every tag carries evidence with non-empty, equal-length ``signatures`` and
+``slots`` lists; :func:`persist_tags` refuses anything else. Funding hops are
+backed by ``Wallet.funding_signature``/``funding_slot`` so evidence survives
+across processes. Nothing in this module commits except :func:`tag_token`.
 """
 
 from __future__ import annotations
 
+import logging
 import weakref
 from dataclasses import dataclass, field
 from typing import Any, Iterable
@@ -32,10 +35,7 @@ REPEAT_EARLY_MIN_RUNNERS = 3
 SNIPER_MAX_SLOTS = 2
 BUNDLE_MIN_WALLETS = 3
 
-# Placeholders used for a hop resolved from the DB cache (Wallet.first_funder),
-# where the funding signature / slot is not stored.
-NO_SIG = ""
-NO_SLOT = -1
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -109,12 +109,12 @@ async def trace_funder_detailed(
     ``[address, f1, f2, ...]`` and ``funding_sigs[i]``/``funding_slots[i]``
     describe the transfer ``chain[i+1] -> chain[i]``.
 
-    A hop already resolved in this process reuses its signature/slot. A hop
-    resolved from the DB cache (``Wallet.first_funder``) has no stored
-    signature/slot (only ``funded_at``), so it gets the placeholders
-    ``NO_SIG`` ('') and ``NO_SLOT`` (-1). Fresh lookups store
-    ``Wallet.first_funder``. Stops on no funder, or after appending a hub.
-    Never commits.
+    A hop is read from ``Wallet`` (``first_funder`` + ``funding_signature`` +
+    ``funding_slot``) when all are stored, else from this process's memo, else
+    fetched via ``first_incoming_sol`` and stored on ``Wallet``. A legacy row
+    with ``first_funder`` but no ``funding_signature`` is re-fetched. Every
+    returned hop has a real signature/slot. Stops on no funder, or after
+    appending a hub. Never commits.
     """
     cache = _cache(helius)
     chain = [address]
@@ -122,24 +122,23 @@ async def trace_funder_detailed(
     slots: list[int] = []
     cur = address
     for _ in range(hops):
-        if cur in cache.funding:
-            res = cache.funding[cur]
-            if res is None:
-                break
-            funder, sig, slot = res
+        w = session.get(Wallet, cur)
+        if (
+            w is not None and w.first_funder and w.funding_signature
+            and w.funding_slot is not None
+        ):
+            funder, sig, slot = w.first_funder, w.funding_signature, w.funding_slot
         else:
-            w = session.get(Wallet, cur)
-            if w is not None and w.first_funder:
-                funder, sig, slot = w.first_funder, NO_SIG, NO_SLOT
+            if cur in cache.funding:
+                res = cache.funding[cur]
             else:
                 res = await helius.first_incoming_sol(cur, max_pages=FUNDER_SCAN_MAX_PAGES)
                 cache.funding[cur] = res
-                if res is None or not res[0]:
-                    break
-                funder, sig, slot = res
-                _wallet(session, cur).first_funder = funder
-        if not funder:
-            break
+            if res is None or not res[0] or not res[1] or res[2] is None:
+                break
+            funder, sig, slot = res
+            w = _wallet(session, cur)
+            w.first_funder, w.funding_signature, w.funding_slot = funder, sig, int(slot)
         chain.append(funder)
         sigs.append(sig)
         slots.append(int(slot))
@@ -182,13 +181,24 @@ def detect_snipers(token: Token, swaps: Iterable[Swap]) -> list[Tag]:
 
 
 def detect_bundles(
-    token: Token, swaps: Iterable[Swap], funders: dict[str, str], hubs: set[str]
+    token: Token,
+    swaps: Iterable[Swap],
+    funders: dict[str, str],
+    hubs: set[str],
+    funding: dict[str, tuple[str, int]] | None = None,
 ) -> list[Tag]:
+    """Same-slot buys by >= BUNDLE_MIN_WALLETS wallets sharing a non-hub funder.
+
+    ``funding[wallet] = (sig, slot)`` is the funder -> wallet transfer. A wallet
+    without a known funding signature is excluded (the shared funder must be
+    provable), so evidence is ``[buy sig, funding sig]`` / ``[buy slot, funding slot]``.
+    """
+    funding = funding or {}
     # slot -> funder -> wallet -> first buy in that slot
     groups: dict[int, dict[str, dict[str, Swap]]] = {}
     for s in _buys(token, swaps):
         f = funders.get(s.wallet)
-        if not f or f in hubs:
+        if not f or f in hubs or not (funding.get(s.wallet) or ("",))[0]:
             continue
         groups.setdefault(s.slot, {}).setdefault(f, {}).setdefault(s.wallet, s)
     tags: list[Tag] = []
@@ -202,17 +212,13 @@ def detect_bundles(
                 if w in tagged:  # one bundle tag per wallet (earliest slot)
                     continue
                 tagged.add(w)
+                fsig, fslot = funding[w]
                 tags.append(
                     Tag(w, "bundle", token.mint,
-                        {"signatures": [s.signature], "slots": [s.slot],
+                        {"signatures": [s.signature, fsig], "slots": [s.slot, int(fslot)],
                          "cluster": cluster, "funder": f})
                 )
     return tags
-
-
-def _real(sigs: list[str], slots: list[int]) -> tuple[list[str], list[int]]:
-    pairs = [(g, s) for g, s in zip(sigs, slots) if g != NO_SIG and s != NO_SLOT]
-    return [g for g, _ in pairs], [s for _, s in pairs]
 
 
 async def detect_deployer_link(
@@ -236,18 +242,16 @@ async def detect_deployer_link(
         seen.add(b)
         if b == deployer:
             own = [s for s in _buys(token, swaps or []) if s.wallet == deployer]
-            ev = {
-                "signatures": [own[0].signature] if own else [],
-                "slots": [own[0].slot] if own else [],
-                "chain": [deployer],
-            }
+            if not own:  # no buy signature -> no evidence -> no tag
+                continue
+            ev = {"signatures": [own[0].signature], "slots": [own[0].slot], "chain": [deployer]}
             tags.append(Tag(b, "deployer_link", token.mint, ev))
             continue
         bchain, bsigs, bslots = await trace_funder_detailed(session, helius, b, hops=2)
         if deployer in bchain[1:]:
             i = bchain.index(deployer)
             chain = bchain[: i + 1]
-            sigs, slots = _real(bsigs[:i], bslots[:i])
+            sigs, slots = bsigs[:i], bslots[:i]
         else:
             shared = None
             for n in bchain[1:]:
@@ -265,7 +269,7 @@ async def detect_deployer_link(
                 continue
             bi, di = bchain.index(shared), dchain.index(shared)
             chain = bchain[: bi + 1] + list(reversed(dchain[:di]))
-            sigs, slots = _real(bsigs[:bi] + dsigs[:di], bslots[:bi] + dslots[:di])
+            sigs, slots = bsigs[:bi] + dsigs[:di], bslots[:bi] + dslots[:di]
         tags.append(
             Tag(b, "deployer_link", token.mint, {"signatures": sigs, "slots": slots, "chain": chain})
         )
@@ -311,9 +315,29 @@ def tag_repeat_early(session: Session) -> list[Tag]:
 # -- persistence & orchestration -----------------------------------------------
 
 
+def _valid_evidence(ev: dict) -> bool:
+    sigs, slots = ev.get("signatures"), ev.get("slots")
+    return (
+        isinstance(sigs, list) and isinstance(slots, list) and len(sigs) > 0
+        and len(sigs) == len(slots) and all(isinstance(g, str) and g for g in sigs)
+    )
+
+
 def persist_tags(session: Session, tags: Iterable[Tag]) -> int:
-    """Replace WalletTag rows keyed by (address, tag, mint). Never commits."""
-    tags = list(tags)
+    """Replace WalletTag rows keyed by (address, tag, mint). Never commits.
+
+    Refuses (skips with a warning, leaving any existing row untouched) a tag
+    whose evidence ``signatures`` is missing/empty, contains an empty string, or
+    differs in length from ``slots``. Returns the number of rows inserted.
+    """
+    accepted: list[Tag] = []
+    for t in tags:
+        if _valid_evidence(t.evidence):
+            accepted.append(t)
+        else:
+            log.warning("refusing %s tag for %s (mint %s): bad evidence %r",
+                        t.tag, t.address, t.mint, t.evidence)
+    tags = accepted
     keys = {(t.address, t.tag, t.mint) for t in tags}
     for address, tag, mint in keys:
         mint_cond = WalletTag.mint.is_(None) if mint is None else WalletTag.mint == mint
@@ -338,17 +362,19 @@ async def tag_token(session: Session, helius: Any, token: Token) -> list[Tag]:
     tags = detect_snipers(token, swaps)
 
     funders: dict[str, str] = {}
+    funding: dict[str, tuple[str, int]] = {}
     hubs: set[str] = set()
     for b in buyers:
-        chain, _, _ = await trace_funder_detailed(session, helius, b, hops=2)
+        chain, fsigs, fslots = await trace_funder_detailed(session, helius, b, hops=2)
         if len(chain) > 1:
             funders[b] = chain[1]
+            funding[b] = (fsigs[0], fslots[0])
         for n in chain[1:]:
             w = session.get(Wallet, n)
             if w is not None and w.label == "hub":
                 hubs.add(n)
 
-    tags += detect_bundles(token, swaps, funders, hubs)
+    tags += detect_bundles(token, swaps, funders, hubs, funding)
     tags += await detect_deployer_link(session, helius, token, buyers, hubs, swaps=swaps)
     persist_tags(session, tags)
     session.commit()
