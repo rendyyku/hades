@@ -1,0 +1,40 @@
+{
+  "signature": "sigSimpleBuy1",
+  "slot": 300000001,
+  "timestamp": 1763500000,
+  "type": "SWAP",
+  "source": "RAYDIUM",
+  "fee": 5000,
+  "feePayer": "WaLLetBuyer1111111111111111111111111111111",
+  "transactionError": null,
+  "nativeTransfers": [
+    {
+      "fromUserAccount": "WaLLetBuyer1111111111111111111111111111111",
+      "toUserAccount": "PooLRaydium111111111111111111111111111111",
+      "amount": 1500000000
+    }
+  ],
+  "tokenTransfers": [
+    {
+      "fromUserAccount": "PooLRaydium111111111111111111111111111111",
+      "toUserAccount": "WaLLetBuyer1111111111111111111111111111111",
+      "fromTokenAccount": "pt1",
+      "toTokenAccount": "wt1",
+      "tokenAmount": 1000000,
+      "mint": "MeMeMint1111111111111111111111111111111pump",
+      "tokenStandard": "Fungible"
+    }
+  ],
+  "accountData": [
+    {
+      "account": "WaLLetBuyer1111111111111111111111111111111",
+      "nativeBalanceChange": -1500005000,
+      "tokenBalanceChanges": []
+    },
+    {
+      "account": "PooLRaydium111111111111111111111111111111",
+      "nativeBalanceChange": 1500000000,
+      "tokenBalanceChanges": []
+    }
+  ]
+}

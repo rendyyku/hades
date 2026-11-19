@@ -1,0 +1,39 @@
+{
+  "signature": "sigUsdcQuote1",
+  "slot": 300000003,
+  "timestamp": 1763500200,
+  "type": "SWAP",
+  "source": "ORCA",
+  "fee": 5000,
+  "feePayer": "WaLLetBuyer1111111111111111111111111111111",
+  "transactionError": null,
+  "nativeTransfers": [],
+  "tokenTransfers": [
+    {
+      "fromUserAccount": "WaLLetBuyer1111111111111111111111111111111",
+      "toUserAccount": "PooLOrca22222222222222222222222222222222222",
+      "tokenAmount": 100.0,
+      "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      "tokenStandard": "Fungible"
+    },
+    {
+      "fromUserAccount": "PooLOrca22222222222222222222222222222222222",
+      "toUserAccount": "WaLLetBuyer1111111111111111111111111111111",
+      "tokenAmount": 50000.0,
+      "mint": "MeMeMint1111111111111111111111111111111pump",
+      "tokenStandard": "Fungible"
+    }
+  ],
+  "accountData": [
+    {
+      "account": "WaLLetBuyer1111111111111111111111111111111",
+      "nativeBalanceChange": -5000,
+      "tokenBalanceChanges": []
+    },
+    {
+      "account": "PooLOrca22222222222222222222222222222222222",
+      "nativeBalanceChange": 0,
+      "tokenBalanceChanges": []
+    }
+  ]
+}
