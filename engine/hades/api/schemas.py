@@ -133,7 +133,7 @@ class TokenForensics(BaseModel):
 
 class WatchlistIn(BaseModel):
     address: str = Field(pattern=BASE58_ADDRESS)
-    note: str | None = None
+    note: str | None = Field(default=None, max_length=280)
 
 
 class WatchlistRow(BaseModel):
@@ -142,3 +142,16 @@ class WatchlistRow(BaseModel):
     address: str
     note: str | None
     added_at: datetime | None
+
+
+class AlertRow(BaseModel):
+    """Payload of the SSE ``alert`` event."""
+
+    id: int
+    wallet: str
+    mint: str
+    symbol: str | None
+    side: str
+    sol_amount: float | None
+    signature: str
+    block_time: datetime | None

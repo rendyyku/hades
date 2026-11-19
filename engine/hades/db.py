@@ -9,6 +9,7 @@ from sqlalchemy import (
     DateTime,
     Engine,
     Float,
+    Index,
     Integer,
     String,
     TypeDecorator,
@@ -151,6 +152,19 @@ class Alert(Base):
     created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
     delivered_tg: Mapped[bool] = mapped_column(Boolean, default=False)
 
+    __table_args__ = (
+        Index("ux_alerts_sig_wallet_mint", "signature", "wallet", "mint", unique=True),
+    )
+
+
+class Kv(Base):
+    """Small key/value store (e.g. ``helius_webhook_id``)."""
+
+    __tablename__ = "kv"
+
+    key: Mapped[str] = mapped_column(String, primary_key=True)
+    value: Mapped[str] = mapped_column(String)
+
 
 def make_engine(url: str) -> Engine:
     """Create an engine; for SQLite, enable WAL and allow cross-thread use."""
@@ -186,6 +200,26 @@ def _existing_columns(conn, table: str) -> set[str]:
     return {c["name"] for c in inspect(conn).get_columns(table)}
 
 
+ALERTS_UNIQUE_INDEX = "ux_alerts_sig_wallet_mint"
+
+
+def _ensure_alerts_unique_index(conn) -> None:
+    """Older DBs: drop duplicate alerts (keep lowest id), then add the unique index.
+
+    Plain SQL valid on both SQLite and Postgres (CREATE UNIQUE INDEX IF NOT EXISTS).
+    """
+    if ALERTS_UNIQUE_INDEX in {ix["name"] for ix in inspect(conn).get_indexes("alerts")}:
+        return
+    conn.execute(text(
+        "DELETE FROM alerts WHERE id NOT IN "
+        "(SELECT MIN(id) FROM alerts GROUP BY signature, wallet, mint)"
+    ))
+    conn.execute(text(
+        f"CREATE UNIQUE INDEX IF NOT EXISTS {ALERTS_UNIQUE_INDEX} "
+        "ON alerts (signature, wallet, mint)"
+    ))
+
+
 def init_db(engine: Engine) -> None:
     """Create missing tables, then add columns missing from older databases."""
     Base.metadata.create_all(engine)
@@ -193,6 +227,7 @@ def init_db(engine: Engine) -> None:
         for table, column, sql_type in _ADDED_COLUMNS:
             if column not in _existing_columns(conn, table):
                 conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}"))
+        _ensure_alerts_unique_index(conn)
 
 
 @contextmanager

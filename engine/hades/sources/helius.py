@@ -280,3 +280,30 @@ class HeliusClient:
                 if nt.get("toUserAccount") == address and (nt.get("amount") or 0) > 0:
                     return nt.get("fromUserAccount"), tx["signature"], int(tx["slot"])
         return None
+
+    # -- webhooks ------------------------------------------------------------
+
+    async def upsert_webhook(
+        self, addresses: list[str], url: str, secret: str, webhook_id: str | None = None
+    ) -> str:
+        """Create (POST) or update (PUT) the enhanced SWAP webhook; return its id.
+
+        Helius sends ``secret`` back verbatim in the ``Authorization`` header.
+        """
+        body = {
+            "webhookURL": url,
+            "transactionTypes": ["SWAP"],
+            "accountAddresses": list(addresses),
+            "webhookType": "enhanced",
+            "authHeader": secret,
+        }
+        if webhook_id:
+            data = await self._request("PUT", f"{self.api_base}/v0/webhooks/{webhook_id}", json=body)
+        else:
+            data = await self._request("POST", f"{self.api_base}/v0/webhooks", json=body)
+        new_id = data.get("webhookID") if isinstance(data, dict) else None
+        if new_id:
+            return str(new_id)
+        if webhook_id:
+            return webhook_id
+        raise HeliusError("POST /v0/webhooks: response has no webhookID")

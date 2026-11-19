@@ -2,11 +2,15 @@
 
 Every ``/api/*`` route requires ``X-Hades-Key`` (constant-time compare). With an
 empty ``HADES_API_KEY`` the API fails closed with 503. ``/healthz`` is public.
-The API only reads the DB: no network calls, no unrealized PnL.
+The read routes only read the DB (no unrealized PnL). Task 9 adds the realtime
+side: ``POST /webhook/helius`` (outside /api, authed by the Helius
+``Authorization`` header = ``HELIUS_WEBHOOK_SECRET``), ``GET /api/stream`` (SSE)
+and watchlist -> Helius webhook sync (the only outbound network call).
 """
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
@@ -15,6 +19,8 @@ from typing import Literal
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from sqlalchemy import and_, exists, func, select
 from sqlalchemy.orm import Session
+from sse_starlette.sse import EventSourceResponse
+from starlette.concurrency import run_in_threadpool
 
 from hades.api import schemas as S
 from hades.config import Settings, get_settings
@@ -30,8 +36,12 @@ from hades.db import (
     make_engine,
 )
 from hades.pnl import compute_positions
+from hades.realtime import AlertBus, alert_events, ingest_webhook, sync_webhook
 
 EARLY_BUYERS_LIMIT = 100
+PING_INTERVAL_SEC = 15
+MAX_WEBHOOK_TXS = 1000
+SYNC_HEADER = "X-Webhook-Sync"
 FUNDING_HOPS = 3
 SORT_COLUMNS = {
     "score": WalletStats.score,
@@ -268,9 +278,7 @@ def watchlist_list(session: Session = Depends(get_session)) -> list[Watchlist]:
     return list(session.scalars(select(Watchlist).order_by(Watchlist.added_at, Watchlist.address)))
 
 
-@router.post("/watchlist", response_model=S.WatchlistRow, status_code=201)
-def watchlist_add(body: S.WatchlistIn, session: Session = Depends(get_session)) -> Watchlist:
-    # No webhook sync here (Task 9).
+def _watchlist_upsert(session: Session, body: S.WatchlistIn) -> Watchlist:
     row = session.get(Watchlist, body.address)
     if row is None:
         row = Watchlist(address=body.address, note=body.note)
@@ -282,14 +290,72 @@ def watchlist_add(body: S.WatchlistIn, session: Session = Depends(get_session)) 
     return row
 
 
-@router.delete("/watchlist/{address}", status_code=204)
-def watchlist_delete(address: str, session: Session = Depends(get_session)) -> Response:
+def _watchlist_remove(session: Session, address: str) -> bool:
     row = session.get(Watchlist, address)
     if row is None:
-        raise HTTPException(status_code=404, detail="not in watchlist")
+        return False
     session.delete(row)
     session.commit()
-    return Response(status_code=204)
+    return True
+
+
+@router.post("/watchlist", response_model=S.WatchlistRow, status_code=201)
+async def watchlist_add(
+    body: S.WatchlistIn, request: Request, response: Response,
+    session: Session = Depends(get_session),
+) -> S.WatchlistRow:
+    row = await run_in_threadpool(_watchlist_upsert, session, body)
+    out = S.WatchlistRow.model_validate(row)
+    response.headers[SYNC_HEADER] = await sync_webhook(request.app)
+    return out
+
+
+@router.delete("/watchlist/{address}", status_code=204)
+async def watchlist_delete(
+    address: str, request: Request, session: Session = Depends(get_session)
+) -> Response:
+    if not await run_in_threadpool(_watchlist_remove, session, address):
+        raise HTTPException(status_code=404, detail="not in watchlist", headers={SYNC_HEADER: "skipped"})
+    return Response(status_code=204, headers={SYNC_HEADER: await sync_webhook(request.app)})
+
+
+@router.get("/stream")
+async def stream(request: Request) -> EventSourceResponse:
+    """SSE: ``alert`` events (AlertRow JSON) and ``ping`` every ping_interval seconds."""
+    app = request.app
+    return EventSourceResponse(alert_events(app.state.bus, request.is_disconnected, app.state.ping_interval))
+
+
+# -- Helius webhook (outside /api) ------------------------------------------------
+
+webhook_router = APIRouter()
+
+
+@webhook_router.post("/webhook/helius")
+async def helius_webhook(
+    request: Request, authorization: str | None = Header(default=None)
+) -> dict[str, int]:
+    secret: str = request.app.state.settings.HELIUS_WEBHOOK_SECRET
+    if not secret:
+        raise HTTPException(status_code=503, detail="webhook secret not configured")
+    if authorization is None or not secrets.compare_digest(
+        authorization.encode("utf-8"), secret.encode("utf-8")
+    ):
+        raise HTTPException(status_code=401, detail="invalid webhook secret")
+    try:
+        body = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid json") from None
+    if isinstance(body, dict):
+        body = [body]
+    if not isinstance(body, list):
+        raise HTTPException(status_code=400, detail="expected a list of transactions")
+    if len(body) > MAX_WEBHOOK_TXS:
+        raise HTTPException(status_code=413, detail="too many transactions")
+    n_swaps, new_rows = await run_in_threadpool(ingest_webhook, request.app.state.engine, body)
+    for row in new_rows:  # after commit
+        request.app.state.bus.publish(row)
+    return {"received": len(body), "swaps": n_swaps, "alerts": len(new_rows)}
 
 
 # -- app factory --------------------------------------------------------------------
@@ -299,15 +365,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     engine = make_engine(settings.DATABASE_URL)
     init_db(engine)
 
-    app = FastAPI(title="HADES", version="0.1.0")
+    app = FastAPI(title="HADES", version="0.1.0", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.settings = settings
     app.state.engine = engine
+    app.state.bus = AlertBus()
+    app.state.ping_interval = PING_INTERVAL_SEC
+    app.state.sync_lock = asyncio.Lock()
 
     @app.get("/healthz")
     def healthz() -> dict[str, bool]:
         return {"ok": True}
 
     app.include_router(router)
+    app.include_router(webhook_router)
     return app
 
 
@@ -323,6 +393,10 @@ def __getattr__(name: str) -> FastAPI:
     global _app
     if name == "app":
         if _app is None:
-            _app = create_app()
+            try:
+                _app = create_app()
+            except AttributeError as e:
+                # PEP 562: an AttributeError escaping here would read as "no attribute app".
+                raise RuntimeError(f"create_app() failed: {e}") from e
         return _app
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
