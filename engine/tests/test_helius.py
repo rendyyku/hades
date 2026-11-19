@@ -212,3 +212,67 @@ async def test_api_key_not_in_repr():
         assert KEY not in repr(client)
     finally:
         await client.aclose()
+
+
+@respx.mock
+async def test_pagination_error_keeps_partial_and_cursor():
+    route = respx.get(f"{API}/v0/addresses/{ADDR}/transactions").mock(
+        side_effect=[httpx.Response(200, json=page("a", 100))] + [httpx.Response(429)] * 6
+    )
+    async with make_client() as client:
+        with pytest.raises(HeliusRateLimited) as exc:
+            await client.address_transactions(ADDR, max_pages=5)
+    assert route.call_count == 7
+    assert len(exc.value.partial) == 100
+    assert exc.value.partial[0]["signature"] == "a-0"
+    assert exc.value.cursor == "a-99"  # resume with before=a-99
+    assert KEY not in str(exc.value)
+
+
+@respx.mock
+async def test_pagination_error_on_first_page_has_empty_partial():
+    respx.get(f"{API}/v0/addresses/{ADDR}/transactions").mock(return_value=httpx.Response(503))
+    async with make_client() as client:
+        with pytest.raises(HeliusError) as exc:
+            await client.address_transactions(ADDR, before="start-sig", max_pages=2)
+    assert exc.value.partial == []
+    assert exc.value.cursor == "start-sig"
+
+
+def test_helius_error_defaults():
+    e = HeliusError("x")
+    assert e.partial == [] and e.cursor is None
+
+
+@pytest.mark.parametrize("param", ["before", "before-signature"])
+@respx.mock
+async def test_pagination_follows_continue_cursor(param):
+    msg = (
+        "Failed to find events within the search period. To continue search, "
+        f"query the API again with the `{param}` parameter set to 5xContinueSig9."
+    )
+    route = respx.get(f"{API}/v0/addresses/{ADDR}/transactions").mock(
+        side_effect=[
+            httpx.Response(404, json={"error": msg}),
+            httpx.Response(200, json=page("b", 100)),
+            httpx.Response(200, json=page("c", 100)),
+        ]
+    )
+    async with make_client() as client:
+        txs = await client.address_transactions(ADDR, max_pages=3)
+    # the continue response counts as one of the max_pages
+    assert route.call_count == 3
+    assert len(txs) == 200
+    assert route.calls[1].request.url.params["before"] == "5xContinueSig9"
+    assert route.calls[2].request.url.params["before"] == "b-99"
+
+
+@respx.mock
+async def test_unrelated_4xx_still_raises():
+    route = respx.get(f"{API}/v0/addresses/{ADDR}/transactions").mock(
+        return_value=httpx.Response(400, json={"error": "invalid address"})
+    )
+    async with make_client() as client:
+        with pytest.raises(HeliusError):
+            await client.address_transactions(ADDR, max_pages=3)
+    assert route.call_count == 1

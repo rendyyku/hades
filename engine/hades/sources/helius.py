@@ -48,11 +48,28 @@ def _install_redactor() -> None:
 
 
 class HeliusError(Exception):
-    """Helius request failed (persistent 5xx, unexpected 4xx, RPC error, network)."""
+    """Helius request failed (persistent 5xx, unexpected 4xx, RPC error, network).
+
+    For paginated calls, `partial` holds the items fetched before the failure
+    and `cursor` the `before` signature to resume from (None = from newest).
+    """
+
+    def __init__(self, *args: object, partial: list[dict] | None = None, cursor: str | None = None) -> None:
+        super().__init__(*args)
+        self.partial: list[dict] = partial if partial is not None else []
+        self.cursor: str | None = cursor
 
 
 class HeliusRateLimited(HeliusError):
     """Still HTTP 429 after all retries were used."""
+
+
+class _ContinueSearch(HeliusError):
+    """4xx from the Enhanced API telling us to keep paging from `cursor`."""
+
+
+# e.g. "... To continue search, query the API again with the `before` parameter set to <sig>."
+_CONTINUE_RE = re.compile(r"continue search.*?parameter set to\s+`?([A-Za-z0-9]+)", re.I | re.S)
 
 
 class TokenBucket:
@@ -150,6 +167,9 @@ class HeliusClient:
                 last_status = status
                 continue
             if status >= 400:
+                m = _CONTINUE_RE.search(resp.text)
+                if m:
+                    raise _ContinueSearch(f"{method} {safe_url} -> HTTP {status} (continue)", cursor=m.group(1))
                 raise HeliusError(f"{method} {safe_url} -> HTTP {status}")
             return resp.json()
         if last_status == 429:
@@ -178,7 +198,12 @@ class HeliusClient:
         before: str | None = None,
         max_pages: int,
     ) -> list[dict]:
-        """Parsed txs for an address, newest first, 100 per page, up to max_pages."""
+        """Parsed txs for an address, newest first, 100 per page, up to max_pages.
+
+        A Helius "continue search with before=<sig>" 4xx is followed (it counts
+        toward max_pages). On any other failure the raised HeliusError carries
+        `partial` (items fetched so far) and `cursor` (resume with before=cursor).
+        """
         url = f"{self.api_base}/v0/addresses/{address}/transactions"
         out: list[dict] = []
         cursor = before
@@ -188,7 +213,16 @@ class HeliusClient:
                 params["type"] = tx_type
             if cursor:
                 params["before"] = cursor
-            page = await self._request("GET", url, params=params)
+            try:
+                page = await self._request("GET", url, params=params)
+            except _ContinueSearch as e:
+                # Sparse type filter: no match in this search window; keep
+                # paging from the cursor Helius gave us (counts as a page).
+                cursor = e.cursor
+                continue
+            except HeliusError as e:
+                e.partial, e.cursor = out, cursor
+                raise
             if not page:
                 break
             out.extend(page)

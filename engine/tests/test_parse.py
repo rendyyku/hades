@@ -86,3 +86,55 @@ def test_failed_tx_yields_nothing():
     tx = load("helius_swap_simple")
     tx["transactionError"] = {"InstructionError": [2, {"Custom": 6001}]}
     assert parse_swaps(tx) == []
+
+
+# -- real Helius payloads (trimmed) ----------------------------------------
+# Ground truth per controller evidence: when the wallet's WSOL account is
+# closed in the tx, the truth is nativeBalanceChange+fee; when WSOL is kept in
+# the account, the truth is the WSOL token net; PUMP_FUN has no WSOL at all.
+
+REAL_WALLET = "8DC3hpFtU3mEU3FUCtDfU72SmxTbrw4w35fyMYP8qGxg"
+
+
+@pytest.mark.parametrize(
+    ("fixture", "side", "mint_prefix", "token_amount", "sol_amount"),
+    [
+        ("real_pumpamm_sell_unwrap", "sell", "6ehEcT", 813554.823263, 14.56233218),
+        ("real_pumpamm_buy_wrap", "buy", "HKpDdv", 957127.35136, 1.00176),
+        ("real_pumpamm_sell_wsol_kept", "sell", "BCdwQB", 12716.385409, 5.62462471),
+        ("real_pumpfun_buy", "buy", "3631Hg", 6866791.900463, 1.757118567),
+    ],
+)
+def test_parse_real_payloads(fixture, side, mint_prefix, token_amount, sol_amount):
+    swaps = parse_swaps(load(fixture))
+    assert len(swaps) == 1
+    s = swaps[0]
+    assert s.wallet == REAL_WALLET
+    assert s.side == side
+    assert s.mint.startswith(mint_prefix)
+    assert s.token_amount == pytest.approx(token_amount, abs=1e-6)
+    assert s.sol_amount == pytest.approx(sol_amount, abs=1e-6)
+
+
+def test_real_fixtures_contain_no_api_key():
+    for path in FIXTURES.glob("*.json"):
+        assert "api-key" not in path.read_text(encoding="utf-8").lower(), path.name
+
+
+def test_parse_usdc_quote_with_token_account_rent_is_not_sol_quoted():
+    # USDC-funded buy that also creates the MEME token account: the wallet pays
+    # ~0.00204 SOL rent, so the SOL net is not ~0, but the swap is USDC-quoted.
+    rent = 2_039_280
+    tx = load("helius_swap_usdc_quote")
+    fee = int(tx["fee"])
+    for acc in tx["accountData"]:
+        if acc["account"] == WALLET:
+            acc["nativeBalanceChange"] = -fee - rent
+    tx["accountData"].append({"account": "NewMemeAta111111111111111111111111111111111", "nativeBalanceChange": rent})
+    tx["nativeTransfers"].append(
+        {"fromUserAccount": WALLET, "toUserAccount": "NewMemeAta111111111111111111111111111111111", "amount": rent}
+    )
+    swaps = parse_swaps(tx)
+    assert len(swaps) == 1
+    assert swaps[0].side == "buy"
+    assert swaps[0].sol_amount is None
