@@ -46,6 +46,9 @@ log = logging.getLogger(__name__)
 
 DEFAULT_INFO_URL = "https://api.hyperliquid.xyz/info"
 DEFAULT_LEADERBOARD_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
+# Unofficial too: the vault list the HL app's Vaults page loads (~14 MB, ~9.5k vaults on
+# 2026-11-20). Used only to exclude vaults from discovery candidates.
+DEFAULT_VAULTS_URL = "https://stats-data.hyperliquid.xyz/Mainnet/vaults"
 RATE_LIMITS_DOC = (
     "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/rate-limits-and-user-limits"
 )
@@ -96,6 +99,7 @@ def item_weight(request_type: str, n_items: int) -> int:
 
 
 SleepFn = Callable[[float], Awaitable[Any]]
+PageFn = Callable[[list[dict]], Any]
 ClockFn = Callable[[], float]
 
 
@@ -199,6 +203,7 @@ class HLClient:
         *,
         info_url: str = DEFAULT_INFO_URL,
         leaderboard_url: str = DEFAULT_LEADERBOARD_URL,
+        vaults_url: str = DEFAULT_VAULTS_URL,
         weight_per_min: int = WEIGHT_PER_MIN,
         max_attempts: int = MAX_ATTEMPTS,
         base_delay: float = 1.0,
@@ -210,6 +215,7 @@ class HLClient:
     ) -> None:
         self.info_url = info_url
         self.leaderboard_url = leaderboard_url
+        self.vaults_url = vaults_url
         self.max_attempts = max_attempts
         self.base_delay = base_delay
         self.leaderboard_timeout = leaderboard_timeout
@@ -223,6 +229,7 @@ class HLClient:
         return cls(
             info_url=settings.INFO_URL,
             leaderboard_url=settings.LEADERBOARD_URL,
+            vaults_url=getattr(settings, "VAULTS_URL", DEFAULT_VAULTS_URL),
             weight_per_min=settings.RATE_WEIGHT_PER_MIN,
             **kw,
         )
@@ -305,7 +312,8 @@ class HLClient:
     # -- endpoints ------------------------------------------------------------------
 
     async def user_fills_by_time(
-        self, addr: str, start_ms: int, end_ms: int | None = None
+        self, addr: str, start_ms: int, end_ms: int | None = None, *,
+        on_page: PageFn | None = None,
     ) -> HLPage:
         """All reachable fills of ``addr`` from ``start_ms`` (inclusive), oldest first.
 
@@ -315,6 +323,9 @@ class HLClient:
         plain ``last time + 1`` restart would silently drop those). If a full page is
         entirely one millisecond the restart advances by 1 ms to guarantee progress.
         Stops at the 10,000-fill history cap with ``truncated=True``.
+
+        ``on_page(new_fills)`` is called after each page with the fills it added, so a
+        caller can persist progress before a later page fails (e.g. HLRateLimited).
         """
         out: list[dict] = []
         seen: set[int] = set()
@@ -327,6 +338,8 @@ class HLClient:
             page = await self._info(body)
             if not isinstance(page, list):
                 raise HLError("info userFillsByTime: expected a list")
+            new: list[dict] = []
+            capped = False
             for f in page:
                 tid = f.get("tid")
                 if tid is None:
@@ -334,9 +347,15 @@ class HLClient:
                 if tid in seen:
                     continue
                 seen.add(tid)
-                out.append(f)
-                if len(out) >= FILLS_HISTORY_CAP:
-                    return HLPage(out, truncated=True)
+                new.append(f)
+                if len(out) + len(new) >= FILLS_HISTORY_CAP:
+                    capped = True
+                    break
+            out.extend(new)
+            if on_page is not None and new:
+                on_page(new)
+            if capped:
+                return HLPage(out, truncated=True)
             if len(page) < FILLS_PAGE_LIMIT:
                 return HLPage(out, truncated=skipped_ms)
             last = max(int(f["time"]) for f in page)
@@ -351,13 +370,15 @@ class HLClient:
                 cursor = last
 
     async def user_funding(
-        self, addr: str, start_ms: int, end_ms: int | None = None
+        self, addr: str, start_ms: int, end_ms: int | None = None, *,
+        on_page: PageFn | None = None,
     ) -> FundingPage:
         """Funding payments of ``addr`` from ``start_ms`` (inclusive), oldest first.
 
         Pages while a page is full (500 rows), restarting inclusive at the last time
         and de-duplicating by (time, coin) like :meth:`user_fills_by_time`. Stops after
         MAX_FUNDING_PAGES pages with ``truncated=True`` (and a warning).
+        ``on_page(new_rows)`` as in :meth:`user_fills_by_time`.
         """
         out: list[dict] = []
         seen: set[tuple[int, str]] = set()
@@ -369,12 +390,16 @@ class HLClient:
             page = await self._info(body)
             if not isinstance(page, list):
                 raise HLError("info userFunding: expected a list")
+            new: list[dict] = []
             for r in page:
                 key = (int(r["time"]), (r.get("delta") or {}).get("coin", ""))
                 if key in seen:
                     continue
                 seen.add(key)
-                out.append(r)
+                new.append(r)
+            out.extend(new)
+            if on_page is not None and new:
+                on_page(new)
             if len(page) < FUNDING_PAGE_LIMIT:
                 return FundingPage(out, truncated=False)
             last = max(int(r["time"]) for r in page)
@@ -416,3 +441,22 @@ class HLClient:
         if not isinstance(rows, list):
             raise HLUnavailable("leaderboard: unexpected shape (no leaderboardRows list)")
         return [r for r in rows if isinstance(r, dict) and r.get("ethAddress")]
+
+    async def vault_addresses(self) -> set[str]:
+        """Lowercase addresses of every HL vault, from the app's vault list (unofficial).
+
+        Raises HLUnavailable on any failure (HTTP error, network, shape change).
+        """
+        try:
+            resp = await self._send("GET", self.vaults_url, timeout=self.leaderboard_timeout)
+            data = resp.json()
+        except (HLError, ValueError) as e:
+            raise HLUnavailable(f"vault list unavailable: {e}") from None
+        if not isinstance(data, list):
+            raise HLUnavailable("vault list: unexpected shape (not a list)")
+        out: set[str] = set()
+        for v in data:
+            addr = ((v or {}).get("summary") or {}).get("vaultAddress") if isinstance(v, dict) else None
+            if addr:
+                out.add(str(addr).lower())
+        return out

@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     WS_URL: str = "wss://api.hyperliquid.xyz/ws"
     # Unofficial: the JSON the HL web app's leaderboard page loads (verified live 2026-11-20).
     LEADERBOARD_URL: str = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
+    # Unofficial: the vault list the HL app's Vaults page loads (verified live 2026-11-20).
+    VAULTS_URL: str = "https://stats-data.hyperliquid.xyz/Mainnet/vaults"
     MAX_FOLLOWS: int = 25
     AUTO_FOLLOW_N: int = 10
     # "REST requests share an aggregated weight limit of 1200 per minute" (per IP).

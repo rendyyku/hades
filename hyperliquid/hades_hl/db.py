@@ -109,6 +109,10 @@ class Fill(Base):
     hash: Mapped[str | None] = mapped_column(String)
     crossed: Mapped[bool] = mapped_column(Boolean)  # True = taker
     liquidation: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    # liquidation.liquidatedUser (lowercase): tells our own liquidation from one where
+    # this wallet was the counterparty / liquidator (normalize.is_own_liquidation)
+    liquidated_user: Mapped[str | None] = mapped_column(String)
+    builder_fee: Mapped[Decimal | None] = mapped_column(DecimalText)  # ruling P20
 
     __table_args__ = (Index("ix_fills_address_time", "address", "time"),)
 
@@ -216,7 +220,10 @@ def make_engine(url: str) -> Engine:
 
 # Columns added after the initial schema: (table, column, SQL type). Empty for v1;
 # later tasks append here so old DBs gain columns on init_db.
-_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = ()
+_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("fills", "liquidated_user", "VARCHAR"),
+    ("fills", "builder_fee", "VARCHAR"),
+)
 
 
 def _existing_columns(conn, table: str) -> set[str]:
@@ -266,7 +273,45 @@ def fill_row(address: str, f: dict) -> dict:
         "crossed": bool(f["crossed"]),
         # HL attaches a ``liquidation`` object only to liquidation fills.
         "liquidation": bool(f.get("liquidation")),
+        "liquidated_user": _liquidated_user(f),
+        "builder_fee": f.get("builderFee"),
     }
+
+
+def _liquidated_user(f: dict) -> str | None:
+    liq = f.get("liquidation")
+    victim = liq.get("liquidatedUser") if isinstance(liq, dict) else None
+    return str(victim).lower() if victim else None
+
+
+def funding_row(address: str, r: dict) -> dict:
+    """Map one HL ``userFunding`` row to a funding row."""
+    delta = r.get("delta") or {}
+    return {"address": address, "coin": delta["coin"], "time": int(r["time"]),
+            "usdc": str(delta.get("usdc") or "0")}
+
+
+def insert_funding(session: Session, address: str, rows: Iterable[dict]) -> int:
+    """Insert funding payments, skipping any (address, coin, time) already stored."""
+    mapped: dict[tuple[str, int], dict] = {}
+    for r in rows:
+        m = funding_row(address, r)
+        mapped.setdefault((m["coin"], m["time"]), m)
+    if not mapped:
+        return 0
+    times = sorted({t for _, t in mapped})
+    existing: set[tuple[str, int]] = set()
+    for i in range(0, len(times), 500):
+        chunk = times[i : i + 500]
+        existing.update(
+            (c, t) for c, t in session.execute(
+                select(Funding.coin, Funding.time).where(
+                    Funding.address == address, Funding.time.in_(chunk)))
+        )
+    new_rows = [m for k, m in mapped.items() if k not in existing]
+    if new_rows:
+        _insert_ignore(session, Funding.__table__, new_rows)
+    return len(new_rows)
 
 
 def _insert_ignore(session: Session, table, rows: list[dict]) -> None:

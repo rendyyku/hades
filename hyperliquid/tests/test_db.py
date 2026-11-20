@@ -21,7 +21,7 @@ from hades_hl.db import (
 EXPECTED = {
     "wallets": {"address", "first_seen", "is_vault", "is_bot", "score", "stats_json", "scored_at"},
     "fills": {"tid", "address", "coin", "px", "sz", "side", "dir", "start_position", "closed_pnl",
-              "fee", "time", "hash", "crossed", "liquidation"},
+              "fee", "time", "hash", "crossed", "liquidation", "liquidated_user", "builder_fee"},
     "funding": {"address", "coin", "time", "usdc"},
     "tags": {"address", "tag", "evidence_json", "created_at"},
     "follows": {"address", "origin", "started_at", "removed_at", "removed_manually", "ladder",

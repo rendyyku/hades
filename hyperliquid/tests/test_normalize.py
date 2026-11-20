@@ -291,9 +291,22 @@ def test_missing_close_gives_next_open_a_new_id(caplog):
     with caplog.at_level("WARNING", logger="hades_hl.normalize"):
         res = normalize_fills(ADDR, fills)
     assert [(lg.side, lg.position_id) for lg in res.legs] == [
-        ("open", "BTC:801"), ("open", "BTC:gap802"), ("close", "BTC:gap802")]
+        ("open", "BTC:801"), ("open", "BTC:802"), ("close", "BTC:802")]  # P25
     assert res.chain_gaps == 1
     assert any("gap" in r.getMessage() for r in caplog.records)
+
+
+def test_gap_fill_from_flat_gets_plain_id_but_counts_as_gap():
+    # ruling P25: a gap fill with startPosition == 0 opens a fresh episode -> {coin}:{tid}
+    fills = [
+        mk("ETH", "B", "2", "10", "0", T0, tid=901),
+        mk("ETH", "A", "1", "10", "0", T0 + 5, tid=902),  # should start at 2: gap, from flat
+        mk("ETH", "B", "1", "10", "-1", T0 + 6, tid=903),
+        mk("ETH", "B", "1", "10", "3", T0 + 7, tid=904),  # gap mid-position: keeps gap id
+    ]
+    res = normalize_fills(ADDR, fills)
+    assert [lg.position_id for lg in res.legs] == ["ETH:901", "ETH:902", "ETH:902", "ETH:gap904"]
+    assert res.chain_gaps == 2
 
 
 def test_ids_stable_when_history_starts_later(fixture):

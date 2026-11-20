@@ -1,0 +1,142 @@
+"""Task 6: the hades-hl CLI (typer CliRunner, respx for HTTP)."""
+
+import json
+
+import httpx
+import pytest
+import respx
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+from typer.testing import CliRunner
+
+from hades_hl import cli
+from hades_hl.client import HLClient
+from hades_hl.config import get_settings
+from hades_hl.db import Fill, Wallet, make_engine
+
+INFO = "https://api.hyperliquid.xyz/info"
+LB = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
+VAULTS = "https://stats-data.hyperliquid.xyz/Mainnet/vaults"
+KEY = "sekrit-hl-key-0123456789"
+A = "0x" + "a1" * 20
+B = "0x" + "b2" * 20
+
+runner = CliRunner()
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    async def sleep(self, s: float) -> None:
+        self.now += s
+
+
+@pytest.fixture
+def env(tmp_path, monkeypatch):
+    url = f"sqlite:///{(tmp_path / 'cli.db').as_posix()}"
+    monkeypatch.setenv("HL_DATABASE_URL", url)
+    monkeypatch.setenv("HL_API_KEY", KEY)
+    get_settings.cache_clear()
+
+    def fake_make_client(settings):
+        clock = FakeClock()
+        return HLClient.from_settings(settings, sleep=clock.sleep, clock=clock, max_attempts=2)
+
+    monkeypatch.setattr(cli, "make_client", fake_make_client)
+    yield url
+    get_settings.cache_clear()
+
+
+def invoke(*args):
+    res = runner.invoke(cli.app, list(args))
+    assert KEY not in res.output
+    if res.exception is not None and not isinstance(res.exception, SystemExit):
+        assert KEY not in repr(res.exception)
+    return res
+
+
+def lb_row(addr, pnl):
+    return {"ethAddress": addr, "accountValue": "10", "displayName": None, "prize": 0,
+            "windowPerformances": [["month", {"pnl": pnl, "roi": "0.1", "vlm": "1"}]]}
+
+
+def fill(tid, t):
+    return {"coin": "BTC", "px": "100.0", "sz": "1.0", "side": "B" if tid % 2 == 0 else "A",
+            "time": t, "startPosition": "0.0" if tid % 2 == 0 else "1.0",
+            "dir": "Open Long" if tid % 2 == 0 else "Close Long", "closedPnl": "0.0",
+            "hash": "0x00", "oid": tid, "crossed": True, "fee": "0.01", "tid": tid}
+
+
+@respx.mock
+def test_full_flow_never_prints_key_and_backfill_all_survives_429(env):
+    import time
+    now_ms = int(time.time() * 1000)
+    respx.get(LB).mock(return_value=httpx.Response(
+        200, json={"leaderboardRows": [lb_row(A, "9"), lb_row(B, "5")]}))
+    respx.get(VAULTS).mock(return_value=httpx.Response(200, json=[]))
+
+    def info(request):
+        body = json.loads(request.content)
+        if body["type"] == "meta":
+            return httpx.Response(200, json={"universe": [{"name": "BTC", "szDecimals": 5}]})
+        if body["user"] == A:  # wallet A is rate limited
+            return httpx.Response(429)
+        if body["type"] == "userFillsByTime":
+            rows = [fill(i, now_ms - 86_400_000 + i * 3_600_000) for i in range(4)]
+            return httpx.Response(200, json=rows)
+        return httpx.Response(200, json=[])
+
+    respx.post(INFO).mock(side_effect=info)
+
+    assert invoke("init-db").exit_code == 0
+    r = invoke("discover", "--limit", "5")
+    assert r.exit_code == 0, r.output
+    assert "2" in r.output
+    r = invoke("backfill", "--all", "--days", "30")
+    assert r.exit_code == 0, r.output
+    assert "rate limited" in r.output.lower()
+    r = invoke("rescore")
+    assert r.exit_code == 0, r.output
+    assert "scored" in r.output
+
+    eng = make_engine(env)
+    with Session(eng) as s:
+        assert {f.address for f in s.scalars(select(Fill))} == {B}
+        w = s.get(Wallet, B)
+        assert w.stats_json["score_reason"] == "n<30"
+        assert w.scored_at is not None
+
+
+@respx.mock
+def test_discover_leaderboard_down_exit_0_with_message(env):
+    respx.get(LB).mock(return_value=httpx.Response(503))
+    respx.get(VAULTS).mock(return_value=httpx.Response(200, json=[]))
+    r = invoke("discover", "--limit", "5")
+    assert r.exit_code == 0
+    assert "leaderboard unavailable" in r.output.lower()
+
+
+def test_backfill_requires_address_or_all(env):
+    r = invoke("backfill")
+    assert r.exit_code != 0
+
+
+@pytest.mark.parametrize("cmd", ["serve", "tag", "follow-sync", "paper-run"])
+def test_later_task_commands_are_stubs(env, cmd):
+    r = invoke(cmd)
+    assert r.exit_code == 2
+    assert "not implemented in Task 6" in r.output
+
+
+def test_serve_defaults_localhost_8010(env):
+    r = invoke("serve", "--help")
+    assert r.exit_code == 0
+    assert "127.0.0.1" in r.output and "8010" in r.output
+
+
+def test_typer_hides_locals():
+    assert cli.app.pretty_exceptions_show_locals is False

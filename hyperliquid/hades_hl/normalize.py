@@ -274,7 +274,9 @@ def normalize_fills(addr: str, fills: Iterable[Mapping]) -> Normalized:
     - ``{coin}:{tid}f``: the open leg of flip fill ``tid``;
     - ``{coin}:pre{tid}``: history starts mid-position at fill ``tid``;
     - ``{coin}:gap{tid}``: fill ``tid`` does not start where the coin's previous fill
-      ended (a missing fill); logged and counted in ``chain_gaps``.
+      ended (a missing fill); logged and counted in ``chain_gaps``. A gap fill with
+      ``startPosition == 0`` gets the plain ``{coin}:{tid}`` (ruling P25) but is still
+      counted in ``chain_gaps``.
     Ids depend only on the fills of the episode itself, so they are stable across
     window shifts and re-normalization.
     """
@@ -296,7 +298,9 @@ def normalize_fills(addr: str, fills: Iterable[Mapping]) -> Normalized:
             gaps += 1
             log.warning("hl %s %s: chain gap at tid %s (startPosition %s, previous end %s); "
                         "new episode", addr, coin, tid, s, last_end[coin])
-            cur[coin] = f"{coin}:gap{tid}"
+            # ruling P25: a gap fill from flat opens a normal episode (plain id);
+            # it still counts as a chain gap
+            cur[coin] = f"{coin}:{tid}" if s == 0 else f"{coin}:gap{tid}"
         elif s == 0:
             cur[coin] = f"{coin}:{tid}"
         last_end[coin] = e

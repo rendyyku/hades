@@ -401,3 +401,25 @@ async def test_requests_are_charged_to_weight_bucket():
         await c.user_fills_by_time(ADDR, 1_700_000_000_000)
         # 20 base + 100//20 = 5 per-item -> 25 spent from 1200
         assert c._bucket.tokens == pytest.approx(1200 - 25)
+
+
+@respx.mock
+async def test_fills_on_page_called_per_page_and_at_cap():
+    t0 = 1_700_000_000_000
+    pages = [[fill(p * 2000 + i, t0 + p * 2000 + i) for i in range(2000)] for p in range(6)]
+    respx.post(INFO).mock(side_effect=[httpx.Response(200, json=pg) for pg in pages])
+    got: list[int] = []
+    async with make_client() as c:
+        page = await c.user_fills_by_time(ADDR, t0, on_page=lambda new: got.append(len(new)))
+    assert got == [2000, 2000, 2000, 2000, 2000]
+    assert sum(got) == len(page.fills) == FILLS_HISTORY_CAP
+
+
+@respx.mock
+async def test_funding_on_page_called():
+    rows = [{"time": 1_700_000_000_000 + i, "delta": {"coin": "BTC", "usdc": "1"}} for i in range(3)]
+    respx.post(INFO).mock(return_value=httpx.Response(200, json=rows))
+    got: list[list] = []
+    async with make_client() as c:
+        await c.user_funding(ADDR, 0, on_page=got.append)
+    assert [len(g) for g in got] == [3]

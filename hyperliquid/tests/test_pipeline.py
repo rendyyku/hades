@@ -1,0 +1,309 @@
+"""Task 6: discovery, backfill, rescore (respx for HTTP)."""
+
+import json
+from datetime import datetime, timedelta, timezone
+
+import httpx
+import pytest
+import respx
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from hades_hl import pipeline
+from hades_hl.client import HLClient, HLRateLimited
+from hades_hl.db import Fill, Funding, Kv, Wallet, init_db, insert_fills, make_engine
+from hlfills import DAY_MS, mk
+
+INFO = "https://api.hyperliquid.xyz/info"
+LB = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
+VAULTS = "https://stats-data.hyperliquid.xyz/Mainnet/vaults"
+NOW = datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc)
+NOW_MS = int(NOW.timestamp() * 1000)
+A = "0x" + "a1" * 20
+B = "0x" + "b2" * 20
+C = "0x" + "c3" * 20
+V = "0x" + "dd" * 20  # a vault
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    async def sleep(self, s: float) -> None:
+        self.now += s
+
+
+def make_client(**kw) -> HLClient:
+    clock = FakeClock()
+    return HLClient(sleep=clock.sleep, clock=clock, **kw)
+
+
+@pytest.fixture
+def engine(tmp_path):
+    eng = make_engine(f"sqlite:///{tmp_path / 'hl.db'}")
+    init_db(eng)
+    return eng
+
+
+@pytest.fixture
+def session(engine):
+    with Session(engine) as s:
+        yield s
+
+
+def lb_row(addr: str, month_pnl: str, account_value: str = "1000", name=None) -> dict:
+    return {"ethAddress": addr, "accountValue": account_value, "displayName": name, "prize": 0,
+            "windowPerformances": [
+                ["day", {"pnl": "1", "roi": "0.1", "vlm": "10"}],
+                ["month", {"pnl": month_pnl, "roi": "0.2", "vlm": "100"}],
+                ["allTime", {"pnl": "5", "roi": "0.3", "vlm": "1000"}]]}
+
+
+def vault_row(addr: str) -> dict:
+    return {"apr": 0.1, "pnls": [], "summary": {"name": "v", "vaultAddress": addr,
+                                                "leader": A, "tvl": "1", "isClosed": False}}
+
+
+def fill(tid: int, t: int, coin: str = "BTC") -> dict:
+    # independent open/close pairs: even tid opens, odd closes
+    return {"coin": coin, "px": "100.0", "sz": "1.0", "side": "B" if tid % 2 == 0 else "A",
+            "time": t, "startPosition": "0.0" if tid % 2 == 0 else "1.0",
+            "dir": "Open Long" if tid % 2 == 0 else "Close Long", "closedPnl": "0.0",
+            "hash": "0x00", "oid": tid, "crossed": True, "fee": "0.01", "tid": tid,
+            "feeToken": "USDC"}
+
+
+def funding_row(t: int, coin: str = "BTC", usdc: str = "-0.5") -> dict:
+    return {"time": t, "hash": "0x0", "delta": {"type": "funding", "coin": coin, "usdc": usdc,
+                                                "szi": "1", "fundingRate": "0.0001"}}
+
+
+def info_router(fills_pages=(), funding_pages=(), meta=None):
+    """respx side effect dispatching on the info request type."""
+    fills_q = list(fills_pages)
+    fund_q = list(funding_pages)
+
+    def handler(request):
+        body = json.loads(request.content)
+        t = body["type"]
+        if t == "userFillsByTime":
+            r = fills_q.pop(0) if fills_q else []
+        elif t == "userFunding":
+            r = fund_q.pop(0) if fund_q else []
+        elif t == "meta":
+            r = meta
+        else:  # pragma: no cover
+            raise AssertionError(t)
+        return r if isinstance(r, httpx.Response) else httpx.Response(200, json=r)
+
+    return handler
+
+
+# -- discover -------------------------------------------------------------------
+
+@respx.mock
+async def test_discover_dedupes_ranks_and_excludes_vaults(session):
+    rows = [lb_row(A, "50"), lb_row(B, "300"), lb_row(A.upper().replace("0X", "0x"), "50"),
+            lb_row(V, "999"), lb_row(C, "10"), lb_row(B, "300")]
+    respx.get(LB).mock(return_value=httpx.Response(200, json={"leaderboardRows": rows}))
+    respx.get(VAULTS).mock(return_value=httpx.Response(200, json=[vault_row(V)]))
+    async with make_client() as c:
+        got = await pipeline.discover(session, c, limit=2, now=NOW)
+    assert list(got) == [B, A]  # by month pnl, vault skipped, deduped case-insensitively
+    assert got.error is None
+    stored = {w.address: w for w in session.scalars(select(Wallet))}
+    assert set(stored) == {A, B}
+    assert stored[B].stats_json["leaderboard"]["pnl_month"] == 300.0
+    assert stored[B].is_vault is False
+
+
+@respx.mock
+async def test_discover_caches_candidates_not_raw_body_for_24h(session):
+    lb = respx.get(LB).mock(return_value=httpx.Response(
+        200, json={"leaderboardRows": [lb_row(A, "5"), lb_row(B, "7")]}))
+    vr = respx.get(VAULTS).mock(return_value=httpx.Response(200, json=[]))
+    async with make_client() as c:
+        await pipeline.discover(session, c, limit=5, now=NOW)
+        await pipeline.discover(session, c, limit=5, now=NOW + timedelta(hours=23))
+        assert lb.call_count == 1 and vr.call_count == 1
+        await pipeline.discover(session, c, limit=5, now=NOW + timedelta(hours=25))
+        assert lb.call_count == 2 and vr.call_count == 2
+    cached = json.loads(session.get(Kv, pipeline.KV_LEADERBOARD).value)
+    assert "leaderboardRows" not in cached
+    assert [r["address"] for r in cached["rows"]] == [B, A]
+
+
+@respx.mock
+async def test_discover_leaderboard_unavailable_returns_empty(session, caplog):
+    respx.get(LB).mock(return_value=httpx.Response(503))
+    respx.get(VAULTS).mock(return_value=httpx.Response(200, json=[]))
+    async with make_client(max_attempts=1) as c:
+        with caplog.at_level("WARNING", logger="hades_hl.pipeline"):
+            got = await pipeline.discover(session, c, limit=5, now=NOW)
+    assert list(got) == []
+    assert got.error and "leaderboard" in got.error
+    assert any("leaderboard" in r.getMessage() for r in caplog.records)
+
+
+@respx.mock
+async def test_discover_vault_list_unavailable_still_discovers(session):
+    respx.get(LB).mock(return_value=httpx.Response(
+        200, json={"leaderboardRows": [lb_row(A, "5")]}))
+    respx.get(VAULTS).mock(return_value=httpx.Response(503))
+    async with make_client(max_attempts=1) as c:
+        got = await pipeline.discover(session, c, limit=5, now=NOW)
+    assert list(got) == [A]
+
+
+@respx.mock
+async def test_discover_marks_existing_wallet_as_vault(session):
+    session.add(Wallet(address=V))
+    session.commit()
+    respx.get(LB).mock(return_value=httpx.Response(
+        200, json={"leaderboardRows": [lb_row(V, "5"), lb_row(A, "1")]}))
+    respx.get(VAULTS).mock(return_value=httpx.Response(200, json=[vault_row(V)]))
+    async with make_client() as c:
+        got = await pipeline.discover(session, c, limit=5, now=NOW)
+    assert list(got) == [A]
+    assert session.get(Wallet, V).is_vault is True
+
+
+# -- backfill -------------------------------------------------------------------
+
+@respx.mock
+async def test_backfill_rerun_inserts_zero(session):
+    t0 = NOW_MS - 5 * DAY_MS
+    fills = [fill(i, t0 + i * 1000) for i in range(10)]
+    fund = [funding_row(t0 + 3600_000 * k) for k in range(3)]
+    route = respx.post(INFO).mock(side_effect=info_router(
+        fills_pages=[fills, fills[-1:]], funding_pages=[fund, fund[-1:]]))
+    async with make_client() as c:
+        r1 = await pipeline.backfill(session, c, A, days=30, now=NOW)
+        r2 = await pipeline.backfill(session, c, A, days=30, now=NOW)
+    assert (r1.new_fills, r1.new_funding, r1.truncated) == (10, 3, False)
+    assert (r2.new_fills, r2.new_funding) == (0, 0)
+    bodies = [json.loads(call.request.content) for call in route.calls]
+    fills_bodies = [b for b in bodies if b["type"] == "userFillsByTime"]
+    assert fills_bodies[0]["startTime"] == NOW_MS - 30 * DAY_MS
+    assert fills_bodies[1]["startTime"] == fills[-1]["time"]  # resume: max stored, inclusive
+    fund_bodies = [b for b in bodies if b["type"] == "userFunding"]
+    assert fund_bodies[1]["startTime"] == fund[-1]["time"]
+    assert session.scalar(select(func.count()).select_from(Fill)) == 10
+    assert session.scalar(select(func.count()).select_from(Funding)) == 3
+    w = session.get(Wallet, A)
+    assert w.stats_json["backfill"]["history_partial"] is False
+
+
+@respx.mock
+async def test_429_mid_backfill_keeps_earlier_pages(engine):
+    t0 = NOW_MS - 5 * DAY_MS
+    page1 = [fill(i, t0 + i) for i in range(2000)]
+    respx.post(INFO).mock(side_effect=info_router(
+        fills_pages=[page1] + [httpx.Response(429)] * 2))
+    with Session(engine) as s:
+        async with make_client(max_attempts=2) as c:
+            with pytest.raises(HLRateLimited):
+                await pipeline.backfill(s, c, A, days=30, now=NOW)
+    with Session(engine) as fresh:  # committed, not just flushed
+        assert fresh.scalar(select(func.count()).select_from(Fill)) == 2000
+        assert fresh.get(Wallet, A) is not None
+
+
+@respx.mock
+async def test_backfill_truncated_sets_history_partial_sticky(session):
+    t0 = NOW_MS - 5 * DAY_MS
+    pages = [[fill(p * 2000 + i, t0 + p * 2000 + i) for i in range(2000)] for p in range(5)]
+    respx.post(INFO).mock(side_effect=info_router(fills_pages=pages + [[]]))
+    async with make_client() as c:
+        r = await pipeline.backfill(session, c, A, days=30, now=NOW)
+        assert r.truncated is True and r.new_fills == 10_000
+        assert session.get(Wallet, A).stats_json["backfill"]["history_partial"] is True
+        r2 = await pipeline.backfill(session, c, A, days=30, now=NOW)  # not truncated now
+    assert r2.truncated is False
+    assert session.get(Wallet, A).stats_json["backfill"]["history_partial"] is True
+
+
+# -- sz decimals / rescore ----------------------------------------------------------
+
+@respx.mock
+async def test_load_sz_decimals_cached_24h(session):
+    meta = {"universe": [{"name": "BTC", "szDecimals": 5}, {"name": "ETH", "szDecimals": 4}]}
+    route = respx.post(INFO).mock(side_effect=info_router(meta=meta))
+    async with make_client() as c:
+        assert await pipeline.load_sz_decimals(session, c, NOW) == {"BTC": 5, "ETH": 4}
+        await pipeline.load_sz_decimals(session, c, NOW + timedelta(hours=23))
+        assert route.call_count == 1
+        await pipeline.load_sz_decimals(session, c, NOW + timedelta(hours=25))
+        assert route.call_count == 2
+
+
+def round_trips(n: int, t0: int, step_ms: int, *, win: bool = True) -> list[dict]:
+    out = []
+    for k in range(n):
+        t = t0 + k * step_ms
+        out.append(mk("BTC", "B", "1", "100", "0", t))
+        out.append(mk("BTC", "A", "1", "110" if win else "90", "1", t + 3_600_000,
+                      closed_pnl="10" if win else "-10"))
+    return out
+
+
+def test_rescore_persists_scores_reasons_and_passes_sz_decimals(session, monkeypatch):
+    t0 = NOW_MS - 20 * DAY_MS
+    session.add_all([Wallet(address=A), Wallet(address=B), Wallet(address=C),
+                     Wallet(address=V, is_vault=True)])
+    insert_fills(session, A, round_trips(35, t0, DAY_MS // 2))
+    insert_fills(session, B, round_trips(35, t0, DAY_MS // 2, win=False))
+    insert_fills(session, C, round_trips(3, t0, DAY_MS))
+    session.add(Funding(address=A, coin="BTC", time=t0 + 1000, usdc="-1.5"))
+    session.commit()
+
+    seen = {}
+    real = pipeline.wallet_stats
+
+    def spy(addr, fills, funding, now, window_days=30, **kw):
+        seen[addr] = kw
+        return real(addr, fills, funding, now, window_days, **kw)
+
+    monkeypatch.setattr(pipeline, "wallet_stats", spy)
+    res = pipeline.rescore(session, NOW, sz_decimals={"BTC": 5})
+    session.commit()
+    assert seen[A]["sz_decimals"] == {"BTC": 5}
+    assert seen[A]["oldest_fill_time"] == datetime.fromtimestamp(t0 / 1000, tz=timezone.utc)
+    w = {x.address: x for x in session.scalars(select(Wallet))}
+    assert w[A].score is not None and w[B].score is not None
+    assert w[A].score > w[B].score
+    assert w[C].score is None and w[C].stats_json["score_reason"] == "n<30"
+    assert w[V].score is None and w[V].stats_json["score_reason"] == "bot"
+    assert w[A].stats_json["funding_usd"] == pytest.approx(-1.5)
+    assert w[A].scored_at is not None
+    assert res.scored == 2 and res.unscored == 2
+    assert res.reasons == {"n<30": 1, "bot": 1}
+
+
+def test_rescore_partial_history_under_7_days_unscored(session):
+    t0 = NOW_MS - 3 * DAY_MS
+    session.add(Wallet(address=A, stats_json={"backfill": {"history_partial": True}}))
+    insert_fills(session, A, round_trips(40, t0, DAY_MS // 20))
+    session.commit()
+    pipeline.rescore(session, NOW, sz_decimals={})
+    w = session.get(Wallet, A)
+    assert w.score is None
+    assert w.stats_json["score_reason"] == "history too short (hyperactive)"
+    assert w.stats_json["history_partial"] is True
+    assert w.stats_json["window_days"] == pytest.approx(3.0)
+    assert w.stats_json["backfill"]["history_partial"] is True  # metadata kept
+
+
+def test_stored_fill_roundtrip_keeps_liquidation_victim_and_builder_fee(session):
+    f = mk("BTC", "A", "1", "90", "1", NOW_MS, liquidation={"liquidatedUser": B, "markPx": "90",
+                                                            "method": "market"})
+    f["builderFee"] = "0.25"
+    insert_fills(session, A, [f])
+    session.commit()
+    (got,) = pipeline.stored_fills(session, A)
+    assert got["liquidation"]["liquidatedUser"] == B
+    assert got["builderFee"] == "0.25"
+    assert got["startPosition"] == "1" or got["startPosition"] == "1.0"
