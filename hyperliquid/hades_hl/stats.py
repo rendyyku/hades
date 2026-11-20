@@ -22,8 +22,12 @@ Definitions (all outputs are plain floats/ints/None so they serialize as JSON):
 - Days are 24 h buckets anchored at the window start.
 
 Partial history (ruling P17): with ``history_partial=True`` (the fills read hit the
-10k-fill cap) the window starts at the oldest fill and ``window_days`` reports the
-covered span ``(now - oldest fill)`` in days.
+10k-fill cap) the window starts at the oldest *fetched* fill (``oldest_fill_time``,
+else the oldest of the given fills; never before the nominal window start) and
+``window_days`` reports the covered span ``(now - that start)`` in days.
+
+- ``chain_gaps``: startPosition chain breaks (missing fills) in the window, see
+  :func:`hades_hl.normalize.normalize_fills`.
 """
 
 from __future__ import annotations
@@ -36,7 +40,7 @@ from decimal import Decimal
 
 from hades_core.events import require_utc
 
-from hades_hl.normalize import fill_legs, is_spot, leverage_by_coin
+from hades_hl.normalize import is_spot, leverage_by_coin, normalize_fills
 from hades_hl.pnl import funding_usdc, wallet_pnl
 
 DAY_MS = 86_400_000
@@ -48,31 +52,39 @@ def _median(xs: list[float]) -> float | None:
 
 
 def wallet_stats(
+    addr: str,
     fills: Iterable[Mapping],
     funding: Iterable[Mapping],
     now: datetime,
     window_days: float = 30,
     *,
-    addr: str | None = None,
     history_partial: bool = False,
     clearinghouse: Mapping | None = None,
+    oldest_fill_time: datetime | None = None,
+    sz_decimals: Mapping[str, int] | None = None,
 ) -> dict:
     require_utc("now", now)
+    fills = list(fills)
     now_ms = int(now.timestamp() * 1000)
     start_ms = now_ms - int(window_days * DAY_MS)
     in_win = [f for f in fills if start_ms <= int(f["time"]) <= now_ms]
     span_days: float = window_days
     if history_partial:
-        if in_win:
-            start_ms = min(int(f["time"]) for f in in_win)
+        if oldest_fill_time is not None:
+            require_utc("oldest_fill_time", oldest_fill_time)
+            oldest = int(oldest_fill_time.timestamp() * 1000)
+        elif fills:
+            oldest = min(int(f["time"]) for f in fills)
         else:
-            start_ms = now_ms
+            oldest = now_ms
+        start_ms = min(max(start_ms, oldest), now_ms)
+        in_win = [f for f in fills if start_ms <= int(f["time"]) <= now_ms]
         span_days = (now_ms - start_ms) / DAY_MS
     perp = [f for f in in_win if not is_spot(f)]
     fund = [r for r in funding if start_ms <= int(r["time"]) <= now_ms]
 
-    pnl = wallet_pnl(perp, fund, addr=addr)
-    legs = fill_legs(perp, addr)
+    pnl = wallet_pnl(addr, perp, fund, sz_decimals=sz_decimals)
+    legs = normalize_fills(addr, perp).legs
 
     # -- margin / leverage ------------------------------------------------------
     lev = leverage_by_coin(clearinghouse)
@@ -155,4 +167,5 @@ def wallet_stats(
         "closedpnl_mismatch": pnl.closedpnl_mismatch,
         "closedpnl_mismatch_pct": (float(pnl.mismatch_pct)
                                    if pnl.mismatch_pct is not None else None),
+        "chain_gaps": pnl.chain_gaps,
     }

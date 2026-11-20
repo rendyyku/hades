@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from decimal import Decimal
 
 ADDR = "0x" + "ab" * 20
@@ -57,3 +58,7 @@ def round_trip(coin: str, t_open: int, hold_ms: int, pnl, *, sz="1", px="100",
         mk(coin, c_side, sz, close_px, start_close, t_open + hold_ms, closed_pnl=pnl, fee=fee,
            crossed=crossed),
     ]
+
+
+def ms_dt(ms: int) -> datetime:
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)

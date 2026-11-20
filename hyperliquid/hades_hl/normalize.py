@@ -4,7 +4,9 @@ Ordering: HL ``tid`` is NOT monotonic, even inside one millisecond (verified on 
 real fixture: sorting by tid breaks the ``startPosition`` chain on 797 of 1312
 fills). The authoritative order of one coin's fills is the ``startPosition`` chain:
 each fill starts where the previous one ended. :func:`order_fills` sorts by time
-and, inside a millisecond, re-chains each coin's fills by ``startPosition``.
+and, inside a millisecond, re-chains each coin's fills by ``startPosition`` (ruling P23:
+backtracking search for groups <= 12 fills, deterministic ``(startPosition, tid)``
+tie-break, fallback ``(startPosition, tid)`` order with a warning).
 
 Side/direction come from position arithmetic, not from HL's ``dir`` text (``dir``
 says "Open Long" for an increase too): with ``s = startPosition`` and the signed
@@ -15,7 +17,10 @@ delta ``d`` (+sz for a buy ``B``, -sz for a sell ``A``), ``e = s + d``:
 - same sign, ``0 < |e| < |s|``  -> reduce;  ``e == 0`` -> close
 - sign change                   -> flip: close ``|s|`` + open ``|e|`` (two legs)
 
-A fill carrying a ``liquidation`` object of this wallet always maps to ``close``.
+Liquidation (ruling P18) follows the same arithmetic: a partial one is ``reduce``, a
+full one ``close``; in a liquidation flip only the close leg is flagged liquidated.
+Only fills whose ``liquidation.liquidatedUser`` is ``addr`` count (``addr`` is
+required). Fees are ``fee + builderFee`` (P20). Position ids: :func:`normalize_fills`.
 Spot fills (``@123`` or ``PURR/USDC``) are dropped; HIP-3 ``dex:COIN`` are perps.
 """
 
@@ -49,18 +54,21 @@ def signed_delta(fill: Mapping) -> Decimal:
     return sz if fill["side"] == "B" else -sz
 
 
-def is_own_liquidation(fill: Mapping, addr: str | None = None) -> bool:
-    """True when the fill liquidated *this* wallet (not one where we were the liquidator).
-
-    Without ``addr`` (or without ``liquidatedUser``) any liquidation fill counts.
-    """
+def is_own_liquidation(fill: Mapping, addr: str) -> bool:
+    """True when the fill liquidated *this* wallet (not one where ``addr`` was the
+    liquidator / backstop). A liquidation object without ``liquidatedUser`` counts."""
     liq = fill.get("liquidation")
     if not liq:
         return False
     victim = liq.get("liquidatedUser") if isinstance(liq, Mapping) else None
-    if addr is None or not victim:
+    if not victim:
         return True
     return str(victim).lower() == addr.lower()
+
+
+def fill_fee(fill: Mapping) -> Decimal:
+    """Total fee of a fill: ``fee`` + ``builderFee`` (when present), in USDC."""
+    return Decimal(str(fill.get("fee") or "0")) + Decimal(str(fill.get("builderFee") or "0"))
 
 
 def leverage_by_coin(clearinghouse_state: Mapping | None) -> dict[str, Decimal]:
@@ -81,13 +89,35 @@ def leverage_by_coin(clearinghouse_state: Mapping | None) -> dict[str, Decimal]:
     return out
 
 
+def sz_decimals_by_coin(meta: Mapping | None) -> dict[str, int]:
+    """``{coin: szDecimals}`` from a ``meta`` response ({} if unavailable)."""
+    out: dict[str, int] = {}
+    for u in (meta or {}).get("universe") or []:
+        if u and u.get("name") is not None and u.get("szDecimals") is not None:
+            out[u["name"]] = int(u["szDecimals"])
+    return out
+
+
 def _require_tid(f: Mapping) -> None:
     if f.get("tid") is None:
         raise ValueError(f"HL fill without tid (coin={f.get('coin')}, time={f.get('time')})")
 
 
+def _start(f: Mapping) -> Decimal:
+    return Decimal(str(f["startPosition"]))
+
+
+def _end(f: Mapping) -> Decimal:
+    return _start(f) + signed_delta(f)
+
+
 def order_fills(fills: Iterable[Mapping]) -> list[dict]:
     """Perp fills, de-duplicated by tid, in true execution order (see module doc)."""
+    return _order(fills)[0]
+
+
+def _order(fills: Iterable[Mapping]) -> tuple[list[dict], int]:
+    """(ordered perp fills, number of same-ms groups with no full chain)."""
     seen: set = set()
     uniq: list[dict] = []
     for f in fills:
@@ -96,50 +126,101 @@ def order_fills(fills: Iterable[Mapping]) -> list[dict]:
             continue
         seen.add(f["tid"])
         uniq.append(dict(f))
-    # group by (time, coin), keeping first-seen order of the groups inside a ms
-    by_time = sorted(range(len(uniq)), key=lambda i: int(uniq[i]["time"]))
+    # bucket by (time, coin); coins inside one ms in sorted order (independent of input)
+    buckets: dict[int, dict[str, list[dict]]] = {}
+    for f in uniq:
+        buckets.setdefault(int(f["time"]), {}).setdefault(f["coin"], []).append(f)
     out: list[dict] = []
+    broken = 0
     last_end: dict[str, Decimal] = {}
-    i = 0
-    while i < len(by_time):
-        t = int(uniq[by_time[i]]["time"])
-        j = i
-        while j < len(by_time) and int(uniq[by_time[j]]["time"]) == t:
-            j += 1
-        groups: dict[str, list[dict]] = {}
-        for k in by_time[i:j]:
-            groups.setdefault(uniq[k]["coin"], []).append(uniq[k])
-        for coin, grp in groups.items():
-            for f in _chain(grp, last_end.get(coin)):
-                out.append(f)
-                last_end[coin] = Decimal(str(f["startPosition"])) + signed_delta(f)
-        i = j
-    return out
+    for t in sorted(buckets):
+        for coin in sorted(buckets[t]):
+            grp, ok = _chain(buckets[t][coin], last_end.get(coin))
+            if not ok:
+                broken += 1
+                log.warning("hl %s @%d: no full startPosition chain over %d same-ms fills; "
+                            "falling back to (startPosition, tid) order", coin, t, len(grp))
+            out.extend(grp)
+            last_end[coin] = _end(grp[-1])
+    return out, broken
 
 
-def _chain(grp: list[dict], prev_end: Decimal | None) -> list[dict]:
-    """Order one coin's same-ms fills so each starts where the previous ended."""
-    if len(grp) == 1:
-        return grp
-    rest = list(grp)
-    starts = [Decimal(str(f["startPosition"])) for f in rest]
-    ends = [s + signed_delta(f) for s, f in zip(starts, rest)]
-    # first: the fill continuing prev_end, else the one no other fill leads into
-    first = None
+CHAIN_SEARCH_MAX = 12  # same-ms groups up to this size get an exhaustive search
+
+
+def _tie(f: Mapping) -> tuple:
+    return (_start(f), f["tid"])
+
+
+def _chain(grp: list[dict], prev_end: Decimal | None) -> tuple[list[dict], bool]:
+    """Order one coin's same-ms fills so each starts where the previous ended.
+
+    Returns ``(order, full_chain)``. The first fill must start at ``prev_end``; if no
+    full chain does, (a gap before this group) the start is chosen as with no previous
+    end: ``startPosition == 0`` first, then the lowest tid. Candidates are tried in
+    ``(startPosition, tid)`` order, so the result does not depend on input order.
+    Groups of <= CHAIN_SEARCH_MAX fills are searched exhaustively (backtracking),
+    larger ones greedily. With no full chain: ``sorted by (startPosition, tid)``.
+    """
+    fs = sorted(grp, key=_tie)
+    if len(fs) == 1:
+        return fs, True
+    starts = [_start(f) for f in fs]
+    ends = [_end(f) for f in fs]
+    free_first = sorted(range(len(fs)), key=lambda k: (starts[k] != 0, fs[k]["tid"]))
+    attempts = []
     if prev_end is not None:
-        first = next((k for k, s in enumerate(starts) if s == prev_end), None)
-    if first is None:
-        first = next((k for k, s in enumerate(starts) if s not in ends), 0)
-    order = [first]
-    used = {first}
-    while len(order) < len(rest):
-        cur_end = ends[order[-1]]
-        nxt = next((k for k in range(len(rest)) if k not in used and starts[k] == cur_end), None)
-        if nxt is None:  # broken chain: keep the remaining fills in input order
-            nxt = next(k for k in range(len(rest)) if k not in used)
-        order.append(nxt)
-        used.add(nxt)
-    return [rest[k] for k in order]
+        attempts.append([k for k in range(len(fs)) if starts[k] == prev_end])
+    attempts.append(free_first)
+    for firsts in attempts:
+        order = _search(starts, ends, firsts) if len(fs) <= CHAIN_SEARCH_MAX else \
+            _greedy(starts, ends, firsts)
+        if order is not None:
+            return [fs[k] for k in order], True
+    return fs, False
+
+
+def _search(starts: list, ends: list, firsts: list[int]) -> list[int] | None:
+    n = len(starts)
+    full = (1 << n) - 1
+    dead: set[tuple[int, int]] = set()
+
+    def go(order: list[int], mask: int) -> bool:
+        if mask == full:
+            return True
+        last = order[-1]
+        if (mask, last) in dead:
+            return False
+        for k in range(n):  # indices are already in (startPosition, tid) order
+            if not mask & (1 << k) and starts[k] == ends[last]:
+                order.append(k)
+                if go(order, mask | (1 << k)):
+                    return True
+                order.pop()
+        dead.add((mask, last))
+        return False
+
+    for k in firsts:
+        order = [k]
+        if go(order, 1 << k):
+            return order
+    return None
+
+
+def _greedy(starts: list, ends: list, firsts: list[int]) -> list[int] | None:
+    n = len(starts)
+    for first in firsts:
+        order, used = [first], {first}
+        while len(order) < n:
+            nxt = next((k for k in range(n) if k not in used and starts[k] == ends[order[-1]]),
+                       None)
+            if nxt is None:
+                break
+            order.append(nxt)
+            used.add(nxt)
+        if len(order) == n:
+            return order
+    return None
 
 
 @dataclass(frozen=True)
@@ -173,51 +254,85 @@ def _dir(x: Decimal) -> str:
     return "long" if x > 0 else "short"
 
 
-def fill_legs(fills: Iterable[Mapping], addr: str | None = None) -> list[Leg]:
-    """Ordered perp legs with position ids ``{coin}:{n}`` (n bumps when flat)."""
+@dataclass(frozen=True)
+class Normalized:
+    legs: list[Leg]
+    # startPosition chain breaks: fills not starting where the coin's previous fill
+    # ended (a missing fill, or a same-ms group with no full chain)
+    chain_gaps: int
+
+
+def fill_legs(addr: str, fills: Iterable[Mapping]) -> list[Leg]:
+    """Ordered perp legs with stable position ids (see :func:`normalize_fills`)."""
+    return normalize_fills(addr, fills).legs
+
+
+def normalize_fills(addr: str, fills: Iterable[Mapping]) -> Normalized:
+    """Ordered perp legs of ``addr`` with stable position ids (ruling P22).
+
+    - ``{coin}:{tid}``: an episode opened (from flat) by fill ``tid``;
+    - ``{coin}:{tid}f``: the open leg of flip fill ``tid``;
+    - ``{coin}:pre{tid}``: history starts mid-position at fill ``tid``;
+    - ``{coin}:gap{tid}``: fill ``tid`` does not start where the coin's previous fill
+      ended (a missing fill); logged and counted in ``chain_gaps``.
+    Ids depend only on the fills of the episode itself, so they are stable across
+    window shifts and re-normalization.
+    """
+    # a same-ms group with no full chain always leaves >= 1 break in its fallback order,
+    # which the per-fill check below counts; _order only logs it
+    ordered, _ = _order(fills)
+    gaps = 0
     legs: list[Leg] = []
-    episode: dict[str, int] = {}
-    for f in order_fills(fills):
-        coin = f["coin"]
-        n = episode.setdefault(coin, 0)
-        s = Decimal(str(f["startPosition"]))
+    cur: dict[str, str | None] = {}  # coin -> open episode id (None when flat)
+    last_end: dict[str, Decimal] = {}
+    for f in ordered:
+        coin, tid = f["coin"], f["tid"]
+        s = _start(f)
         d = signed_delta(f)
+        e = s + d
+        if coin not in last_end:
+            cur[coin] = f"{coin}:{tid}" if s == 0 else f"{coin}:pre{tid}"
+        elif s != last_end[coin]:
+            gaps += 1
+            log.warning("hl %s %s: chain gap at tid %s (startPosition %s, previous end %s); "
+                        "new episode", addr, coin, tid, s, last_end[coin])
+            cur[coin] = f"{coin}:gap{tid}"
+        elif s == 0:
+            cur[coin] = f"{coin}:{tid}"
+        last_end[coin] = e
         if d == 0:
             continue
-        e = s + d
+        pid = cur[coin]
         px = Decimal(str(f["px"]))
-        fee = Decimal(str(f.get("fee") or "0"))
+        fee = fill_fee(f)
         cpnl = Decimal(str(f.get("closedPnl") or "0"))
         liq = is_own_liquidation(f, addr)
         sz = abs(d)
 
-        def leg(side, direction, size, fee_, cpnl_, pid, st, en, suffix="") -> Leg:
-            return Leg(f, coin, side, direction, size, px, fee_, cpnl_, pid, st, en, liq, suffix)
+        def leg(side, direction, size, fee_, cpnl_, pid_, st, en, liq_, suffix="") -> Leg:
+            return Leg(f, coin, side, direction, size, px, fee_, cpnl_, pid_, st, en, liq_,
+                       suffix)
 
         if s == 0:
-            legs.append(leg("open", _dir(d), sz, fee, cpnl, f"{coin}:{n}", s, e))
-        elif e != 0 and (e > 0) != (s > 0):  # flip
+            legs.append(leg("open", _dir(d), sz, fee, cpnl, pid, s, e, liq))
+        elif e != 0 and (e > 0) != (s > 0):  # flip: the liquidation (if any) is the close
             close_sz, open_sz = abs(s), abs(e)
             close_fee = fee * close_sz / sz
-            legs.append(leg("close", _dir(s), close_sz, close_fee, cpnl, f"{coin}:{n}",
-                            s, ZERO, ":close"))
-            n += 1
-            legs.append(leg("open", _dir(e), open_sz, fee - close_fee, ZERO, f"{coin}:{n}",
-                            ZERO, e, ":open"))
-        else:
-            grows = (d > 0) == (s > 0)
-            if liq and not grows:
-                side = "close"
-            elif grows:
+            legs.append(leg("close", _dir(s), close_sz, close_fee, cpnl, pid, s, ZERO, liq,
+                            ":close"))
+            pid = cur[coin] = f"{coin}:{tid}f"
+            legs.append(leg("open", _dir(e), open_sz, fee - close_fee, ZERO, pid, ZERO, e,
+                            False, ":open"))
+        else:  # same sign: increase, reduce (a partial liquidation too) or close
+            if (d > 0) == (s > 0):
                 side = "increase"
             else:
                 side = "close" if e == 0 else "reduce"
-            legs.append(leg(side, _dir(s), sz, fee, cpnl, f"{coin}:{n}", s, e))
+            legs.append(leg(side, _dir(s), sz, fee, cpnl, pid, s, e, liq))
         if e == 0:
-            n += 1
-        episode[coin] = n
+            cur[coin] = None
         _check_dir(f, legs[-1])
-    return legs
+    return Normalized(legs, gaps)
 
 
 def _check_dir(f: Mapping, last: Leg) -> None:
@@ -245,7 +360,7 @@ def fills_to_events(
     """
     lev = leverage or {}
     out: list[TradeEvent] = []
-    for lg in fill_legs(fills, addr):
+    for seq, lg in enumerate(fill_legs(addr, fills)):
         leader_time = ms_to_dt(lg.time_ms)
         observed = observed_time_fn(lg.fill) if observed_time_fn else leader_time
         out.append(TradeEvent(
@@ -264,5 +379,6 @@ def fills_to_events(
             leverage=lev.get(lg.coin),
             position_id=lg.position_id,
             group_id=None,
+            seq=seq,
         ))
     return out

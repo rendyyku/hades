@@ -77,11 +77,17 @@ def _percentiles(values: list[float | None]) -> list[float]:
     """Mid-rank percentile of each value; None ranks below every number."""
     n = len(values)
     keyed = [(-float("inf") if v is None else float(v)) for v in values]
-    out = []
-    for v in keyed:
-        below = sum(1 for w in keyed if w < v)
-        equal = sum(1 for w in keyed if w == v)
-        out.append((below + 0.5 * equal) / n)
+    order = sorted(range(n), key=keyed.__getitem__)
+    out = [0.0] * n
+    i = 0
+    while i < n:  # O(n log n): one pass over runs of equal values
+        j = i
+        while j < n and keyed[order[j]] == keyed[order[i]]:
+            j += 1
+        p = (i + 0.5 * (j - i)) / n  # i values below, j - i ties
+        for k in order[i:j]:
+            out[k] = p
+        i = j
     return out
 
 

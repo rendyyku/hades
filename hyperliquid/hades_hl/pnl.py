@@ -3,14 +3,21 @@
 - Realized = sum of HL's per-fill ``closedPnl``. It is cross-checked against our own
   reconstruction: average-entry accounting rebuilt from ``startPosition`` + size.
   Only fills whose entry we fully observed are compared (a position already open at
-  the start of the history has an unknown entry price). The mismatch is
-  ``|HL - ours| / sum(|HL closedPnl|)`` over the compared fills, in percent; above
-  1% it is logged and flagged (``closedpnl_mismatch``).
-- Fees: sum of per-fill ``fee`` (negative = maker rebate).
+  the start of the history, or after a chain gap, has an unknown entry price). The
+  mismatch is ``sum(|HL - ours| per fill) / sum(|HL closedPnl|)`` over the compared
+  fills, in percent (``mismatch_pct``); above 1% it is logged and flagged
+  (``closedpnl_mismatch``). The netted ``|sum HL - sum ours| / sum |HL|`` is kept as
+  ``aggregate_mismatch_pct`` for information.
+  HL computes closedPnl from the average entry *truncated* to the coin's price
+  decimals (``6 - szDecimals``); given ``sz_decimals`` (see
+  :func:`hades_hl.normalize.sz_decimals_by_coin`) we do the same, which matches the
+  real fixture exactly (0.000% vs 1.09% per fill with the untruncated entry).
+- Fees: sum of per-fill ``fee`` + ``builderFee`` (negative fee = maker rebate).
 - Funding: sum of ``userFunding`` ``delta.usdc`` (negative = paid).
 - net = realized - fees + funding.
-- Liquidations: the number of position episodes in which this wallet was liquidated;
-  a liquidated position always counts as a loss.
+- Liquidations: the number of position episodes in which this wallet was liquidated
+  (partially or fully; in a flip only the closed episode); a liquidated position
+  always counts as a loss.
 """
 
 from __future__ import annotations
@@ -19,9 +26,9 @@ import logging
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 
-from hades_hl.normalize import Leg, fill_legs, ms_to_dt
+from hades_hl.normalize import Leg, ms_to_dt, normalize_fills
 
 log = logging.getLogger(__name__)
 
@@ -69,8 +76,10 @@ class PnlSummary:
     reconstructed_usd: Decimal = ZERO  # our realized over the compared fills
     compared_realized_usd: Decimal = ZERO  # HL closedPnl over the same fills
     compared_fills: int = 0
-    mismatch_pct: Decimal | None = None
+    mismatch_pct: Decimal | None = None  # per-fill: sum|HL - ours| / sum|HL|
     closedpnl_mismatch: bool = False
+    aggregate_mismatch_pct: Decimal | None = None  # netted: |sum HL - sum ours| / sum|HL|
+    chain_gaps: int = 0
 
 
 def funding_coin(row: Mapping) -> str:
@@ -125,15 +134,22 @@ def _attribute_funding(eps: list[_Episode], funding: Iterable[Mapping]) -> None:
             hit.funding += funding_usdc(row)
 
 
-def _reconstruct(legs: list[Leg]) -> tuple[Decimal, Decimal, Decimal, int]:
-    """(ours, hl, hl_gross, n) over legs whose entry price we observed."""
+PERP_PX_DECIMALS = 6
+
+
+def _reconstruct(
+    legs: list[Leg], sz_decimals: Mapping[str, int] | None = None
+) -> tuple[Decimal, Decimal, Decimal, Decimal, int]:
+    """(ours, hl, sum |per-fill diff|, hl_gross, n) over legs whose entry we observed."""
     entry: dict[str, Decimal | None] = {}
-    ours = hl = gross = ZERO
+    last_end: dict[str, Decimal] = {}
+    ours = hl = absdiff = gross = ZERO
     n = 0
     for lg in legs:
         c = lg.coin
-        if c not in entry:
-            entry[c] = None if lg.start != 0 else ZERO
+        if c not in last_end or lg.start != last_end[c]:  # history start or chain gap
+            entry[c] = ZERO if lg.start == 0 else None
+        last_end[c] = lg.end
         cur = entry[c]
         if lg.side in ("open", "increase"):
             if lg.start == 0:
@@ -142,26 +158,41 @@ def _reconstruct(legs: list[Leg]) -> tuple[Decimal, Decimal, Decimal, int]:
                 entry[c] = (cur * abs(lg.start) + lg.price * lg.size) / abs(lg.end)
         else:  # reduce / close
             if cur is not None:
+                if sz_decimals and c in sz_decimals:
+                    q = Decimal(1).scaleb(-(PERP_PX_DECIMALS - sz_decimals[c]))
+                    cur = cur.quantize(q, rounding=ROUND_DOWN)
                 sign = 1 if lg.start > 0 else -1
-                ours += (lg.price - cur) * lg.size * sign
+                mine = (lg.price - cur) * lg.size * sign
+                ours += mine
                 hl += lg.closed_pnl
+                absdiff += abs(lg.closed_pnl - mine)
                 gross += abs(lg.closed_pnl)
                 n += 1
             if lg.end == 0:
                 entry[c] = ZERO  # flat: the next open has a known entry
-    return ours, hl, gross, n
+    return ours, hl, absdiff, gross, n
+
+
+def _pct(diff: Decimal, gross: Decimal) -> Decimal:
+    return (diff / gross * 100) if gross else (ZERO if diff == 0 else Decimal(100))
 
 
 def wallet_pnl(
-    fills: Iterable[Mapping], funding: Iterable[Mapping], *, addr: str | None = None
+    addr: str,
+    fills: Iterable[Mapping],
+    funding: Iterable[Mapping],
+    *,
+    sz_decimals: Mapping[str, int] | None = None,
 ) -> PnlSummary:
-    """PnL of one wallet over the given perp fills and funding rows (spot is ignored).
+    """PnL of wallet ``addr`` over the given perp fills and funding rows (spot ignored).
 
-    ``addr`` lets liquidation fills where this wallet was the liquidator (not the
-    victim) be told apart; without it any liquidation fill counts.
+    ``addr`` tells liquidation fills where this wallet was the victim apart from ones
+    where it was the liquidator (only the former count). ``sz_decimals``: optional
+    ``{coin: szDecimals}`` for the cross-check's HL-style entry truncation.
     """
     funding = list(funding)
-    legs = fill_legs(fills, addr)
+    norm = normalize_fills(addr, fills)
+    legs = norm.legs
     realized = sum((lg.closed_pnl for lg in legs), ZERO)
     fees = sum((lg.fee for lg in legs), ZERO)
     fund = sum((funding_usdc(r) for r in funding), ZERO)
@@ -176,17 +207,19 @@ def wallet_pnl(
     ]
     closed.sort(key=lambda c: c.close_time)
 
-    ours, hl, gross, n = _reconstruct(legs)
+    ours, hl, absdiff, gross, n = _reconstruct(legs, sz_decimals)
     mismatch_pct: Decimal | None = None
+    aggregate_pct: Decimal | None = None
     flagged = False
     if n:
-        diff = abs(hl - ours)
-        mismatch_pct = (diff / gross * 100) if gross else (ZERO if diff == 0 else Decimal(100))
-        if mismatch_pct > MISMATCH_TOLERANCE_PCT and (gross >= MISMATCH_MIN_GROSS_USD or diff
-                                                      >= MISMATCH_MIN_GROSS_USD):
+        mismatch_pct = _pct(absdiff, gross)
+        aggregate_pct = _pct(abs(hl - ours), gross)
+        if mismatch_pct > MISMATCH_TOLERANCE_PCT and (gross >= MISMATCH_MIN_GROSS_USD
+                                                      or absdiff >= MISMATCH_MIN_GROSS_USD):
             flagged = True
-            log.warning("hl closedPnl cross-check %s: HL %s vs ours %s over %d fills (%.2f%%)",
-                        addr or "?", hl, ours, n, mismatch_pct)
+            log.warning("hl closedPnl cross-check %s: HL %s vs ours %s over %d fills "
+                        "(per-fill %.2f%%, netted %.2f%%)",
+                        addr, hl, ours, n, mismatch_pct, aggregate_pct)
 
     return PnlSummary(
         net_usd=realized - fees + fund,
@@ -200,4 +233,6 @@ def wallet_pnl(
         compared_fills=n,
         mismatch_pct=mismatch_pct,
         closedpnl_mismatch=flagged,
+        aggregate_mismatch_pct=aggregate_pct,
+        chain_gaps=norm.chain_gaps,
     )

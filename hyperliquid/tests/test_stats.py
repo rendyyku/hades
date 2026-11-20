@@ -33,7 +33,7 @@ def trader(n: int, *, hold_ms=3_600_000, win_every=2, crossed=True, start=T0 + D
 
 def test_stats_keys_and_basic_values():
     fills = trader(4)
-    st = wallet_stats(fills, [funding("BTC", "-0.5", T0 + DAY_MS + 1000)], NOW)
+    st = wallet_stats(ADDR, fills, [funding("BTC", "-0.5", T0 + DAY_MS + 1000)], NOW)
     assert KEYS <= st.keys()
     assert st["n"] == 4
     assert st["trades"] == 8
@@ -53,14 +53,14 @@ def test_stats_keys_and_basic_values():
 
 
 def test_winrate_none_when_n_zero():
-    st = wallet_stats([mk("BTC", "B", "1", "100", "0", T0 + DAY_MS)], [], NOW)
+    st = wallet_stats(ADDR, [mk("BTC", "B", "1", "100", "0", T0 + DAY_MS)], [], NOW)
     assert st["n"] == 0
     assert st["winrate"] is None
     assert st["median_hold_s"] is None
 
 
 def test_empty_wallet():
-    st = wallet_stats([], [], NOW)
+    st = wallet_stats(ADDR, [], [], NOW)
     assert st["n"] == 0 and st["trades"] == 0
     assert st["winrate"] is None and st["maker_share"] is None
     assert st["median_fills_per_day"] is None
@@ -70,14 +70,14 @@ def test_empty_wallet():
 
 def test_window_filters_old_fills():
     old = round_trip("BTC", T0 - 5 * DAY_MS, 1000, "100")
-    st = wallet_stats(old + trader(2), [], NOW)
+    st = wallet_stats(ADDR, old + trader(2), [], NOW)
     assert st["n"] == 2
 
 
 def test_leverage_from_clearinghouse():
     ch = {"assetPositions": [{"type": "oneWay", "position": {
         "coin": "BTC", "szi": "1", "leverage": {"type": "cross", "value": 5}}}]}
-    st = wallet_stats(trader(4), [], NOW, clearinghouse=ch)
+    st = wallet_stats(ADDR, trader(4), [], NOW, clearinghouse=ch)
     assert st["avg_leverage"] == 5.0
     assert st["roi_on_margin"] == pytest.approx((6 - 0.8) / 20)  # margin = 100/5
 
@@ -85,26 +85,26 @@ def test_leverage_from_clearinghouse():
 def test_max_dd_after_losses():
     fills = (round_trip("BTC", T0 + DAY_MS, 1000, "-50")
              + round_trip("BTC", T0 + 2 * DAY_MS, 1000, "10"))
-    st = wallet_stats(fills, [], NOW)
+    st = wallet_stats(ADDR, fills, [], NOW)
     # equity starts at margin 100; trough after the 2nd open fee: 100-0.1-50.1-0.1 = 49.7
     assert st["max_dd"] == pytest.approx(0.503, abs=1e-9)
     assert st["closedpnl_mismatch"] is False
 
 
 def test_daily_sharpe_none_when_flat():
-    st = wallet_stats([], [], NOW)
+    st = wallet_stats(ADDR, [], [], NOW)
     assert st["daily_sharpe"] is None
 
 
 def test_partial_history_window_is_covered_span():
     fills = trader(4, start=T0 + 20 * DAY_MS)
-    st = wallet_stats(fills, [], NOW, history_partial=True)
+    st = wallet_stats(ADDR, fills, [], NOW, history_partial=True)
     assert st["history_partial"] is True
     assert st["window_days"] == pytest.approx(10.0)
 
 
 def test_maker_share_and_fills_per_day():
-    st = wallet_stats(trader(4, crossed=False), [], NOW)
+    st = wallet_stats(ADDR, trader(4, crossed=False), [], NOW)
     assert st["maker_share"] == 1.0
 
 
@@ -114,8 +114,11 @@ def test_real_fixture_stats(fixture):
     meta = fixture("fixture_meta.json")
     ch = fixture("clearinghouse_state.json")
     now = datetime.fromtimestamp(meta["end_ms"] / 1000, tz=timezone.utc)
-    st = wallet_stats(fills, fund, now, window_days=7, addr=meta["address"],
-                      history_partial=True, clearinghouse=ch)
+    from hades_hl.normalize import sz_decimals_by_coin
+
+    st = wallet_stats(meta["address"], fills, fund, now, window_days=7,
+                      history_partial=True, clearinghouse=ch,
+                      sz_decimals=sz_decimals_by_coin(fixture("meta.json")))
     assert KEYS <= st.keys()
     assert st["trades"] == 1312
     assert st["history_partial"] is True
@@ -123,6 +126,46 @@ def test_real_fixture_stats(fixture):
     assert 0 < st["maker_share"] < 0.1  # 37 of 1312 fills were maker
     assert st["avg_leverage"] is not None
     assert st["closedpnl_mismatch"] is False
+
+
+def test_partial_span_from_oldest_fetched_fill():
+    # P17 minor: the covered span starts at the oldest *fetched* fill, which may lie
+    # before the first fill inside the window
+    from hlfills import ms_dt
+
+    fills = trader(4, start=T0 + 20 * DAY_MS)
+    st = wallet_stats(ADDR, fills, [], NOW, history_partial=True,
+                      oldest_fill_time=ms_dt(T0 + 15 * DAY_MS))
+    assert st["window_days"] == pytest.approx(15.0)
+
+
+def test_chain_gaps_in_stats():
+    fills = [mk("BTC", "B", "1", "100", "0", T0 + DAY_MS),
+             mk("BTC", "A", "1", "110", "3", T0 + DAY_MS + 5)]
+    assert wallet_stats(ADDR, fills, [], NOW)["chain_gaps"] == 1
+    assert wallet_stats(ADDR, trader(2), [], NOW)["chain_gaps"] == 0
+
+
+def test_stats_addr_required_positional():
+    import inspect
+
+    p = inspect.signature(wallet_stats).parameters["addr"]
+    assert p.default is inspect.Parameter.empty
+    assert list(inspect.signature(wallet_stats).parameters)[0] == "addr"
+
+
+def test_percentiles_sort_based_mid_rank():
+    import time
+
+    from hades_hl.scoring import _percentiles
+
+    assert _percentiles([3, None, 3, 1]) == [0.75, 0.125, 0.75, 0.375]
+    assert _percentiles([]) == []
+    vals = [float(i % 997) for i in range(6000)] + [None] * 10
+    t = time.perf_counter()
+    out = _percentiles(vals)
+    assert time.perf_counter() - t < 1.0
+    assert out[0] == pytest.approx((10 + 0.5 * 7) / 6010)  # value 0: 10 Nones below, 7 ties
 
 
 # -- bot rule ------------------------------------------------------------------
