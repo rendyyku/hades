@@ -33,6 +33,8 @@ class TradeEvent:
       close/resolve). When None the simulator keys by ``wallet:market_id:direction``.
     - ``group_id``: optional wider grouping for gate concentration checks (Polymarket:
       the event/condition id spanning several outcome tokens).
+    - ``seq``: ordering tie-break inside one ``observed_time`` (the head's true order of
+      same-time events); default 0.
     """
 
     head: str
@@ -52,6 +54,10 @@ class TradeEvent:
     position_id: str | None = None
     # Wider concentration group (Polymarket event/condition id); see GateConfig.
     group_id: str | None = None
+    # Tie-break for events with the same observed_time: the head's execution order
+    # (e.g. a flip's close leg before its open leg). The simulator sorts by
+    # (observed_time, seq, source_ref).
+    seq: int = 0
 
     def __post_init__(self) -> None:
         require_utc("leader_time", self.leader_time)

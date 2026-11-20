@@ -453,3 +453,25 @@ def test_model_without_holding_cost_unchanged():
     res = simulate(events, FakeModel({"o": Decimal("100"), "c": Decimal("100")}), CFG, FOLLOW)
     assert res.closed_trades[0].pnl_usd == Decimal("0")
     assert final_equity(res) == Decimal("10000")
+
+
+# --- fix round 1 (Task 5, ruling P21): seq orders same-time events -------------------
+
+
+def test_same_observed_time_sorted_by_seq_before_source_ref():
+    # source_ref order is reversed ("a-close" < "b-open"); seq says open first
+    o = ev("b-open", "open", 1, seq=0)
+    c = ev("a-close", "close", 1, seq=1)
+    prices = {"b-open": Decimal("100"), "a-close": Decimal("110")}
+    for events in ([c, o], [o, c]):
+        res = simulate(events, FakeModel(prices), CFG, FOLLOW)
+        assert [f.ev_ref for f in res.fills] == ["b-open", "a-close"]
+        assert len(res.closed_trades) == 1
+
+
+def test_seq_defaults_to_zero_and_sort_key_is_public():
+    from hades_core.paper import event_sort_key
+
+    e = ev("x", "open", 1)
+    assert e.seq == 0
+    assert event_sort_key(e) == (e.observed_time, 0, "x")

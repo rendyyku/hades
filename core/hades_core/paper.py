@@ -20,7 +20,8 @@ Accounting:
 
 Event handling:
 - Input is de-duplicated by ``source_ref`` (first occurrence in input order wins), then
-  sorted by ``(observed_time, source_ref)``.
+  sorted by :func:`event_sort_key` = ``(observed_time, seq, source_ref)``: ``seq`` is the
+  head's own order of events sharing an observed_time (a flip's close before its open).
 - Ignoring is per leader position *episode*: a position the leader opened before
   ``follow_started_at`` (or that we missed / were liquidated out of) is ignored until
   the episode ends: a close/resolve, or a reduce that takes the leader's tracked size
@@ -57,6 +58,11 @@ class ExecutionModel(Protocol):
     # Optional, detected with getattr (absent means 0):
     # def holding_cost(self, pos: OpenPosition, start: datetime, end: datetime) -> Decimal
     #     Cost of holding ``pos`` over [start, end]; positive = cost, negative = income.
+
+
+def event_sort_key(ev: TradeEvent) -> tuple[datetime, int, str]:
+    """The simulator's processing order: ``(observed_time, seq, source_ref)``."""
+    return (ev.observed_time, ev.seq, ev.source_ref)
 
 
 @dataclass
@@ -230,7 +236,7 @@ def simulate(
             total += p.unrealized(px)
         return total
 
-    ordered = sorted(_dedupe(events), key=lambda e: (e.observed_time, e.source_ref))
+    ordered = sorted(_dedupe(events), key=event_sort_key)
     for ev in ordered:
         key = _key(ev)
         terminal = ev.side in ("close", "resolve")
