@@ -19,6 +19,8 @@ export interface StyxInput {
     deployer: string | null;
     deployer_funder?: string | null;
     pool_created_slot: number | null;
+    /** Signature scan truncated: no launch anchor, buyers are earliest observed. */
+    history_truncated?: boolean;
   };
   early_buyers: StyxBuyerIn[];
 }
@@ -165,7 +167,7 @@ export function computeStyxLayout(input: StyxInput, size: { width: number; heigh
   const funderPos = new Map(funderNodes.map((n) => [n.id, n]));
 
   const maxSol = buyers.reduce((m, b) => (b.sol_amount != null && b.sol_amount > m ? b.sol_amount : m), 0);
-  const pool = t.pool_created_slot;
+  const pool = t.history_truncated ? null : t.pool_created_slot;
 
   const buyerNodes: StyxNode[] = [];
   const links: StyxLink[] = [];

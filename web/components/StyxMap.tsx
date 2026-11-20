@@ -4,6 +4,7 @@ import { useRouter } from "next/navigation";
 import { useMemo, useState, type KeyboardEvent } from "react";
 import { computeStyxLayout, styxActive, styxNeighbors, styxSize, type StyxClass, type StyxInput, type StyxNode } from "@/lib/styxLayout";
 import { ScrollRegion } from "@/components/ScrollRegion";
+import { truncationAriaNote } from "@/lib/forensics";
 
 // Literal class names so Tailwind generates them (tokens only).
 const STROKE: Record<StyxClass, string> = {
@@ -80,7 +81,9 @@ export function StyxMap({ data }: { data: StyxInput }) {
 
   const summary = `Styx map: ${counts.buyers} early buyer${counts.buyers === 1 ? "" : "s"}, ${counts.funders} funder${
     counts.funders === 1 ? "" : "s"
-  }, ${counts.hubs} hub${counts.hubs === 1 ? "" : "s"}`;
+  }, ${counts.hubs} hub${counts.hubs === 1 ? "" : "s"}${
+    data.token.history_truncated ? `. ${truncationAriaNote(data.token)}` : ""
+  }`;
 
   return (
     <div className="styx flex flex-col gap-4">

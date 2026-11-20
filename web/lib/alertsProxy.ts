@@ -2,6 +2,8 @@
 // (used by LiveFeed to backfill after an SSE reconnect). The key is added on the server
 // and never relayed. Pure (env + fetch injected) so vitest can drive it.
 
+import { hostAllowed, parseAllowList } from "./originGuard";
+
 const DEFAULT_API_URL = "http://127.0.0.1:8000";
 const TIMEOUT_MS = 8000;
 const DEFAULT_LIMIT = 50;
@@ -10,6 +12,8 @@ const MAX_LIMIT = 200;
 export interface AlertsEnv {
   HADES_API_URL?: string;
   HADES_API_KEY?: string;
+  /** Allow-listed origins; the request Host must be one of their hosts (DNS rebinding guard). */
+  HADES_PUBLIC_ORIGIN?: string;
   fetchImpl?: typeof fetch;
 }
 
@@ -24,6 +28,7 @@ const unreachable = () => json(502, { error: "engine unreachable" });
 
 export async function handleAlerts(req: Request, env: AlertsEnv): Promise<Response> {
   if (req.method.toUpperCase() !== "GET") return json(405, { error: "method not allowed" }, { allow: "GET" });
+  if (!hostAllowed(req, parseAllowList(env.HADES_PUBLIC_ORIGIN))) return json(403, { error: "forbidden" });
 
   const raw = new URL(req.url).searchParams.get("limit");
   let limit = DEFAULT_LIMIT;

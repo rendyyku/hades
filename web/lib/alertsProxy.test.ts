@@ -18,7 +18,12 @@ function req(qs = "", method = "GET"): Request {
 }
 
 function env(f: (...a: unknown[]) => Promise<Response>) {
-  return { HADES_API_URL: "http://engine:8200/", HADES_API_KEY: KEY, fetchImpl: vi.fn(f) as unknown as typeof fetch };
+  return {
+    HADES_API_URL: "http://engine:8200/",
+    HADES_API_KEY: KEY,
+    HADES_PUBLIC_ORIGIN: "http://localhost:3200",
+    fetchImpl: vi.fn(f) as unknown as typeof fetch,
+  };
 }
 
 async function expectNoKey(res: Response) {
@@ -99,5 +104,15 @@ describe("handleAlerts", () => {
     const res = await handleAlerts(req(), e);
     expect(res.status).toBe(502);
     await expectNoKey(res);
+  });
+});
+
+describe("handleAlerts host allow-list (DNS rebinding)", () => {
+  it("returns 403 for a Host outside HADES_PUBLIC_ORIGIN and never calls the engine", async () => {
+    const e = env(async () => new Response(JSON.stringify([ROW]), { status: 200 }));
+    const r = new Request("http://rebind.example:3200/api/alerts", { headers: { host: "rebind.example:3200" } });
+    const res = await handleAlerts(r, e);
+    expect(res.status).toBe(403);
+    expect(e.fetchImpl).not.toHaveBeenCalled();
   });
 });

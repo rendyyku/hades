@@ -4,7 +4,11 @@ import { handleWatchlist } from "@/lib/watchlistProxy";
 export const dynamic = "force-dynamic";
 
 function env() {
-  return { HADES_API_URL: process.env.HADES_API_URL, HADES_API_KEY: process.env.HADES_API_KEY };
+  return {
+    HADES_API_URL: process.env.HADES_API_URL,
+    HADES_API_KEY: process.env.HADES_API_KEY,
+    HADES_PUBLIC_ORIGIN: process.env.HADES_PUBLIC_ORIGIN,
+  };
 }
 
 export async function POST(req: Request): Promise<Response> {

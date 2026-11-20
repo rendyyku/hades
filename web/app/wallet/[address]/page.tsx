@@ -12,7 +12,8 @@ import { TagBadge } from "@/components/TagBadge";
 import { WatchButton } from "@/components/WatchButton";
 import { apiGet, type TagRow, type WalletDetail, type WatchlistRow } from "@/lib/api";
 import { readEvidence } from "@/lib/evidence";
-import { formatDuration, formatPct, formatScore, relTime, shortAddr } from "@/lib/format";
+import { formatDuration, formatPct, formatScore, formatSol, relTime, shortAddr } from "@/lib/format";
+import { ALL_TIME_LABEL, scoreReason, statsWindowLabel } from "@/lib/walletView";
 import { BASE58_ADDRESS } from "@/lib/watchlistProxy";
 
 export const dynamic = "force-dynamic";
@@ -121,6 +122,9 @@ export default async function WalletPage({ params }: { params: Params }) {
   if (!res.ok && res.status === 404) notFound();
 
   const watched = watch.ok && Array.isArray(watch.data) && watch.data.some((w) => w.address === address);
+  const windowDays = res.ok ? res.data.window_days : 30;
+  const reason = res.ok ? scoreReason(res.data) : null;
+  const unpriced = res.ok ? (res.data.stats?.unpriced_cost_sol ?? null) : null;
 
   return (
     <div className="flex flex-col gap-14 pt-14 sm:gap-16 sm:pt-20">
@@ -139,10 +143,8 @@ export default async function WalletPage({ params }: { params: Params }) {
         <ErrorCard error={res.error} />
       ) : (
         <>
-          <Section index="#1" title="Stats">
-            {res.data.stats ? null : (
-              <p className="mb-4 text-sm text-muted">Not scored yet (needs ≥5 closed tokens)</p>
-            )}
+          <Section index="#1" title={`Stats · ${statsWindowLabel(windowDays)}`}>
+            {reason ? <p className="mb-4 text-sm text-muted">{reason}</p> : null}
             <dl className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
               <StatCard compact label="Score" value={formatScore(res.data.stats?.score)} sub="0–100" />
               <StatCard
@@ -173,6 +175,12 @@ export default async function WalletPage({ params }: { params: Params }) {
               <StatCard compact label="Median hold" value={formatDuration(res.data.stats?.median_hold_sec)} />
               <StatCard
                 compact
+                label="Unpriced open cost"
+                value={unpriced != null ? formatSol(Math.abs(unpriced)).replace(/^\+/, "") : "—"}
+                sub="Open positions with no trusted price; not in PnL or score"
+              />
+              <StatCard
+                compact
                 label="Trades / day"
                 value={res.data.stats?.trades_per_day != null ? tpd.format(res.data.stats.trades_per_day) : "—"}
                 sub={res.data.stats?.computed_at ? `Scored ${relTime(res.data.stats.computed_at)}` : undefined}
@@ -180,11 +188,11 @@ export default async function WalletPage({ params }: { params: Params }) {
             </dl>
           </Section>
 
-          <Section index="#2" title="PnL curve">
+          <Section index="#2" title={`PnL curve · ${ALL_TIME_LABEL}`}>
             <PnlChart curve={res.data.pnl_curve} />
           </Section>
 
-          <Section index="#3" title="Positions">
+          <Section index="#3" title={`Positions · ${ALL_TIME_LABEL}`}>
             <PositionsTable rows={res.data.positions} />
           </Section>
 

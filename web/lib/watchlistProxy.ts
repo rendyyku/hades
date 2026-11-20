@@ -1,5 +1,7 @@
-// Core of app/api/watchlist/route.ts: a CSRF-guarded proxy that adds the engine key
-// on the server. Pure (env + fetch injected) so vitest can drive it.
+// Core of app/api/watchlist/route.ts: a CSRF/rebinding-guarded proxy that adds the
+// engine key on the server. Pure (env + fetch injected) so vitest can drive it.
+
+import { hostAllowed, originAllowed, parseAllowList } from "./originGuard";
 
 export const BASE58_ADDRESS = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const DEFAULT_API_URL = "http://127.0.0.1:8000";
@@ -8,6 +10,8 @@ const TIMEOUT_MS = 8000;
 export interface WatchlistEnv {
   HADES_API_URL?: string;
   HADES_API_KEY?: string;
+  /** Comma-separated exact origins allowed to mutate (default localhost:3000 / 127.0.0.1:3000). */
+  HADES_PUBLIC_ORIGIN?: string;
   fetchImpl?: typeof fetch;
 }
 
@@ -18,25 +22,10 @@ function json(status: number, body: unknown): Response {
   });
 }
 
-/** Same-origin check: the Origin header's host:port must equal the Host header. */
-function sameOrigin(req: Request): boolean {
-  const origin = req.headers.get("origin");
-  if (!origin || origin === "null") return false;
-  let originHost: string;
-  try {
-    originHost = new URL(origin).host.toLowerCase();
-  } catch {
-    return false;
-  }
-  let host = req.headers.get("host");
-  if (!host) {
-    try {
-      host = new URL(req.url).host;
-    } catch {
-      return false;
-    }
-  }
-  return originHost === host.toLowerCase();
+/** Mutations need an allow-listed Origin (CSRF) AND an allow-listed Host (DNS rebinding). */
+function trusted(req: Request, env: WatchlistEnv): boolean {
+  const allow = parseAllowList(env.HADES_PUBLIC_ORIGIN);
+  return originAllowed(req, allow) && hostAllowed(req, allow);
 }
 
 export async function handleWatchlist(req: Request, env: WatchlistEnv): Promise<Response> {
@@ -47,7 +36,7 @@ export async function handleWatchlist(req: Request, env: WatchlistEnv): Promise<
       headers: { "content-type": "application/json", allow: "POST, DELETE" },
     });
   }
-  if (!sameOrigin(req)) return json(403, { error: "forbidden" });
+  if (!trusted(req, env)) return json(403, { error: "forbidden" });
 
   let enginePath: string;
   let body: string | undefined;

@@ -1,4 +1,4 @@
-import { ExternalLink } from "lucide-react";
+import { ExternalLink, TriangleAlert } from "lucide-react";
 import { notFound } from "next/navigation";
 import { Address } from "@/components/Address";
 import { BundleCluster } from "@/components/BundleCluster";
@@ -9,6 +9,7 @@ import { StatCard } from "@/components/StatCard";
 import { StyxMap } from "@/components/StyxMap";
 import { TagBadge } from "@/components/TagBadge";
 import { apiGet, type TokenForensics } from "@/lib/api";
+import { showDeltaColumn, TRUNCATION_NOTICE } from "@/lib/forensics";
 import { formatSol, relTime, shortAddr } from "@/lib/format";
 import { BASE58_ADDRESS } from "@/lib/watchlistProxy";
 import { ScrollRegion } from "@/components/ScrollRegion";
@@ -50,6 +51,8 @@ export default async function TokenPage({ params }: { params: Params }) {
   const t = res.ok ? res.data.token : null;
   const title = t?.symbol || t?.name || shortAddr(mint);
   const poolSlot = t?.pool_created_slot ?? null;
+  const truncated = Boolean(t?.history_truncated);
+  const showDelta = t ? showDeltaColumn(t) : false;
 
   return (
     <div className="flex flex-col gap-14 pt-14 sm:gap-16 sm:pt-20">
@@ -79,12 +82,22 @@ export default async function TokenPage({ params }: { params: Params }) {
         <ErrorCard error={res.ok ? "invalid response" : res.error} />
       ) : (
         <>
+          {truncated ? (
+            <p
+              role="note"
+              className="flex items-start gap-3 rounded-lg border border-ember bg-surface p-5 text-sm text-fg"
+            >
+              <TriangleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-ember" />
+              <span>{TRUNCATION_NOTICE}</span>
+            </p>
+          ) : null}
           <Section index="#1" title="Forensics">
             <dl className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
               <StatCard
                 compact
                 label="Deployer"
                 value={t.deployer ? <Address value={t.deployer} href={`/wallet/${t.deployer}`} /> : "—"}
+                sub={!t.deployer && truncated ? "Unknown (history truncated)" : undefined}
               />
               <StatCard compact label="Pool" value={t.pool_address ? <Address value={t.pool_address} /> : "—"} />
               <StatCard
@@ -94,6 +107,8 @@ export default async function TokenPage({ params }: { params: Params }) {
                 sub={
                   t.pool_created_at ? (
                     <time dateTime={t.pool_created_at}>{relTime(t.pool_created_at)}</time>
+                  ) : truncated ? (
+                    "Unknown (history truncated)"
                   ) : undefined
                 }
               />
@@ -111,7 +126,7 @@ export default async function TokenPage({ params }: { params: Params }) {
             </dl>
           </Section>
 
-          <Section index="#2" title="Early buyers">
+          <Section index="#2" title={truncated ? "Earliest observed buyers" : "Early buyers"}>
             {res.data.early_buyers.length === 0 ? (
               <p className="rounded-lg border border-border bg-surface p-5 text-sm text-muted">
                 No buys recorded for this token.
@@ -120,15 +135,28 @@ export default async function TokenPage({ params }: { params: Params }) {
               <ScrollRegion label="Early buyers (scrollable)" className="rounded-lg border border-border">
                 <table className="w-full min-w-[820px] border-collapse text-sm">
                   <caption className="sr-only">
-                    First {res.data.early_buyers.length} buyers by slot. Δ is slots after pool creation; Δ ≤{" "}
-                    {SNIPER_DELTA} is sniper range.
+                    {showDelta ? (
+                      <>
+                        First {res.data.early_buyers.length} buyers by slot. Δ is slots after pool creation; Δ ≤{" "}
+                        {SNIPER_DELTA} is sniper range.
+                      </>
+                    ) : (
+                      <>
+                        Earliest {res.data.early_buyers.length} observed buyers by slot. Launch slot unknown, so no
+                        sniper Δ column.
+                      </>
+                    )}
                   </caption>
                   <thead className="border-b border-border">
                     <tr>
                       <th scope="col" className={`${TH} w-12`}>#</th>
                       <th scope="col" className={TH}>Wallet</th>
                       <th scope="col" className={`${TH} text-right`}>Slot</th>
-                      <th scope="col" className={`${TH} text-right`}>Δ slots</th>
+                      {showDelta ? (
+                        <th scope="col" className={`${TH} text-right`}>
+                          Δ slots
+                        </th>
+                      ) : null}
                       <th scope="col" className={`${TH} text-right`}>SOL</th>
                       <th scope="col" className={TH}>Tx</th>
                       <th scope="col" className={TH}>Tags</th>
@@ -136,7 +164,7 @@ export default async function TokenPage({ params }: { params: Params }) {
                   </thead>
                   <tbody>
                     {res.data.early_buyers.map((b, i) => {
-                      const delta = poolSlot != null ? b.slot - poolSlot : null;
+                      const delta = showDelta && poolSlot != null ? b.slot - poolSlot : null;
                       const sniper = delta != null && delta >= 0 && delta <= SNIPER_DELTA;
                       return (
                         <tr
@@ -148,19 +176,21 @@ export default async function TokenPage({ params }: { params: Params }) {
                             <Address value={b.address} href={`/wallet/${b.address}`} />
                           </td>
                           <td className={`${TD} text-right font-mono tabular-nums text-muted`}>{nf.format(b.slot)}</td>
-                          <td
-                            className={`${TD} text-right font-mono tabular-nums ${sniper ? "text-ember" : "text-muted"}`}
-                          >
-                            {delta == null ? (
-                              "—"
-                            ) : (
-                              <>
-                                {sniper ? <span className="mr-1 text-[11px]">Δ</span> : null}
-                                {delta >= 0 ? `+${nf.format(delta)}` : nf.format(delta)}
-                                {sniper ? <span className="sr-only"> (sniper range)</span> : null}
-                              </>
-                            )}
-                          </td>
+                          {showDelta ? (
+                            <td
+                              className={`${TD} text-right font-mono tabular-nums ${sniper ? "text-ember" : "text-muted"}`}
+                            >
+                              {delta == null ? (
+                                "—"
+                              ) : (
+                                <>
+                                  {sniper ? <span className="mr-1 text-[11px]">Δ</span> : null}
+                                  {delta >= 0 ? `+${nf.format(delta)}` : nf.format(delta)}
+                                  {sniper ? <span className="sr-only"> (sniper range)</span> : null}
+                                </>
+                              )}
+                            </td>
+                          ) : null}
                           <td className={`${TD} text-right font-mono tabular-nums text-fg`}>{sol(b.sol_amount)}</td>
                           <td className={TD}>
                             <TxLink sig={b.signature} />

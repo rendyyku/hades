@@ -141,3 +141,42 @@ describe("handleWatchlist", () => {
     }
   });
 });
+
+describe("handleWatchlist origin allow-list (HADES_PUBLIC_ORIGIN)", () => {
+  it("accepts 127.0.0.1:3000 from the default list", async () => {
+    const f = engineJson(201, { address: ADDR, note: null, added_at: null });
+    const res = await handleWatchlist(
+      req("POST", { origin: "http://127.0.0.1:3000", host: "127.0.0.1:3000", body: { address: ADDR } }),
+      env(f),
+    );
+    expect(res.status).toBe(201);
+  });
+
+  it("rejects an allow-listed Origin with a rebinding Host", async () => {
+    const f = engineJson(201, {});
+    const res = await handleWatchlist(
+      req("POST", { origin: "http://localhost:3000", host: "evil.example:3000", body: { address: ADDR } }),
+      env(f),
+    );
+    expect(res.status).toBe(403);
+    expect(f).not.toHaveBeenCalled();
+  });
+
+  it("rejects same-origin requests from an origin that is not allow-listed", async () => {
+    const f = engineJson(201, {});
+    const res = await handleWatchlist(
+      req("POST", { origin: "http://hades.lan:3000", host: "hades.lan:3000", body: { address: ADDR } }),
+      env(f),
+    );
+    expect(res.status).toBe(403);
+  });
+
+  it("honours a custom HADES_PUBLIC_ORIGIN", async () => {
+    const f = engineJson(201, { address: ADDR, note: null, added_at: null });
+    const res = await handleWatchlist(
+      req("POST", { origin: "http://hades.lan:3000", host: "hades.lan:3000", body: { address: ADDR } }),
+      { ...env(f), HADES_PUBLIC_ORIGIN: "http://hades.lan:3000" },
+    );
+    expect(res.status).toBe(201);
+  });
+});

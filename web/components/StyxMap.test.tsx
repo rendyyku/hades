@@ -28,3 +28,27 @@ describe("StyxMap", () => {
     expect(region).toContain('tabindex="0"');
   });
 });
+
+describe("StyxMap truncated history", () => {
+  const html = renderToStaticMarkup(
+    <StyxMap
+      data={{
+        token: {
+          mint: A("M"),
+          symbol: "AAA",
+          deployer: null,
+          deployer_funder: null,
+          pool_created_slot: null,
+          history_truncated: true,
+        },
+        early_buyers: [{ address: A("b"), slot: 101, sol_amount: 1, tags: [], funder: A("F"), funder_is_hub: false }],
+      }}
+    />,
+  );
+
+  it("adds an aria note that the buyers are earliest observed", () => {
+    const label = html.match(/<svg[^>]*aria-label="([^"]*)"/)![1];
+    expect(label).toMatch(/history truncated/i);
+    expect(label).toMatch(/earliest observed/);
+  });
+});

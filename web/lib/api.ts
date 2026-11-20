@@ -69,6 +69,8 @@ export interface WalletStatsOut {
   win_rate: number | null;
   median_hold_sec: number | null;
   trades_per_day: number | null;
+  /** Cost basis of open positions (in the window) with no trusted price at rescore. */
+  unpriced_cost_sol: number | null;
   score: number | null;
   computed_at: string | null;
 }
@@ -83,6 +85,8 @@ export interface PositionRow {
   realized_pnl_sol: number;
   remaining_tokens: number;
   untracked_sell_tokens: number;
+  /** Open cost basis (the read API never prices positions); 0 when closed. */
+  unpriced_cost_sol: number;
   closed: boolean;
   first_buy_time: string | null;
   last_sell_time: string | null;
@@ -107,6 +111,10 @@ export interface PnlPoint {
 }
 
 export interface WalletDetail {
+  /** Stats window in days; positions and the PnL curve are all-time. */
+  window_days: number;
+  is_bot: boolean;
+  min_tokens_closed: number;
   stats: WalletStatsOut | null;
   positions: PositionRow[];
   tags: TagRow[];
@@ -127,6 +135,8 @@ export interface TokenOut {
   is_runner: boolean | null;
   /** Wallet.first_funder of the deployer. */
   deployer_funder: string | null;
+  /** Signature scan hit its cap: deployer / launch slot unknown, buyers are earliest observed. */
+  history_truncated: boolean;
 }
 
 export interface EarlyBuyer {

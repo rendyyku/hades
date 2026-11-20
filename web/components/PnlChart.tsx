@@ -11,7 +11,7 @@ import { useEffect, useId, useMemo, useRef } from "react";
 import type { PnlPoint } from "@/lib/api";
 import { buildChartOptions, CHART_HEIGHT_PX } from "@/lib/chartOptions";
 import { formatSol } from "@/lib/format";
-import { toChartPoints } from "@/lib/pnl";
+import { PNL_EMPTY_TEXT, pnlCaption, toChartPoints } from "@/lib/pnl";
 
 function cssVar(name: string): string {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -52,16 +52,14 @@ export function PnlChart({ curve }: { curve: PnlPoint[] }) {
 
   if (points.length === 0) {
     return (
-      <p className="rounded-lg border border-border bg-surface p-5 text-sm text-muted">No closed positions yet</p>
+      <p className="rounded-lg border border-border bg-surface p-5 text-sm text-muted">{PNL_EMPTY_TEXT}</p>
     );
   }
 
   return (
     <figure aria-labelledby={captionId} className="m-0 rounded-lg border border-border bg-surface p-3 sm:p-4">
       <figcaption id={captionId} className="sr-only">
-        {`Cumulative realized PnL over ${points.length} closed ${
-          points.length === 1 ? "position" : "positions"
-        }, ending at ${formatSol(final)}`}
+        {pnlCaption(points.length, formatSol(final))}
       </figcaption>
       {/* Canvas host: no role, so the TradingView attribution link inside stays a normal link. */}
       <div ref={ref} className="w-full font-mono" style={{ height: CHART_HEIGHT_PX }} />

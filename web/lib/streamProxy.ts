@@ -1,11 +1,15 @@
 // Core of app/api/stream/route.ts: proxies the engine SSE (/api/stream) to the browser
 // and adds the engine key on the server. Pure (env + fetch injected) so vitest can drive it.
 
+import { hostAllowed, parseAllowList } from "./originGuard";
+
 const DEFAULT_API_URL = "http://127.0.0.1:8000";
 
 export interface StreamEnv {
   HADES_API_URL?: string;
   HADES_API_KEY?: string;
+  /** Allow-listed origins; the request Host must be one of their hosts (DNS rebinding guard). */
+  HADES_PUBLIC_ORIGIN?: string;
 }
 
 const SSE_HEADERS = {
@@ -26,6 +30,12 @@ export async function proxyStream(
   env: StreamEnv,
   fetchImpl: typeof fetch = fetch,
 ): Promise<Response> {
+  if (!hostAllowed(req, parseAllowList(env.HADES_PUBLIC_ORIGIN))) {
+    return new Response(JSON.stringify({ error: "forbidden" }), {
+      status: 403,
+      headers: { "content-type": "application/json", "cache-control": "no-store" },
+    });
+  }
   const base = (env.HADES_API_URL || DEFAULT_API_URL).replace(/\/+$/, "");
   let upstream: Response;
   try {

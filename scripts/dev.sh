@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # Start the HADES engine (API) and the web dev server together; Ctrl-C stops both.
 #   ENGINE_PORT (default 8000)  WEB_PORT (default 3000)
-# Works in Linux/macOS bash and Windows git-bash. Run from anywhere.
+# Both bind to 127.0.0.1 only. Needs bash >= 4.3 (`wait -n`): Linux bash and Windows
+# git-bash work; macOS ships bash 3.2, so install a newer bash first. Run from anywhere.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENGINE_PORT="${ENGINE_PORT:-8000}"
 WEB_PORT="${WEB_PORT:-3000}"
+# The web server routes accept only these origins/hosts (see web/.env.example).
+export HADES_PUBLIC_ORIGIN="${HADES_PUBLIC_ORIGIN:-http://localhost:$WEB_PORT,http://127.0.0.1:$WEB_PORT}"
 
 if [ -x "$ROOT/engine/.venv/Scripts/hades.exe" ]; then
   HADES="$ROOT/engine/.venv/Scripts/hades.exe"   # Windows venv
@@ -38,11 +41,11 @@ cleanup() {
 trap cleanup INT TERM EXIT
 
 set -m  # each background job gets its own process group
-(cd "$ROOT" && exec "$HADES" serve --port "$ENGINE_PORT") &
+(cd "$ROOT" && exec "$HADES" serve --host 127.0.0.1 --port "$ENGINE_PORT") &
 pids+=("$!")
 (cd "$ROOT/web" && exec npm run dev -- -p "$WEB_PORT") &
 pids+=("$!")
 set +m
 
-echo "engine: http://127.0.0.1:$ENGINE_PORT   web: http://localhost:$WEB_PORT   (Ctrl-C to stop)"
+echo "engine: http://127.0.0.1:$ENGINE_PORT   web: http://127.0.0.1:$WEB_PORT   (Ctrl-C to stop)"
 wait -n || true  # first one to exit (or Ctrl-C) stops both via the EXIT trap

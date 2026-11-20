@@ -1,5 +1,13 @@
 import type { PnlPoint } from "./api";
 
+/** Empty state: the curve has one point per position with at least one sell. */
+export const PNL_EMPTY_TEXT = "No positions with a sell yet";
+
+/** Accessible caption of the PnL curve (points are positions with a sell, not closed positions). */
+export function pnlCaption(n: number, finalText: string): string {
+  return `Cumulative realized PnL over ${n} ${n === 1 ? "position" : "positions"} with a sell, ending at ${finalText}`;
+}
+
 export interface ChartPoint {
   time: number; // unix seconds
   value: number;

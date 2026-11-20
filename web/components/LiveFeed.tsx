@@ -188,7 +188,7 @@ export function LiveFeed({ initial }: { initial: AlertRow[] }) {
             >
               watched wallets
             </Link>{" "}
-            and wallets scoring 70+.
+            and the top 25 non-bot wallets scoring 70+ (both are subscribed to the Helius webhook).
           </p>
         </div>
       ) : (

@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { proxyStream } from "./streamProxy";
 
 const KEY = "test-secret-stream-key-do-not-leak";
-const ENV = { HADES_API_URL: "http://engine:8200/", HADES_API_KEY: KEY };
+const ENV = { HADES_API_URL: "http://engine:8200/", HADES_API_KEY: KEY, HADES_PUBLIC_ORIGIN: "http://localhost:3200" };
 
 function sseBody(text: string): ReadableStream<Uint8Array> {
   return new ReadableStream({
@@ -106,7 +106,28 @@ describe("proxyStream", () => {
 
   it("uses the default engine URL when HADES_API_URL is unset", async () => {
     const f = mock(async () => new Response(sseBody(""), { status: 200 }));
-    await proxyStream(req(), { HADES_API_KEY: KEY }, f as unknown as typeof fetch);
+    await proxyStream(req(), { HADES_API_KEY: KEY, HADES_PUBLIC_ORIGIN: ENV.HADES_PUBLIC_ORIGIN }, f as unknown as typeof fetch);
     expect((f.mock.calls[0] as unknown as [string])[0]).toBe("http://127.0.0.1:8000/api/stream");
+  });
+});
+
+const PING = ["event: ping", "data: {}", "", ""].join(String.fromCharCode(10));
+
+describe("proxyStream host allow-list (DNS rebinding)", () => {
+  it("returns 403 for a Host outside HADES_PUBLIC_ORIGIN and never calls the engine", async () => {
+    const f = vi.fn(async () => new Response(sseBody(PING), { status: 200 }));
+    const r = new Request("http://evil.example:3200/api/stream", { headers: { host: "evil.example:3200" } });
+    const res = await proxyStream(r, ENV, f as unknown as typeof fetch);
+    expect(res.status).toBe(403);
+    expect(f).not.toHaveBeenCalled();
+  });
+
+  it("uses the default allow-list (localhost:3000) when HADES_PUBLIC_ORIGIN is unset", async () => {
+    const f = vi.fn(async () => new Response(sseBody(PING), { status: 200 }));
+    const bad = await proxyStream(req(), { HADES_API_URL: ENV.HADES_API_URL, HADES_API_KEY: KEY }, f as unknown as typeof fetch);
+    expect(bad.status).toBe(403);
+    const ok = new Request("http://localhost:3000/api/stream", { headers: { host: "localhost:3000" } });
+    const res = await proxyStream(ok, { HADES_API_URL: ENV.HADES_API_URL, HADES_API_KEY: KEY }, f as unknown as typeof fetch);
+    expect(res.status).toBe(200);
   });
 });

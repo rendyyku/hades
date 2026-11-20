@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { toChartPoints } from "./pnl";
+import { PNL_EMPTY_TEXT, pnlCaption, toChartPoints } from "./pnl";
 
 describe("toChartPoints", () => {
   it("converts ISO times to unix seconds", () => {
@@ -26,5 +26,13 @@ describe("toChartPoints", () => {
   });
   it("returns an empty array for no points", () => {
     expect(toChartPoints([])).toEqual([]);
+  });
+});
+
+describe("pnl wording", () => {
+  it("counts positions with a sell, not 'closed' positions", () => {
+    expect(pnlCaption(1, "+1.0000 SOL")).toBe("Cumulative realized PnL over 1 position with a sell, ending at +1.0000 SOL");
+    expect(pnlCaption(3, "-2 SOL")).toBe("Cumulative realized PnL over 3 positions with a sell, ending at -2 SOL");
+    expect(PNL_EMPTY_TEXT).toBe("No positions with a sell yet");
   });
 });
