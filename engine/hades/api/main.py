@@ -319,6 +319,26 @@ async def watchlist_delete(
     return Response(status_code=204, headers={SYNC_HEADER: await sync_webhook(request.app)})
 
 
+@router.get("/alerts", response_model=list[S.AlertRow])
+def list_alerts(
+    limit: int = Query(50, ge=1, le=200), session: Session = Depends(get_session)
+) -> list[S.AlertRow]:
+    """Recent alerts, newest first (id desc), in the same shape as the SSE ``alert`` event."""
+    rows = session.execute(
+        select(Alert, Token.symbol)
+        .outerjoin(Token, Token.mint == Alert.mint)
+        .order_by(Alert.id.desc())
+        .limit(limit)
+    ).all()
+    return [
+        S.AlertRow(
+            id=a.id, wallet=a.wallet, mint=a.mint, symbol=symbol, side=a.side,
+            sol_amount=a.sol_amount, signature=a.signature, block_time=a.block_time,
+        )
+        for a, symbol in rows
+    ]
+
+
 @router.get("/stream")
 async def stream(request: Request) -> EventSourceResponse:
     """SSE: ``alert`` events (AlertRow JSON) and ``ping`` every ping_interval seconds."""

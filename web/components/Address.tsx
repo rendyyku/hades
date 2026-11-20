@@ -53,7 +53,7 @@ export function Address({ value, full = false, href }: Props) {
             href={solscanAccount(value)}
             target="_blank"
             rel="noopener"
-            aria-label="View on Solscan (opens in a new tab)"
+            aria-label={`View ${shortAddr(value)} on Solscan (opens in a new tab)`}
             className={ICON_BTN}
           >
             <ExternalLink aria-hidden="true" className="size-3.5" />
@@ -72,7 +72,7 @@ export function Address({ value, full = false, href }: Props) {
           <span className="sr-only">(opens Solscan in a new tab)</span>
         </a>
       )}
-      <button type="button" onClick={copy} aria-label="Copy address" className={ICON_BTN}>
+      <button type="button" onClick={copy} aria-label={`Copy address ${shortAddr(value)}`} className={ICON_BTN}>
         {copied ? (
           <Check aria-hidden="true" className="size-3.5 text-gain" />
         ) : (

@@ -60,7 +60,7 @@ export default async function WalletsPage({ searchParams }: { searchParams: Prom
                 <li key={s.value}>
                   <Link
                     href={walletsHref(q, { sort: s.value })}
-                    aria-current={on ? "page" : undefined}
+                    aria-current={on ? "true" : undefined}
                     className={`${PILL} ${on ? PILL_ON : PILL_OFF}`}
                   >
                     {s.label}
@@ -79,7 +79,7 @@ export default async function WalletsPage({ searchParams }: { searchParams: Prom
                 <li key={t ?? "all"}>
                   <Link
                     href={walletsHref(q, { tag: t })}
-                    aria-current={on ? "page" : undefined}
+                    aria-current={on ? "true" : undefined}
                     className={`${PILL} font-mono text-xs uppercase tracking-wide ${on ? PILL_ON : PILL_OFF}`}
                   >
                     {t ? tagMeta(t).label : "All"}
@@ -148,7 +148,7 @@ export default async function WalletsPage({ searchParams }: { searchParams: Prom
                   <ChevronLeft aria-hidden="true" className="size-4" /> Prev
                 </span>
               )}
-              <p className="font-mono text-sm tabular-nums text-muted" aria-current="page">
+              <p className="font-mono text-sm tabular-nums text-muted">
                 Page {q.page} of {totalPages}
               </p>
               {q.page < totalPages ? (

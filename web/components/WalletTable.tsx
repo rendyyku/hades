@@ -29,7 +29,12 @@ export function WalletTable({ rows, rankOffset = 0, caption = "Top wallets by sc
     );
   }
   return (
-    <div className="overflow-x-auto rounded-lg border border-border">
+    <div
+      role="region"
+      aria-label={`${caption} (scrollable)`}
+      tabIndex={0}
+      className="overflow-x-auto rounded-lg border border-border"
+    >
       <table className="w-full min-w-[760px] border-collapse text-sm">
         <caption className="sr-only">{caption}</caption>
         <thead className="border-b border-border">

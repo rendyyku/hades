@@ -21,7 +21,12 @@ export function PositionsTable({ rows }: { rows: PositionRow[] }) {
     );
   }
   return (
-    <div className="overflow-x-auto rounded-lg border border-border" tabIndex={0} aria-label="Positions (scrollable)">
+    <div
+      role="region"
+      aria-label="Positions (scrollable)"
+      tabIndex={0}
+      className="overflow-x-auto rounded-lg border border-border"
+    >
       <table className="w-full min-w-[820px] border-collapse text-sm">
         <caption className="sr-only">Positions by last activity</caption>
         <thead className="border-b border-border">

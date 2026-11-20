@@ -1,11 +1,12 @@
 import { ArrowRight } from "lucide-react";
 import Link from "next/link";
+import { AlertTable } from "@/components/AlertTable";
+import { BadgeView } from "@/components/BadgeView";
 import { ErrorCard } from "@/components/ErrorCard";
-import { LiveBadge } from "@/components/LiveBadge";
 import { Section } from "@/components/Section";
 import { StatCard } from "@/components/StatCard";
 import { WalletTable } from "@/components/WalletTable";
-import { apiGet, type Overview } from "@/lib/api";
+import { apiGet, type AlertRow, type Overview } from "@/lib/api";
 import { relTime } from "@/lib/format";
 
 export const dynamic = "force-dynamic";
@@ -16,7 +17,10 @@ const LINK =
   "inline-flex min-h-11 cursor-pointer items-center gap-2 rounded text-sm text-fg underline decoration-primary decoration-2 underline-offset-8 transition-colors duration-200 hover:text-muted";
 
 export default async function OverviewPage() {
-  const res = await apiGet<Overview>("/api/overview");
+  const [res, alerts] = await Promise.all([
+    apiGet<Overview>("/api/overview"),
+    apiGet<AlertRow[]>("/api/alerts?limit=5"),
+  ]);
 
   return (
     <div className="flex flex-col gap-16 sm:gap-20">
@@ -60,13 +64,21 @@ export default async function OverviewPage() {
             <WalletTable rows={res.data.top} />
           </Section>
 
-          <Section index="#3" title="Cerberus" action={<LiveBadge />}>
-            <div className="flex flex-col gap-4 rounded-lg border border-border bg-surface p-5 backdrop-blur-md sm:flex-row sm:items-center sm:justify-between sm:p-6">
+          {/* No EventSource here: the badge is static; the live stream is on /live. */}
+          <Section index="#3" title="Cerberus" action={<BadgeView state={{ label: "STALE", since: "—" }} />}>
+            <div className="flex flex-col gap-4">
               <p className="text-muted">
                 <span className="font-mono text-2xl tabular-nums text-fg">{nf.format(res.data.alerts_24h)}</span>{" "}
                 {res.data.alerts_24h === 1 ? "alert" : "alerts"} from watched wallets in the last 24 hours.
               </p>
-              <Link href="/live" className={LINK}>
+              {!alerts.ok ? (
+                <ErrorCard error={alerts.error} />
+              ) : alerts.data.length === 0 ? (
+                <p className="rounded-lg border border-border bg-surface p-5 text-sm text-muted">No alerts yet.</p>
+              ) : (
+                <AlertTable rows={alerts.data} now={Date.now()} caption="Last 5 Cerberus alerts" />
+              )}
+              <Link href="/live" className={`${LINK} self-start`}>
                 Open live feed <ArrowRight aria-hidden="true" className="size-4" />
               </Link>
             </div>

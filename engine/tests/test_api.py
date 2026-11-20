@@ -290,3 +290,48 @@ def test_watchlist_crud(client):
     assert client.delete("/api/watchlist/" + W_A, headers=H).status_code == 404
     assert [w["address"] for w in client.get("/api/watchlist", headers=H).json()] == [W_B]
     assert client.delete("/api/watchlist/" + W_B).status_code == 401
+
+
+# -- alerts (Task 12) ------------------------------------------------------------
+
+def test_alerts_requires_key(client):
+    assert client.get("/api/alerts").status_code == 401
+    assert client.get("/api/alerts", headers={"X-Hades-Key": "nope"}).status_code == 401
+
+
+def test_alerts_newest_first_with_symbol(client):
+    with Session(client.app.state.engine) as s:
+        s.add(Alert(wallet=W_B, mint=MINT2, side="sell", sol_amount=1.5, signature="a3",
+                    block_time=T0))
+        s.commit()
+    r = client.get("/api/alerts", headers=H)
+    assert r.status_code == 200
+    rows = r.json()
+    assert [a["signature"] for a in rows] == ["a3", "a2", "a1"]
+    ids = [a["id"] for a in rows]
+    assert ids == sorted(ids, reverse=True)
+    assert set(rows[0]) == {"id", "wallet", "mint", "symbol", "side", "sol_amount", "signature", "block_time"}
+    assert rows[0]["symbol"] is None  # MINT2 has no symbol
+    assert rows[0]["sol_amount"] == 1.5 and rows[0]["side"] == "sell"
+    assert rows[1]["symbol"] == "AAA"  # joined from tokens
+    assert rows[1]["wallet"] == W_A and rows[1]["mint"] == MINT
+
+
+def test_alerts_limit(client):
+    r = client.get("/api/alerts?limit=1", headers=H)
+    assert r.status_code == 200
+    assert [a["signature"] for a in r.json()] == ["a2"]
+    assert client.get("/api/alerts?limit=200", headers=H).status_code == 200
+
+
+@pytest.mark.parametrize("bad", ["0", "201", "-1", "x"])
+def test_alerts_limit_bounds_422(client, bad):
+    assert client.get(f"/api/alerts?limit={bad}", headers=H).status_code == 422
+
+
+def test_alerts_unknown_mint_symbol_null(client):
+    with Session(client.app.state.engine) as s:
+        s.add(Alert(wallet=W_C, mint="Z" * 32 + "pump", side="buy", signature="a9"))
+        s.commit()
+    rows = client.get("/api/alerts?limit=1", headers=H).json()
+    assert rows[0]["signature"] == "a9" and rows[0]["symbol"] is None
