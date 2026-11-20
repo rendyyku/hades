@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { computeStyxLayout, styxClass, styxSize, styxStroke, type StyxInput } from "./styxLayout";
+import { computeStyxLayout, styxActive, styxNeighbors, styxClass, styxSize, styxStroke, type StyxInput } from "./styxLayout";
 
 const A = (c: string) => c.repeat(32) + "zz";
 const MINT = A("M");
@@ -71,6 +71,9 @@ describe("computeStyxLayout", () => {
     expect(dep.label).toBe("DEPLOYER");
     expect(dep.cls).toBe("loss");
     expect(funders.find((f) => f.id === F1)!.label).toBe("FFFF…FFzz");
+    const depf = funders.find((f) => f.id === DEPF)!;
+    expect(depf.label).toBe("DEP. FUNDER · EEEE…EEzz");
+    expect(depf.cls).toBe("loss");
   });
 
   it("links buyer and funder nodes to their wallet page; the token has none", () => {
@@ -145,3 +148,27 @@ describe("styxSize", () => {
     expect(styxSize(5, 40)).toEqual({ width: 1100, height: 560 });
   });
 });
+
+describe("styxNeighbors", () => {
+  const L = computeStyxLayout(INPUT, SIZE);
+  const adj = styxNeighbors(L.links);
+
+  it("maps each funder to its buyers and each buyer to its funder", () => {
+    expect([...adj.get(HUB)!].sort()).toEqual([A("b"), A("e")]);
+    expect([...adj.get(A("b"))!]).toEqual([HUB]);
+    expect([...adj.get(DEPF)!]).toEqual([A("f")]);
+  });
+
+  it("gives a no-funder buyer an empty neighbor set", () => {
+    expect(adj.get(A("d"))!.size).toBe(0);
+  });
+});
+
+describe("styxActive", () => {
+  it("prefers the hovered node, then falls back to the focused node, then null", () => {
+    expect(styxActive({ hover: "a", focus: "b" })).toBe("a");
+    expect(styxActive({ hover: null, focus: "b" })).toBe("b");
+    expect(styxActive({ hover: null, focus: null })).toBeNull();
+  });
+});
+

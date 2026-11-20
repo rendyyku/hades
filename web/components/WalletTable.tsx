@@ -4,6 +4,7 @@ import { formatPct, formatScore } from "@/lib/format";
 import { Address } from "./Address";
 import { Pnl } from "./Pnl";
 import { TagBadge } from "./TagBadge";
+import { ScrollRegion } from "@/components/ScrollRegion";
 
 const TH = "px-3 py-3 text-left text-xs font-normal uppercase tracking-[0.14em] text-muted";
 const TD = "px-3 py-3 align-middle";
@@ -29,12 +30,7 @@ export function WalletTable({ rows, rankOffset = 0, caption = "Top wallets by sc
     );
   }
   return (
-    <div
-      role="region"
-      aria-label={`${caption} (scrollable)`}
-      tabIndex={0}
-      className="overflow-x-auto rounded-lg border border-border"
-    >
+    <ScrollRegion label={`${caption} (scrollable)`} className="rounded-lg border border-border">
       <table className="w-full min-w-[760px] border-collapse text-sm">
         <caption className="sr-only">{caption}</caption>
         <thead className="border-b border-border">
@@ -78,6 +74,6 @@ export function WalletTable({ rows, rankOffset = 0, caption = "Top wallets by sc
           ))}
         </tbody>
       </table>
-    </div>
+    </ScrollRegion>
   );
 }

@@ -11,6 +11,7 @@ import { TagBadge } from "@/components/TagBadge";
 import { apiGet, type TokenForensics } from "@/lib/api";
 import { formatSol, relTime, shortAddr } from "@/lib/format";
 import { BASE58_ADDRESS } from "@/lib/watchlistProxy";
+import { ScrollRegion } from "@/components/ScrollRegion";
 
 export const dynamic = "force-dynamic";
 
@@ -116,12 +117,7 @@ export default async function TokenPage({ params }: { params: Params }) {
                 No buys recorded for this token.
               </p>
             ) : (
-              <div
-                role="region"
-                aria-label="Early buyers (scrollable)"
-                tabIndex={0}
-                className="overflow-x-auto rounded-lg border border-border"
-              >
+              <ScrollRegion label="Early buyers (scrollable)" className="rounded-lg border border-border">
                 <table className="w-full min-w-[820px] border-collapse text-sm">
                   <caption className="sr-only">
                     First {res.data.early_buyers.length} buyers by slot. Δ is slots after pool creation; Δ ≤{" "}
@@ -184,7 +180,7 @@ export default async function TokenPage({ params }: { params: Params }) {
                     })}
                   </tbody>
                 </table>
-              </div>
+              </ScrollRegion>
             )}
           </Section>
 

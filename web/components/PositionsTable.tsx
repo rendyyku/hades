@@ -3,6 +3,7 @@ import Link from "next/link";
 import type { PositionRow } from "@/lib/api";
 import { formatSol, relTime, shortAddr } from "@/lib/format";
 import { Pnl } from "./Pnl";
+import { ScrollRegion } from "@/components/ScrollRegion";
 
 const TH = "px-3 py-3 text-left text-xs font-normal uppercase tracking-[0.14em] text-muted whitespace-nowrap";
 const TD = "px-3 py-3 align-middle whitespace-nowrap";
@@ -21,12 +22,7 @@ export function PositionsTable({ rows }: { rows: PositionRow[] }) {
     );
   }
   return (
-    <div
-      role="region"
-      aria-label="Positions (scrollable)"
-      tabIndex={0}
-      className="overflow-x-auto rounded-lg border border-border"
-    >
+    <ScrollRegion label="Positions (scrollable)" className="rounded-lg border border-border">
       <table className="w-full min-w-[820px] border-collapse text-sm">
         <caption className="sr-only">Positions by last activity</caption>
         <thead className="border-b border-border">
@@ -86,6 +82,6 @@ export function PositionsTable({ rows }: { rows: PositionRow[] }) {
           })}
         </tbody>
       </table>
-    </div>
+    </ScrollRegion>
   );
 }

@@ -3,8 +3,16 @@
 // Angles are degrees in SVG space: 0 = right, 90 = down, 180 = left, 270 = up.
 
 export const ART_SIZE = 1254;
-/** Hard budget for rendered base lines (performance, Task 12b G4). */
+/**
+ * Hard budget for rendered SVG <line>s (performance, Task 12b G4). The overlay
+ * draws a base line plus a pulse line per thread, so the budget covers both:
+ * threads × LINES_PER_THREAD <= MAX_THREADS, i.e. at most 24 threads.
+ */
 export const MAX_THREADS = 48;
+/** Lines drawn per thread by ThreadsOverlay: one base + one pulse. */
+export const LINES_PER_THREAD = 2;
+/** Threads per fist in the hero overlay: 4 fists × 6 × 2 lines = 48. */
+export const HERO_PER_FIST = 6;
 
 export interface FistAnchor {
   x: number;

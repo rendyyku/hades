@@ -4,6 +4,7 @@ import { Section } from "@/components/Section";
 import { RemoveWatchButton, WatchAddForm } from "@/components/WatchlistControls";
 import { apiGet, type WatchlistRow } from "@/lib/api";
 import { relTime } from "@/lib/format";
+import { ScrollRegion } from "@/components/ScrollRegion";
 
 export const dynamic = "force-dynamic";
 export const metadata = { title: "Watchlist — HADES" };
@@ -45,12 +46,7 @@ export default async function WatchlistPage() {
             No watched wallets yet. Add one above.
           </p>
         ) : (
-          <div
-            role="region"
-            aria-label="Watched wallets (scrollable)"
-            tabIndex={0}
-            className="overflow-x-auto rounded-lg border border-border"
-          >
+          <ScrollRegion label="Watched wallets (scrollable)" className="rounded-lg border border-border">
             <table className="w-full min-w-[680px] border-collapse text-sm">
               <caption className="sr-only">Watched wallets, oldest first</caption>
               <thead className="border-b border-border">
@@ -82,7 +78,7 @@ export default async function WatchlistPage() {
                 ))}
               </tbody>
             </table>
-          </div>
+          </ScrollRegion>
         )}
       </Section>
     </div>

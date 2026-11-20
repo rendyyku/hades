@@ -2,7 +2,8 @@
 
 import { useRouter } from "next/navigation";
 import { useMemo, useState, type KeyboardEvent } from "react";
-import { computeStyxLayout, styxSize, type StyxClass, type StyxInput, type StyxNode } from "@/lib/styxLayout";
+import { computeStyxLayout, styxActive, styxNeighbors, styxSize, type StyxClass, type StyxInput, type StyxNode } from "@/lib/styxLayout";
+import { ScrollRegion } from "@/components/ScrollRegion";
 
 // Literal class names so Tailwind generates them (tokens only).
 const STROKE: Record<StyxClass, string> = {
@@ -45,7 +46,11 @@ function nodeAria(n: StyxNode): string {
 /** Styx map: funders (left) → token (center) → early buyers (right). */
 export function StyxMap({ data }: { data: StyxInput }) {
   const router = useRouter();
-  const [active, setActive] = useState<string | null>(null);
+  // Hover and keyboard focus are tracked separately so leaving a node with the
+  // mouse falls back to the focused node instead of clearing it (hover wins).
+  const [hover, setHover] = useState<string | null>(null);
+  const [focus, setFocus] = useState<string | null>(null);
+  const active = styxActive({ hover, focus });
 
   const { layout, size, counts } = useMemo(() => {
     const probe = computeStyxLayout(data, styxSize(0, 0));
@@ -58,6 +63,9 @@ export function StyxMap({ data }: { data: StyxInput }) {
       counts: { buyers, funders: funders.length, hubs: funders.filter((f) => f.hub).length },
     };
   }, [data]);
+
+  const neighbors = useMemo(() => styxNeighbors(layout.links), [layout]);
+  const activeNeighbors = active == null ? null : neighbors.get(active);
 
   const token = layout.nodes[0];
   const go = (href?: string) => {
@@ -90,20 +98,17 @@ export function StyxMap({ data }: { data: StyxInput }) {
       </ul>
       <p className="sr-only">The early buyers table above lists the same wallets and is the accessible equivalent of this map.</p>
 
-      <div
-        role="region"
-        aria-label="Styx map (scrollable)"
-        tabIndex={0}
-        className="styx-field overflow-x-auto rounded-lg border border-border"
-      >
-        <div className="min-w-[720px]">
+      <ScrollRegion label="Styx map (scrollable)" className="styx-field rounded-lg border border-border">
+        {/* G7: never narrower than the layout width, so viewBox units map >= 1:1
+            and the 11px labels never shrink; narrow screens scroll the region. */}
+        <div style={{ minWidth: size.width }}>
           <svg
             role="group"
             aria-label={summary}
             viewBox={`0 0 ${size.width} ${size.height}`}
             width="100%"
             className="block h-auto w-full font-mono"
-            onMouseLeave={() => setActive(null)}
+            onMouseLeave={() => setHover(null)}
           >
             <g fill="none">
               {layout.links.map((l) => {
@@ -134,11 +139,7 @@ export function StyxMap({ data }: { data: StyxInput }) {
             {layout.nodes.slice(1).map((n) => {
               const left = n.kind === "funder";
               const related =
-                active == null ||
-                n.id === active ||
-                layout.links.some(
-                  (l) => (l.buyer === active || l.funder === active) && (l.buyer === n.id || l.funder === n.id),
-                );
+                active == null || n.id === active || (activeNeighbors?.has(n.id) ?? false);
               return (
                 <g
                   key={`${n.kind}:${n.id}`}
@@ -149,9 +150,10 @@ export function StyxMap({ data }: { data: StyxInput }) {
                   style={{ opacity: related ? 1 : 0.35 }}
                   onClick={() => go(n.href)}
                   onKeyDown={(e) => onKey(e, n.href)}
-                  onMouseEnter={() => setActive(n.id)}
-                  onFocus={() => setActive(n.id)}
-                  onBlur={() => setActive(null)}
+                  onMouseEnter={() => setHover(n.id)}
+                  onMouseLeave={() => setHover(null)}
+                  onFocus={() => setFocus(n.id)}
+                  onBlur={() => setFocus(null)}
                 >
                   {/* generous hit area across the label */}
                   <rect
@@ -178,7 +180,7 @@ export function StyxMap({ data }: { data: StyxInput }) {
             })}
           </svg>
         </div>
-      </div>
+      </ScrollRegion>
     </div>
   );
 }

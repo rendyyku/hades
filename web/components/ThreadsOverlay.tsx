@@ -1,13 +1,16 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { FIST_ANCHORS, MAX_THREADS, anchorsNear, generateThreads, ART_SIZE } from "@/lib/heroThreads";
+import {
+  ART_SIZE,
+  FIST_ANCHORS,
+  HERO_PER_FIST,
+  LINES_PER_THREAD,
+  MAX_THREADS,
+  anchorsNear,
+  generateThreads,
+} from "@/lib/heroThreads";
 
-/**
- * Threads per fist. Each thread renders a base line plus a pulse line, so
- * 4 fists × 6 threads × 2 = 48 <line>s, the G4 budget.
- */
-const PER_FIST = 6;
 const HOVER_RADIUS = 160;
 
 const REDUCED = "(prefers-reduced-motion: reduce)";
@@ -26,7 +29,8 @@ const getReducedServer = () => false;
  */
 export function ThreadsOverlay() {
   const ref = useRef<SVGSVGElement>(null);
-  const threads = useMemo(() => generateThreads(FIST_ANCHORS, PER_FIST, 7).slice(0, MAX_THREADS / 2), []);
+  // Each thread draws base + pulse; the slice enforces the 48-line budget.
+  const threads = useMemo(() => generateThreads(FIST_ANCHORS, HERO_PER_FIST, 7).slice(0, MAX_THREADS / LINES_PER_THREAD), []);
   const reduced = useSyncExternalStore(subscribeReduced, getReduced, getReducedServer);
   const [active, setActive] = useState<string>("");
   const [offscreen, setOffscreen] = useState(false);

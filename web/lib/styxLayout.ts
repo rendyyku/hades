@@ -201,3 +201,30 @@ export function computeStyxLayout(input: StyxInput, size: { width: number; heigh
 
   return { nodes: [token, ...buyerNodes, ...funderNodes], links };
 }
+
+/**
+ * Buyer <-> funder adjacency, built once per layout so highlight checks are
+ * O(1) per node instead of scanning every link. Every buyer and funder in the
+ * links gets an entry; a buyer without a funder has an empty set.
+ */
+export function styxNeighbors(links: readonly StyxLink[]): Map<string, Set<string>> {
+  const adj = new Map<string, Set<string>>();
+  const at = (id: string) => {
+    let set = adj.get(id);
+    if (!set) adj.set(id, (set = new Set()));
+    return set;
+  };
+  for (const l of links) {
+    const b = at(l.buyer);
+    if (l.funder) {
+      b.add(l.funder);
+      at(l.funder).add(l.buyer);
+    }
+  }
+  return adj;
+}
+
+/** Highlighted node: the hovered one, else the keyboard-focused one, else none. */
+export function styxActive(s: { hover: string | null; focus: string | null }): string | null {
+  return s.hover ?? s.focus;
+}

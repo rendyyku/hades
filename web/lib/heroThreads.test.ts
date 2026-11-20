@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ART_SIZE, FIST_ANCHORS, MAX_THREADS, anchorsNear, generateThreads, type FistAnchor } from "./heroThreads";
+import { ART_SIZE, FIST_ANCHORS, HERO_PER_FIST, LINES_PER_THREAD, MAX_THREADS, anchorsNear, generateThreads, type FistAnchor } from "./heroThreads";
 
 /** Angle of a thread in degrees, SVG space (0 = right, 90 = down), normalised into the anchor's fan. */
 function angleIn(a: FistAnchor, x2: number, y2: number): number {
@@ -32,7 +32,13 @@ describe("generateThreads", () => {
   it("emits anchors × perAnchor threads, within the 48-line budget by default", () => {
     expect(generateThreads(FIST_ANCHORS, 10, 7)).toHaveLength(40);
     expect(generateThreads(FIST_ANCHORS.slice(0, 2), 3, 1)).toHaveLength(6);
-    expect(generateThreads(FIST_ANCHORS).length).toBeLessThanOrEqual(MAX_THREADS);
+  });
+
+  it("keeps the hero overlay within the 48-line budget (base + pulse per thread)", () => {
+    expect(LINES_PER_THREAD).toBe(2);
+    const rendered = generateThreads(FIST_ANCHORS, HERO_PER_FIST, 7).length * LINES_PER_THREAD;
+    expect(rendered).toBeLessThanOrEqual(MAX_THREADS);
+    expect(rendered).toBe(48);
   });
 
   it("starts each thread at its anchor and ends beyond the viewBox edge", () => {
