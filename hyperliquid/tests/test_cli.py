@@ -185,7 +185,7 @@ def test_backfill_requires_address_or_all(env):
     assert r.exit_code != 0
 
 
-@pytest.mark.parametrize("cmd", ["serve", "tag", "follow-sync", "paper-run"])
+@pytest.mark.parametrize("cmd", ["serve", "follow-sync", "paper-run"])
 def test_later_task_commands_are_stubs(env, cmd):
     r = invoke(cmd)
     assert r.exit_code == 2
@@ -200,3 +200,48 @@ def test_serve_defaults_localhost_8010(env):
 
 def test_typer_hides_locals():
     assert cli.app.pretty_exceptions_show_locals is False
+
+
+# -- Task 7: tag ----------------------------------------------------------------------
+
+def test_tag_requires_address_or_all(env):
+    assert invoke("tag").exit_code != 0
+    assert invoke("tag", "--address", A, "--all").exit_code != 0
+
+
+def _seed_wallets(url, addrs):
+    from hades_hl import pipeline
+    from hades_hl.db import init_db
+    eng = make_engine(url)
+    init_db(eng)
+    with Session(eng) as s:
+        for a in addrs:
+            s.add(Wallet(address=a, stats_json={}))
+            pipeline.kv_set_json(s, f"hl:cov:{a}", {"start": 0, "end": 1, "capped": False})
+        s.commit()
+
+
+def test_tag_all_continues_after_rate_limit(env, monkeypatch):
+    from hades_hl import insider
+    from hades_hl.client import HLRateLimited
+    from hades_hl.insider import Tag
+    _seed_wallets(env, [A, B])
+    seen = []
+
+    async def fake_tag_wallet(session, client, addr, *, now=None, sz_decimals=None):
+        seen.append(addr)
+        if addr == A:
+            raise HLRateLimited("429", status=429)
+        return {"pre_move": Tag(addr, "pre_move", [
+            {"tid": 1, "hash": "0xh", "coin": "BTC", "time": 1, "detail": {}}] * 3)}
+
+    async def fake_szd(session, client, now=None):
+        return {}
+
+    monkeypatch.setattr(insider, "tag_wallet", fake_tag_wallet)
+    monkeypatch.setattr(cli.pipeline, "load_sz_decimals", fake_szd)
+    r = invoke("tag", "--all")
+    assert r.exit_code == 0, r.output
+    assert seen == sorted([A, B])
+    assert "rate limited" in r.output
+    assert "pre_move 1" in r.output and "1 ok, 1 failed" in r.output

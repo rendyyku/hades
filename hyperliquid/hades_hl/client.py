@@ -542,7 +542,28 @@ class HLClient:
         return out
 
     async def meta(self) -> dict:
-        return await self._info({"type": "meta"})
+        data = await self._info({"type": "meta"})
+        if not isinstance(data, dict):
+            raise HLError(f"info meta: expected an object, got {type(data).__name__}")
+        return data
+
+    async def candle_snapshot(self, coin: str, interval: str, start_ms: int,
+                              end_ms: int) -> list[dict]:
+        """Candles of ``coin`` in ``[start_ms, end_ms]`` (``t``/``T`` open/close ms,
+        ``o``/``h``/``l``/``c`` prices as strings, ``n`` trades, ``v`` volume).
+        HL serves only the most recent 5000 candles per interval (live probe
+        2026-11-21: 1m reaches ~3.5 days back, 5m ~17 d, 15m ~52 d, 1h ~208 d)."""
+        data = await self._info({"type": "candleSnapshot", "req": {
+            "coin": coin, "interval": interval, "startTime": int(start_ms),
+            "endTime": int(end_ms)}})
+        if not isinstance(data, list):
+            raise HLError("info candleSnapshot: expected a list")
+        return data
+
+    async def user_fills_range(self, addr: str, start_ms: int, end_ms: int) -> list[dict]:
+        """One ``userFillsByTime`` request over ``[start_ms, end_ms]``: the OLDEST <= 2000
+        fills of that range, ascending (see the module doc)."""
+        return await self._fills_window(addr, int(start_ms), int(end_ms))
 
     async def leaderboard(self) -> list[dict]:
         """Rows of the HL app's leaderboard feed (unofficial; see module doc).

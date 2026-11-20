@@ -125,7 +125,7 @@ def sim_router(fills: dict[str, FakeFillsAPI] | None = None, funding=None, meta=
             sample = probes.get(body["user"])
             return httpx.Response(200, json=human_sample() if sample is None else sample)
         if t == "meta":
-            return httpx.Response(200, json=meta)
+            return httpx.Response(200, json={"universe": []} if meta is None else meta)
         raise AssertionError(t)  # pragma: no cover
 
     return handler
@@ -552,8 +552,8 @@ async def test_discover_probe_rejects_inactive(session):
 
 
 @respx.mock
-async def test_discover_probe_budget_is_5x_limit(session):
-    bots = [hfmt(0x50 + i) for i in range(8)]
+async def test_discover_probe_budget_is_10x_limit(session):  # P33
+    bots = [hfmt(0x50 + i) for i in range(12)]
     lb_route(*(lb_row(a, str(100 - i)) for i, a in enumerate(bots)))
     calls: list[str] = []
     respx.post(INFO).mock(side_effect=sim_router(
@@ -561,8 +561,31 @@ async def test_discover_probe_budget_is_5x_limit(session):
     async with make_client() as c:
         got = await pipeline.discover(session, c, limit=1, now=NOW)
     assert list(got) == []
-    assert calls == bots[:5]
-    assert got.probe["probed"] == 5 and got.probe["budget_exhausted"] is True
+    assert calls == bots[:10]
+    assert got.probe["probed"] == 10 and got.probe["budget"] == 10
+    assert got.probe["budget_exhausted"] is True
+
+
+def bursty_sample() -> list[dict]:
+    """3 very busy days (400 fills each, 2-min holds) + 1 fill 29 days ago: the mean over
+    the span is ~41/day but the median over active days is 400 (P32)."""
+    out: list[dict] = [fill(0, NOW_MS - 29 * DAY_MS)]
+    tid = 10
+    for d in range(3):
+        base = NOW_MS - (d + 1) * DAY_MS
+        for k in range(200):
+            t = base + k * 200_000
+            out += [fill(tid, t), fill(tid + 1, t + 120_000)]
+            tid += 2
+    return out
+
+
+def test_probe_verdict_uses_max_of_mean_and_median_fills_per_day():  # P32
+    v = pipeline.probe_verdict(A, bursty_sample(), NOW)
+    assert v["fills_per_day"] < 300 and v["median_fills_per_day"] > 300
+    assert v["verdict"] == "fills_per_day"
+    calm = human_sample()
+    assert pipeline.probe_verdict(A, calm, NOW)["verdict"] == "ok"
 
 
 @respx.mock
@@ -684,3 +707,11 @@ async def test_discover_probe_loads_sz_decimals_once(session, monkeypatch):
     types = [json.loads(x.request.content)["type"] for x in route.calls]
     assert types.count("meta") == 1
     assert seen == [{"BTC": 5}, {"BTC": 5}]  # the P28 chain tolerance reaches the probe
+
+
+@respx.mock
+async def test_load_sz_decimals_bad_meta_not_cached(session):
+    respx.post(INFO).mock(return_value=httpx.Response(200, json=["not", "a", "dict"]))
+    async with make_client() as c:
+        assert await pipeline.load_sz_decimals(session, c, NOW) == {}
+    assert pipeline.kv_get_json(session, "hl:sz_decimals") is None

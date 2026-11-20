@@ -434,3 +434,16 @@ def test_tolerance_scales_with_sz_decimals():
     assert normalize_fills(ADDR, fills).chain_gaps == 1  # 1e-9 fallback
     evs = fills_to_events(ADDR, fills, sz_decimals={"XYZ": 2})
     assert [e.position_id for e in evs] == ["XYZ:31", "XYZ:31"]
+
+
+def test_fallback_tolerance_is_relative_to_position():  # P34
+    from hades_hl.normalize import chain_tol
+    assert chain_tol("X") == Decimal("1e-9")
+    assert chain_tol("X", None, Decimal("-5e8")) == Decimal("0.5")
+    assert chain_tol("X", {"X": 2}, Decimal("1e12")) == Decimal("0.005")  # szDecimals wins
+    fills = [mk("BIG", "B", "300000000", "1", "0", T0, tid=41),
+             mk("BIG", "B", "1", "1", "300000000.00000003", T0 + 5, tid=42)]  # 3e-8 noise
+    assert normalize_fills(ADDR, fills).chain_gaps == 0
+    gap = [mk("BIG", "B", "300000000", "1", "0", T0, tid=43),
+           mk("BIG", "B", "1", "1", "300000000.5", T0 + 5, tid=44)]  # 0.5 > 0.3
+    assert normalize_fills(ADDR, gap).chain_gaps == 1

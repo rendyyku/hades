@@ -25,7 +25,8 @@ Spot fills (``@123`` or ``PURR/USDC``) are dropped; HIP-3 ``dex:COIN`` are perps
 
 Tolerance (ruling P28): HL sends float noise in ``startPosition`` (``-613298.4300000001``
 where the chain gives ``-613298.43``). Every chain / zero comparison uses
-``tol = 10**-szDecimals / 2`` per coin (``1e-9`` when szDecimals is unknown): a start
+``tol = 10**-szDecimals / 2`` per coin (when szDecimals is unknown: ``max(1e-9,
+1e-9 x |position|)``, relative, ruling P34): a start
 within ``tol`` of the previous end is snapped to it, and a start or end within ``tol``
 of 0 is snapped to 0. Pass ``sz_decimals`` (see :func:`sz_decimals_by_coin`).
 """
@@ -96,9 +97,13 @@ def leverage_by_coin(clearinghouse_state: Mapping | None) -> dict[str, Decimal]:
 
 
 def sz_decimals_by_coin(meta: Mapping | None) -> dict[str, int]:
-    """``{coin: szDecimals}`` from a ``meta`` response ({} if unavailable)."""
+    """``{coin: szDecimals}`` from a ``meta`` response ({} if unavailable; a non-dict
+    response is logged: :meth:`HLClient.meta` already rejects it, so callers that cache
+    the result never see one)."""
     out: dict[str, int] = {}
     if not isinstance(meta, Mapping):  # unavailable or an unexpected shape
+        if meta is not None:
+            log.warning("hl meta: unexpected shape %s; no szDecimals", type(meta).__name__)
         return out
     for u in meta.get("universe") or []:
         if u and u.get("name") is not None and u.get("szDecimals") is not None:
@@ -110,10 +115,14 @@ DEFAULT_TOL = Decimal("1e-9")
 SzDecimals = Mapping[str, int] | None
 
 
-def chain_tol(coin: str, sz_decimals: SzDecimals = None) -> Decimal:
-    """Half a size step of ``coin`` (``10**-szDecimals / 2``), else 1e-9 (ruling P28)."""
+def chain_tol(coin: str, sz_decimals: SzDecimals = None,
+              position: Decimal | None = None) -> Decimal:
+    """Half a size step of ``coin`` (``10**-szDecimals / 2``, ruling P28); without
+    szDecimals ``max(1e-9, 1e-9 x |position|)`` (relative float noise, ruling P34)."""
     if sz_decimals and coin in sz_decimals:
         return Decimal(10) ** -int(sz_decimals[coin]) / 2
+    if position:
+        return max(DEFAULT_TOL, DEFAULT_TOL * abs(Decimal(position)))
     return DEFAULT_TOL
 
 
@@ -158,7 +167,9 @@ def _order(fills: Iterable[Mapping], sz_decimals: SzDecimals = None) -> tuple[li
     last_end: dict[str, Decimal] = {}
     for t in sorted(buckets):
         for coin in sorted(buckets[t]):
-            grp, ok = _chain(buckets[t][coin], last_end.get(coin), chain_tol(coin, sz_decimals))
+            grp_in = buckets[t][coin]
+            scale = max([abs(_start(f)) for f in grp_in] + [abs(last_end.get(coin, ZERO))])
+            grp, ok = _chain(grp_in, last_end.get(coin), chain_tol(coin, sz_decimals, scale))
             if not ok:
                 broken += 1
                 log.warning("hl %s @%d: no full startPosition chain over %d same-ms fills; "
@@ -321,8 +332,8 @@ def normalize_fills(addr: str, fills: Iterable[Mapping], *,
     last_end: dict[str, Decimal] = {}
     for f in ordered:
         coin, tid = f["coin"], f["tid"]
-        tol = chain_tol(coin, sz_decimals)
         s = _start(f)
+        tol = chain_tol(coin, sz_decimals, max(abs(s), abs(last_end.get(coin, ZERO))))
         if coin in last_end and _near(s, last_end[coin], tol):
             s = last_end[coin]  # float noise in startPosition (ruling P28)
         elif _near(s, ZERO, tol):

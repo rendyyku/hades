@@ -61,7 +61,7 @@ MAX_VLM_TO_ACCOUNT_VALUE = 30.0
 
 # discovery activity probe (ruling P30)
 KV_PROBE = "hl:probe:{}"  # per-address probe verdict, 24 h TTL
-PROBE_BUDGET_PER_LIMIT = 5  # at most 5 x limit probe requests per discover run
+PROBE_BUDGET_PER_LIMIT = 10  # at most 10 x limit probe requests per discover run (P33)
 PROBE_ACTIVE_DAYS = 30  # a sample with no fill in the last 30 days is inactive
 PROBE_OK = "ok"
 
@@ -274,8 +274,9 @@ def probe_verdict(addr: str, sample: list[dict], now: datetime,
     Checked in this order (the global bot rule, plus inactivity):
 
     - ``inactive``: no fill in the last PROBE_ACTIVE_DAYS days (or no fill at all);
-    - ``fills_per_day``: fills / probe span > 300, the span being ``now - oldest fill``
-      (at least 1 day, so a burst of a few fills does not read as hyperactive);
+    - ``fills_per_day``: ``max(mean, median) > 300`` (ruling P32), the mean being fills
+      / probe span (``now - oldest fill``, at least 1 day, so a burst of a few fills
+      does not read as hyperactive) and the median the fills per *active* day;
     - ``hold``: median hold of the closed positions seen in the sample < 60 s;
     - ``maker_share``: share of perp fills with ``crossed == False`` > 70%;
     - else ``ok``.
@@ -305,7 +306,8 @@ def probe_verdict(addr: str, sample: list[dict], now: datetime,
         log.warning("probe %s: stats over the sample failed (%s); using fills/day and "
                     "maker share only", addr, type(e).__name__)
         res["maker_share"] = sum(1 for f in sample if f.get("crossed") is False) / len(sample)
-    if res["fills_per_day"] > BOT_MAX_FILLS_PER_DAY:
+    rate = max(res["fills_per_day"], res["median_fills_per_day"] or 0.0)
+    if rate > BOT_MAX_FILLS_PER_DAY:
         verdict = "fills_per_day"
     elif res["median_hold_s"] is not None and res["median_hold_s"] < BOT_MIN_HOLD_S:
         verdict = "hold"
@@ -348,8 +350,8 @@ async def discover(
     """Up to ``limit`` non-vault leaderboard candidates, in month-PnL order, that pass
     the activity probe (ruling P30), upserted into ``wallets`` (leaderboard fields
     under ``stats_json['leaderboard']``, informational only). Rejected candidates are
-    not stored. Probing stops once ``limit`` are accepted or ``5 x limit`` probe
-    requests were spent (cached verdicts, < 24 h old, are free); on HLRateLimited it
+    not stored. Probing stops once ``limit`` are accepted or ``10 x limit`` probe
+    requests were spent (ruling P33; cached verdicts, < 24 h old, are free); on HLRateLimited it
     stops and keeps what was accepted. ``Discovered.probe`` = ``{probed, cached,
     accepted, rejected: {reason: n}, budget, budget_exhausted, rate_limited}``.
     Known wallets that turn out to be vaults get ``is_vault=True``.

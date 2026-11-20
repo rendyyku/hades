@@ -86,7 +86,9 @@ class Wallet(Base):
     __tablename__ = "wallets"
 
     address: Mapped[str] = mapped_column(String, primary_key=True)
-    first_seen: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    # earliest fill time HL can give us (set by ``hades-hl tag``; Task 7): the oldest
+    # stored fill of an uncapped coverage, None when unknown (capped history)
+    first_seen: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
     is_vault: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
     is_bot: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
     score: Mapped[float | None] = mapped_column(index=True)
@@ -250,9 +252,26 @@ def init_db(engine: Engine) -> None:
             if column not in _existing_columns(conn, table):
                 conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}"))
     _migrate_fills_pk(engine)
+    _migrate_wallets_first_seen(engine)
 
 
 FILLS_PK = ["address", "tid"]
+
+
+def _migrate_wallets_first_seen(engine: Engine) -> None:
+    """Make ``wallets.first_seen`` nullable (Task 7: it is the earliest HL fill, unknown
+    for capped histories). The old values were the discovery time, not a fill time, so
+    they are reset to NULL; ``hades-hl tag`` recomputes them. No-op when nullable."""
+    with engine.connect() as conn:
+        if conn.dialect.name != "sqlite":  # pragma: no cover - SQLite only for now
+            return
+        info = {r[1]: r for r in conn.execute(text("PRAGMA table_info(wallets)"))}
+        if "first_seen" not in info or not info["first_seen"][3]:  # notnull flag
+            return
+        old_cols = set(info)
+    cols = [c.name for c in Wallet.__table__.columns if c.name in old_cols]
+    select_cols = ["NULL" if c == "first_seen" else c for c in cols]
+    _rebuild_table(engine, Wallet.__table__, cols, select_cols)
 
 
 def _migrate_fills_pk(engine: Engine) -> None:
@@ -268,14 +287,21 @@ def _migrate_fills_pk(engine: Engine) -> None:
         if conn.dialect.name != "sqlite":  # pragma: no cover - SQLite only for now
             raise NotImplementedError(f"fills PK migration not implemented for {conn.dialect.name}")
         old_cols = _existing_columns(conn, "fills")
-    table = Fill.__table__
-    cols = [c.name for c in table.columns if c.name in old_cols]
-    tmp = "fills__new"
+    cols = [c.name for c in Fill.__table__.columns if c.name in old_cols]
+    _rebuild_table(engine, Fill.__table__, cols, cols)
+
+
+def _rebuild_table(engine: Engine, table, cols: list[str], select_cols: list[str]) -> None:
+    """Recreate ``table`` from its current model definition and copy ``select_cols``
+    (expressions over the old table) into ``cols``, in ONE SQLite transaction."""
+    name = table.name
+    tmp = f"{name}__new"
     create = str(CreateTable(table).compile(dialect=engine.dialect)).strip()
-    create = create.replace("CREATE TABLE fills ", f"CREATE TABLE {tmp} ", 1)
+    create = create.replace(f"CREATE TABLE {name} ", f"CREATE TABLE {tmp} ", 1)
     indexes = [str(CreateIndex(ix).compile(dialect=engine.dialect)).strip()
                for ix in sorted(table.indexes, key=lambda ix: ix.name)]
     col_list = ", ".join(cols)
+    sel_list = ", ".join(select_cols)
     raw = engine.raw_connection()
     try:
         dbapi = raw.driver_connection
@@ -286,9 +312,9 @@ def _migrate_fills_pk(engine: Engine) -> None:
             cur.execute("BEGIN IMMEDIATE")
             cur.execute(f"DROP TABLE IF EXISTS {tmp}")
             cur.execute(create)
-            cur.execute(f"INSERT INTO {tmp} ({col_list}) SELECT {col_list} FROM fills")
-            cur.execute("DROP TABLE fills")  # drops the old table's indexes too
-            cur.execute(f"ALTER TABLE {tmp} RENAME TO fills")
+            cur.execute(f"INSERT INTO {tmp} ({col_list}) SELECT {sel_list} FROM {name}")
+            cur.execute(f"DROP TABLE {name}")  # drops the old table's indexes too
+            cur.execute(f"ALTER TABLE {tmp} RENAME TO {name}")
             for ddl in indexes:
                 cur.execute(ddl)
             cur.execute("COMMIT")

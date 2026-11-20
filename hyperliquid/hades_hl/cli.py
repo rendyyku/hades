@@ -1,7 +1,7 @@
 """``hades-hl`` command line.
 
-``init-db | discover | backfill | rescore`` are implemented here (Task 6);
-``serve | tag | follow-sync | paper-run`` are stubs filled in by later tasks.
+``init-db | discover | backfill | rescore`` (Task 6) and ``tag`` (Task 7) are
+implemented here; ``serve | follow-sync | paper-run`` are stubs filled in by later tasks.
 Nothing here ever prints ``HL_API_KEY`` (Settings hides it from repr; tracebacks
 never show locals).
 """
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import Counter
 from typing import Any, Optional
 
 import typer
@@ -17,7 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 
-from hades_hl import __version__, pipeline
+from hades_hl import __version__, insider, pipeline
 from hades_hl.client import HLClient, HLError, HLRateLimited
 from hades_hl.config import Settings, get_settings
 from hades_hl.db import Wallet, init_db, make_engine
@@ -220,9 +221,57 @@ def serve(
 
 
 @app.command()
-def tag() -> None:
-    """Insider-pattern tagging (later task)."""
-    _stub("tag")
+def tag(
+    address: Optional[str] = typer.Option(None, "--address", help="one wallet"),
+    all_: bool = typer.Option(False, "--all", help="every non-vault wallet in the DB"),
+) -> None:
+    """Insider tags with evidence (pre_listing, pre_move, fresh_whale) over the stored
+    fills. Idempotent: re-tagging replaces a wallet's tags and drops stale ones.
+
+    With --all, the exit code is 0 even when some wallets failed (rate limited or HL
+    errors): check the per-wallet lines."""
+    if bool(address) == bool(all_):
+        raise typer.BadParameter("pass exactly one of --address or --all")
+    _setup_logging()
+    settings = get_settings()
+    with _session(settings) as session:
+        if address:
+            addrs = [address.lower()]
+        else:
+            addrs = list(session.scalars(
+                select(Wallet.address).where(Wallet.is_vault.is_(False)).order_by(Wallet.address)))
+
+        async def run(client: HLClient) -> tuple[int, int, Counter]:
+            szd = await pipeline.load_sz_decimals(session, client)
+            ok = failed = 0
+            counts: Counter = Counter()
+            for i, a in enumerate(addrs, 1):
+                try:
+                    got = await insider.tag_wallet(session, client, a, sz_decimals=szd)
+                except HLRateLimited:
+                    session.rollback()
+                    failed += 1
+                    typer.echo(f"[{i}/{len(addrs)}] {a}: rate limited; tags unchanged; "
+                               "continuing")
+                    continue
+                except HLError as e:
+                    session.rollback()
+                    failed += 1
+                    typer.echo(f"[{i}/{len(addrs)}] {a}: HL error {type(e).__name__} "
+                               f"(status {e.status}); tags unchanged; continuing")
+                    continue
+                ok += 1
+                counts.update(got.keys())
+                desc = ", ".join(f"{k} ({len(t.evidence)} evidence)"
+                                 for k, t in sorted(got.items())) or "no tags"
+                typer.echo(f"[{i}/{len(addrs)}] {a}: {desc}")
+            return ok, failed, counts
+
+        ok, failed, counts = asyncio.run(_with_client(settings, run))
+    per = ", ".join(f"{k} {counts.get(k, 0)}" for k in insider.TAG_KINDS)
+    typer.echo(f"tag done: {ok} ok, {failed} failed; wallets tagged: {per}")
+    if address and failed:
+        raise typer.Exit(1)
 
 
 @app.command("follow-sync")

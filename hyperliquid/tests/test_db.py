@@ -202,3 +202,32 @@ def test_init_db_twice_after_migration_is_noop(tmp_path):
         assert c.execute(text("SELECT count(*) FROM fills")).scalar() == 3
     assert before == after
     assert any(name == "ix_fills_address_time" for _, name, _ in after)
+
+
+OLD_WALLETS_DDL = """
+CREATE TABLE wallets (
+    address VARCHAR NOT NULL, first_seen DATETIME NOT NULL,
+    is_vault BOOLEAN DEFAULT 0 NOT NULL, is_bot BOOLEAN DEFAULT 0 NOT NULL,
+    score DOUBLE, stats_json JSON NOT NULL, scored_at DATETIME,
+    PRIMARY KEY (address)
+)"""
+
+
+def test_migration_makes_first_seen_nullable(tmp_path):  # Task 7
+    e = make_engine(f"sqlite:///{(tmp_path / 'oldw.db').as_posix()}")
+    with e.begin() as c:
+        c.execute(text(OLD_WALLETS_DDL))
+        c.execute(text("INSERT INTO wallets (address, first_seen, is_vault, is_bot, score, "
+                       "stats_json) VALUES (:a, '2026-11-20 17:19:03', 0, 1, 2.5, '{\"n\": 3}')"),
+                  {"a": ADDR})
+    init_db(e)
+    init_db(e)  # idempotent
+    cols = {c["name"]: c for c in inspect(e).get_columns("wallets")}
+    assert cols["first_seen"]["nullable"] is True
+    with session_scope(e) as s:
+        w = s.get(Wallet, ADDR)
+        assert w.first_seen is None  # discovery time, not a fill time: reset
+        assert w.is_bot is True and w.score == 2.5 and w.stats_json == {"n": 3}
+        s.add(Wallet(address=OTHER, stats_json={}))
+    with session_scope(e) as s:
+        assert s.get(Wallet, OTHER).first_seen is None
