@@ -9,8 +9,8 @@ from typer.testing import CliRunner
 
 from hades import cli
 from hades.config import get_settings
-from hades.db import Swap, Token, WalletTag, init_db, make_engine
-from hades.sources.helius import HeliusError
+from hades.db import Kv, Swap, Token, WalletTag, Watchlist, init_db, make_engine
+from hades.sources.helius import HeliusClient, HeliusError
 
 runner = CliRunner()
 MINT = "MeMeMint1111111111111111111111111111111pump"
@@ -82,7 +82,7 @@ def use_db(tmp_path, monkeypatch):
 
 def test_help_lists_commands():
     out = runner.invoke(cli.app, ["--help"]).output
-    for cmd in ("init-db", "seed", "discover", "backfill", "rescore", "tag", "serve"):
+    for cmd in ("init-db", "seed", "discover", "backfill", "rescore", "tag", "serve", "webhook-sync"):
         assert cmd in out
 
 
@@ -267,3 +267,62 @@ def test_backfill_token_runs_tagging(tmp_path, monkeypatch):
     assert "early buyers: 2" in res.output
     assert "sniper=2" in res.output
     assert _tags(eng) == {("WalletA", "sniper", MINT), ("WalletB", "sniper", MINT)}
+
+
+def test_discover_passes_limit(tmp_path, monkeypatch):
+    use_db(tmp_path, monkeypatch)
+    seen = {}
+
+    async def fake_discover(session, helius, dex, settings, now=None, limit=0):
+        seen["limit"] = limit
+        return []
+
+    monkeypatch.setattr(cli.pipeline, "discover", fake_discover)
+    res = runner.invoke(cli.app, ["discover", "--limit", "2"])
+    assert res.exit_code == 0, res.output
+    assert seen["limit"] == 2 and "discovered 0 new runner(s)" in res.output
+    res = runner.invoke(cli.app, ["discover"])
+    assert res.exit_code == 0 and seen["limit"] == 0
+
+
+def test_webhook_sync_cli_prints_status_and_id_not_key(tmp_path, monkeypatch):
+    url = use_db(tmp_path, monkeypatch)
+    monkeypatch.setenv("HELIUS_API_KEY", "hkey-cli-secret")
+    monkeypatch.setenv("HELIUS_WEBHOOK_SECRET", "whsec-cli-secret")
+    monkeypatch.setenv("HELIUS_WEBHOOK_ID", "")
+    monkeypatch.setenv("PUBLIC_WEBHOOK_URL", "https://x.example")
+    get_settings.cache_clear()
+    eng = make_engine(url)
+    init_db(eng)
+    with Session(eng) as s:
+        s.add(Watchlist(address="WalletW"))
+        s.commit()
+    calls = []
+
+    async def fake_upsert(self, addresses, u, secret, webhook_id=None):
+        calls.append((addresses, u, webhook_id))
+        return "wh-cli"
+
+    monkeypatch.setattr(HeliusClient, "upsert_webhook", fake_upsert)
+    res = runner.invoke(cli.app, ["webhook-sync"])
+    assert res.exit_code == 0, res.output
+    assert calls == [(["WalletW"], "https://x.example/webhook/helius", None)]
+    assert "ok" in res.output and "wh-cli" in res.output
+    assert "hkey-cli-secret" not in res.output and "whsec-cli-secret" not in res.output
+    with Session(eng) as s:
+        assert s.get(Kv, "helius_webhook_id").value == "wh-cli"
+
+
+def test_webhook_sync_cli_skipped_and_error(tmp_path, monkeypatch):
+    use_db(tmp_path, monkeypatch)
+    monkeypatch.setenv("PUBLIC_WEBHOOK_URL", "")
+    get_settings.cache_clear()
+    res = runner.invoke(cli.app, ["webhook-sync"])
+    assert res.exit_code == 0, res.output
+    assert "skipped" in res.output
+    monkeypatch.setenv("PUBLIC_WEBHOOK_URL", "https://x.example")
+    monkeypatch.setenv("HELIUS_API_KEY", "")
+    get_settings.cache_clear()
+    res = runner.invoke(cli.app, ["webhook-sync"])
+    assert res.exit_code == 1
+    assert "error" in res.output

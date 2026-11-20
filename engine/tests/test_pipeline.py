@@ -327,6 +327,25 @@ async def test_discover_seeds_new_runners_only(session):
     assert dex.calls[1] == ("token_pairs", (a, b, c))
 
 
+async def test_discover_limit_caps_new_runners(session):
+    a, b = "MintA", "MintB"
+    dex = FakeDex(
+        boosted=[a, b],
+        pairs=[pair(mint=a, address="PoolA", liq=60_000, h24=400),
+               pair(mint=b, address="PoolB", liq=60_000, h24=400)],
+    )
+    helius = seed_fakes(mint=a, pool="PoolA")
+    hb = seed_fakes(mint=b, pool="PoolB")
+    helius.sigs.update(hb.sigs)
+    helius.txs.update(hb.txs)
+    new = await pipeline.discover(session, helius, dex, settings(), now=NOW, limit=1)
+    assert [t.mint for t in new] == [a]
+    assert session.get(Token, b) is None
+    # limit=0 means unlimited
+    new = await pipeline.discover(session, helius, dex, settings(), now=NOW, limit=0)
+    assert [t.mint for t in new] == [b]
+
+
 # -- rescore -------------------------------------------------------------------
 
 

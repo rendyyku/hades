@@ -54,10 +54,14 @@ class HeliusError(Exception):
     and `cursor` the `before` signature to resume from (None = from newest).
     """
 
-    def __init__(self, *args: object, partial: list[dict] | None = None, cursor: str | None = None) -> None:
+    def __init__(
+        self, *args: object, partial: list[dict] | None = None, cursor: str | None = None,
+        status: int | None = None,
+    ) -> None:
         super().__init__(*args)
         self.partial: list[dict] = partial if partial is not None else []
         self.cursor: str | None = cursor
+        self.status: int | None = status  # HTTP status of a non-retried 4xx, if any
 
 
 class HeliusRateLimited(HeliusError):
@@ -139,18 +143,24 @@ class HeliusClient:
     # -- transport -----------------------------------------------------------
 
     async def _request(
-        self, method: str, url: str, *, params: dict[str, Any] | None = None, json: Any = None
+        self, method: str, url: str, *, params: dict[str, Any] | None = None, json: Any = None,
+        max_retries: int | None = None,
     ) -> Any:
-        """Send with rate limiting; retry 429/5xx/network errors with backoff."""
+        """Send with rate limiting; retry 429/5xx/network errors with backoff.
+
+        ``max_retries`` overrides the client default (0 = single attempt, used for
+        non-idempotent calls such as webhook creation). An empty body returns None.
+        """
+        retries = self.max_retries if max_retries is None else max_retries
         query = {"api-key": self._api_key, **(params or {})}
         safe_url = httpx.URL(url).copy_with(query=None)  # for logs/errors: no key
         last_status: int | None = None
-        for attempt in range(self.max_retries + 1):
+        for attempt in range(retries + 1):
             if attempt:
                 delay = self.base_delay * 2 ** (attempt - 1)
                 log.warning(
                     "helius %s %s -> %s, retry %d/%d in %.2fs",
-                    method, safe_url, last_status or "network error", attempt, self.max_retries, delay,
+                    method, safe_url, last_status or "network error", attempt, retries, delay,
                 )
                 await self._sleep(delay)
             await self._bucket.acquire()
@@ -159,7 +169,7 @@ class HeliusClient:
             except httpx.TransportError as e:
                 last_status = None
                 last_exc_name = type(e).__name__
-                if attempt == self.max_retries:
+                if attempt == retries:
                     raise HeliusError(f"{method} {safe_url}: {last_exc_name}") from None
                 continue
             status = resp.status_code
@@ -170,13 +180,15 @@ class HeliusClient:
                 m = _CONTINUE_RE.search(resp.text)
                 if m:
                     raise _ContinueSearch(f"{method} {safe_url} -> HTTP {status} (continue)", cursor=m.group(1))
-                raise HeliusError(f"{method} {safe_url} -> HTTP {status}")
+                raise HeliusError(f"{method} {safe_url} -> HTTP {status}", status=status)
+            if not resp.content:
+                return None
             return resp.json()
         if last_status == 429:
             raise HeliusRateLimited(
-                f"{method} {safe_url}: still HTTP 429 after {self.max_retries} retries"
+                f"{method} {safe_url}: still HTTP 429 after {retries} retries", status=429
             )
-        raise HeliusError(f"{method} {safe_url}: HTTP {last_status} after {self.max_retries} retries")
+        raise HeliusError(f"{method} {safe_url}: HTTP {last_status} after {retries} retries", status=last_status)
 
     async def _rpc(self, method: str, params: list[Any]) -> Any:
         self._rpc_id += 1
@@ -283,12 +295,36 @@ class HeliusClient:
 
     # -- webhooks ------------------------------------------------------------
 
+    async def list_webhooks(self) -> list[dict]:
+        """GET /v0/webhooks: every webhook on this API key (retried; idempotent)."""
+        data = await self._request("GET", f"{self.api_base}/v0/webhooks")
+        return [w for w in data if isinstance(w, dict)] if isinstance(data, list) else []
+
+    async def find_webhook(self, url: str) -> str | None:
+        """Id of an existing webhook whose webhookURL equals ``url``, else None."""
+        for w in await self.list_webhooks():
+            if w.get("webhookURL") == url and w.get("webhookID"):
+                return str(w["webhookID"])
+        return None
+
+    async def delete_webhook(self, webhook_id: str) -> None:
+        """DELETE /v0/webhooks/{id}. A 404 (already gone) is not an error."""
+        try:
+            await self._request("DELETE", f"{self.api_base}/v0/webhooks/{webhook_id}")
+        except HeliusError as e:
+            if e.status != 404:
+                raise
+
     async def upsert_webhook(
         self, addresses: list[str], url: str, secret: str, webhook_id: str | None = None
     ) -> str:
-        """Create (POST) or update (PUT) the enhanced SWAP webhook; return its id.
+        """Create or update the enhanced SWAP webhook for ``url``; return its id.
 
-        Helius sends ``secret`` back verbatim in the ``Authorization`` header.
+        Create is de-duplicated: an existing webhook with the same webhookURL is
+        reused (PUT) instead of POSTing a second one, and the POST itself is never
+        retried (a timed-out create may have succeeded; the next sync finds it by
+        URL). A PUT to an id Helius no longer knows (404) falls back to this
+        create path. Helius sends ``secret`` back verbatim in ``Authorization``.
         """
         body = {
             "webhookURL": url,
@@ -298,12 +334,22 @@ class HeliusClient:
             "authHeader": secret,
         }
         if webhook_id:
-            data = await self._request("PUT", f"{self.api_base}/v0/webhooks/{webhook_id}", json=body)
-        else:
-            data = await self._request("POST", f"{self.api_base}/v0/webhooks", json=body)
+            try:
+                return await self._put_webhook(webhook_id, body)
+            except HeliusError as e:
+                if e.status != 404:
+                    raise
+                log.warning("helius webhook %s not found (404); re-resolving by URL", webhook_id)
+        existing = await self.find_webhook(url)
+        if existing:
+            return await self._put_webhook(existing, body)
+        data = await self._request("POST", f"{self.api_base}/v0/webhooks", json=body, max_retries=0)
         new_id = data.get("webhookID") if isinstance(data, dict) else None
         if new_id:
             return str(new_id)
-        if webhook_id:
-            return webhook_id
         raise HeliusError("POST /v0/webhooks: response has no webhookID")
+
+    async def _put_webhook(self, webhook_id: str, body: dict) -> str:
+        data = await self._request("PUT", f"{self.api_base}/v0/webhooks/{webhook_id}", json=body)
+        new_id = data.get("webhookID") if isinstance(data, dict) else None
+        return str(new_id) if new_id else webhook_id

@@ -259,9 +259,28 @@ def test_sync_webhook_called_on_watchlist_add(monkeypatch):
     assert r.status_code == 201
     assert r.headers["X-Webhook-Sync"] == "ok"
     assert calls == [([WALLET], "https://example.ngrok.app/webhook/helius", SECRET, None)]
+    deleted = []
+
+    async def fake_delete(self, webhook_id):
+        deleted.append(webhook_id)
+
+    monkeypatch.setattr(HeliusClient, "delete_webhook", fake_delete)
     r = c.delete(f"/api/watchlist/{WALLET}", headers=H)
     assert r.status_code == 204 and r.headers["X-Webhook-Sync"] == "ok"
-    assert calls[-1] == ([], "https://example.ngrok.app/webhook/helius", SECRET, "wh-1")
+    assert len(calls) == 1 and deleted == ["wh-1"]  # empty list -> DELETE, never PUT []
+
+
+def test_public_url_with_webhook_path_not_doubled(monkeypatch):
+    calls = []
+
+    async def fake(self, addresses, url, secret, webhook_id=None):
+        calls.append(url)
+        return "wh-1"
+
+    monkeypatch.setattr(HeliusClient, "upsert_webhook", fake)
+    c = TestClient(_app(PUBLIC_WEBHOOK_URL="https://example.ngrok.app/webhook/helius/"))
+    assert c.post("/api/watchlist", json={"address": WALLET}, headers=H).headers["X-Webhook-Sync"] == "ok"
+    assert calls == ["https://example.ngrok.app/webhook/helius"]
 
 
 def test_sync_skipped_without_public_url(monkeypatch):
@@ -299,6 +318,7 @@ def test_sync_failure_does_not_fail_request(monkeypatch, caplog):
 
 @respx.mock
 def test_webhook_id_persisted_in_kv():
+    respx.get(f"{API}/v0/webhooks").mock(return_value=httpx.Response(200, json=[]))
     create = respx.post(f"{API}/v0/webhooks").mock(
         return_value=httpx.Response(200, json={"webhookID": "wh-new"}))
     update = respx.put(f"{API}/v0/webhooks/wh-new").mock(
@@ -328,6 +348,8 @@ def test_settings_webhook_id_wins_over_kv():
 
 @respx.mock
 async def test_upsert_webhook_create_and_update():
+    listing = respx.get(f"{API}/v0/webhooks").mock(return_value=httpx.Response(200, json=[
+        {"webhookID": "other", "webhookURL": "https://elsewhere/webhook/helius"}]))
     create = respx.post(f"{API}/v0/webhooks").mock(
         return_value=httpx.Response(200, json={"webhookID": "id1"}))
     update = respx.put(f"{API}/v0/webhooks/id1").mock(return_value=httpx.Response(200, json={}))
@@ -340,15 +362,126 @@ async def test_upsert_webhook_create_and_update():
         "webhookURL": "https://u/webhook/helius", "transactionTypes": ["SWAP"],
         "accountAddresses": ["a"], "webhookType": "enhanced", "authHeader": "sec"}
     assert json.loads(update.calls[0].request.content)["accountAddresses"] == ["a", "b"]
+    assert listing.call_count == 1 and create.call_count == 1  # list-then-create; update path skips list
 
 
 @respx.mock
 async def test_upsert_webhook_error_redacts_key():
+    respx.get(f"{API}/v0/webhooks").mock(return_value=httpx.Response(200, json=[]))
     respx.post(f"{API}/v0/webhooks").mock(return_value=httpx.Response(400, json={"error": "bad"}))
     async with HeliusClient("secretkey123", rps=100, max_retries=0) as h:
         with pytest.raises(HeliusError) as ei:
             await h.upsert_webhook(["a"], "https://u", "sec", None)
     assert "secretkey123" not in str(ei.value)
+
+
+async def _nosleep(_):
+    return None
+
+
+@respx.mock
+async def test_upsert_reuses_existing_webhook_by_url():
+    respx.get(f"{API}/v0/webhooks").mock(return_value=httpx.Response(200, json=[
+        {"webhookID": "other", "webhookURL": "https://elsewhere/webhook/helius"},
+        {"webhookID": "found-1", "webhookURL": "https://u/webhook/helius"}]))
+    create = respx.post(f"{API}/v0/webhooks").mock(return_value=httpx.Response(200, json={"webhookID": "dup"}))
+    update = respx.put(f"{API}/v0/webhooks/found-1").mock(return_value=httpx.Response(200, json={}))
+    async with HeliusClient("hk", rps=100) as h:
+        assert await h.upsert_webhook(["a"], "https://u/webhook/helius", "sec", None) == "found-1"
+    assert create.call_count == 0 and update.call_count == 1
+
+
+@respx.mock
+async def test_upsert_create_post_timeout_not_retried():
+    respx.get(f"{API}/v0/webhooks").mock(return_value=httpx.Response(200, json=[]))
+    create = respx.post(f"{API}/v0/webhooks").mock(side_effect=httpx.ReadTimeout("slow"))
+    async with HeliusClient("hk", rps=100, max_retries=5, sleep=_nosleep) as h:
+        with pytest.raises(HeliusError):
+            await h.upsert_webhook(["a"], "https://u/webhook/helius", "sec", None)
+    assert create.call_count == 1
+
+
+@respx.mock
+async def test_upsert_create_list_get_is_retried():
+    listing = respx.get(f"{API}/v0/webhooks").mock(side_effect=[
+        httpx.Response(503), httpx.Response(200, json=[])])
+    create = respx.post(f"{API}/v0/webhooks").mock(return_value=httpx.Response(200, json={"webhookID": "n1"}))
+    async with HeliusClient("hk", rps=100, max_retries=2, sleep=_nosleep) as h:
+        assert await h.upsert_webhook(["a"], "https://u/webhook/helius", "sec", None) == "n1"
+    assert listing.call_count == 2 and create.call_count == 1
+
+
+@respx.mock
+async def test_upsert_put_404_falls_back_to_create_path():
+    respx.put(f"{API}/v0/webhooks/gone").mock(return_value=httpx.Response(404, json={"error": "not found"}))
+    respx.get(f"{API}/v0/webhooks").mock(return_value=httpx.Response(200, json=[]))
+    create = respx.post(f"{API}/v0/webhooks").mock(return_value=httpx.Response(200, json={"webhookID": "n2"}))
+    async with HeliusClient("hk", rps=100, sleep=_nosleep) as h:
+        assert await h.upsert_webhook(["a"], "https://u/webhook/helius", "sec", "gone") == "n2"
+    assert create.call_count == 1
+
+
+@respx.mock
+async def test_delete_webhook_empty_body_and_404_ok():
+    respx.delete(f"{API}/v0/webhooks/w1").mock(return_value=httpx.Response(200))
+    respx.delete(f"{API}/v0/webhooks/w2").mock(return_value=httpx.Response(404))
+    async with HeliusClient("hk", rps=100, sleep=_nosleep) as h:
+        await h.delete_webhook("w1")
+        await h.delete_webhook("w2")  # already gone: not an error
+
+
+@respx.mock
+def test_last_removal_deletes_webhook_and_clears_kv_then_add_recreates():
+    respx.get(f"{API}/v0/webhooks").mock(return_value=httpx.Response(200, json=[]))
+    create = respx.post(f"{API}/v0/webhooks").mock(side_effect=[
+        httpx.Response(200, json={"webhookID": "wh-a"}), httpx.Response(200, json={"webhookID": "wh-b"})])
+    put = respx.put(url__regex=rf"{API}/v0/webhooks/.*").mock(return_value=httpx.Response(200, json={}))
+    delete = respx.delete(f"{API}/v0/webhooks/wh-a").mock(return_value=httpx.Response(200, json={}))
+    app = _app(PUBLIC_WEBHOOK_URL="https://x.example")
+    c = TestClient(app)
+    assert c.post("/api/watchlist", json={"address": WALLET}, headers=H).headers["X-Webhook-Sync"] == "ok"
+    r = c.delete(f"/api/watchlist/{WALLET}", headers=H)
+    assert r.status_code == 204 and r.headers["X-Webhook-Sync"] == "ok"
+    assert delete.call_count == 1 and put.call_count == 0
+    with Session(app.state.engine) as s:
+        assert s.get(Kv, "helius_webhook_id") is None
+    assert c.post("/api/watchlist", json={"address": OTHER}, headers=H).headers["X-Webhook-Sync"] == "ok"
+    assert create.call_count == 2 and put.call_count == 0
+    assert json.loads(create.calls[-1].request.content)["accountAddresses"] == [OTHER]
+    with Session(app.state.engine) as s:
+        assert s.get(Kv, "helius_webhook_id").value == "wh-b"
+
+
+@respx.mock
+def test_empty_watchlist_without_webhook_is_noop():
+    listing = respx.get(f"{API}/v0/webhooks").mock(return_value=httpx.Response(200, json=[]))
+    app = _app(PUBLIC_WEBHOOK_URL="https://x.example")
+    _watch(app)
+    with Session(app.state.engine) as s:
+        s.delete(s.get(Watchlist, WALLET))
+        s.commit()
+    from hades.realtime import sync_webhook
+    import asyncio as _a
+    app.state.sync_lock = _a.Lock()
+    assert _a.run(sync_webhook(app)) == "ok"
+    assert listing.call_count == 1  # looked for an orphan by URL, found none, nothing deleted
+
+
+def test_kv_write_failure_after_create_logs_and_returns_ok(monkeypatch, caplog):
+    async def fake(self, addresses, url, secret, webhook_id=None):
+        return "wh-z"
+
+    def broken(engine, webhook_id):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(HeliusClient, "upsert_webhook", fake)
+    from hades import realtime
+    monkeypatch.setattr(realtime, "_store_webhook_id", broken)
+    c = TestClient(_app(PUBLIC_WEBHOOK_URL="https://x.example"))
+    with caplog.at_level("WARNING"):
+        r = c.post("/api/watchlist", json={"address": WALLET}, headers=H)
+    assert r.status_code == 201 and r.headers["X-Webhook-Sync"] == "ok"
+    assert "could not persist webhook id" in caplog.text
 
 
 # -- migration -----------------------------------------------------------------------

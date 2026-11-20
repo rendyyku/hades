@@ -30,7 +30,7 @@ ALERT_MIN_SCORE = 70
 QUEUE_MAXSIZE = 100
 KV_WEBHOOK_ID = "helius_webhook_id"
 WEBHOOK_PATH = "/webhook/helius"
-SYNC_MAX_RETRIES = 1  # POST /v0/webhooks is not idempotent: keep retries minimal
+SYNC_MAX_RETRIES = 2  # GET/PUT/DELETE only; the create POST is never retried (see upsert_webhook)
 
 
 # -- bus ----------------------------------------------------------------------------
@@ -179,10 +179,25 @@ def _store_webhook_id(engine, webhook_id: str) -> None:
         session.commit()
 
 
+def _clear_webhook_id(engine) -> None:
+    with Session(engine) as session:
+        row = session.get(Kv, KV_WEBHOOK_ID)
+        if row is not None:
+            session.delete(row)
+            session.commit()
+
+
+def effective_webhook_id(engine, settings) -> str | None:
+    """The webhook id the next sync would use (settings override, else kv)."""
+    return _sync_inputs(engine, settings)[1]
+
+
 async def sync_webhook(app) -> str:
     """Push the watchlist to the Helius webhook. Returns 'ok' | 'skipped' | 'error'.
 
-    Never raises: the watchlist change is already committed and must not fail.
+    Non-empty watchlist -> upsert (create is de-duplicated by URL, never retried).
+    Empty watchlist -> DELETE the webhook (known id, else one found by URL) and
+    clear the stored id. Never raises: the watchlist change is already committed.
     """
     settings = app.state.settings
     if not settings.PUBLIC_WEBHOOK_URL:
@@ -190,18 +205,34 @@ async def sync_webhook(app) -> str:
     if not settings.HELIUS_API_KEY or not settings.HELIUS_WEBHOOK_SECRET:
         log.warning("webhook sync: HELIUS_API_KEY or HELIUS_WEBHOOK_SECRET not configured")
         return "error"
-    url = settings.PUBLIC_WEBHOOK_URL.rstrip("/") + WEBHOOK_PATH
+    url = settings.PUBLIC_WEBHOOK_URL.rstrip("/")
+    if not url.endswith(WEBHOOK_PATH):  # accept the base URL or the full receiver URL
+        url += WEBHOOK_PATH
+    engine = app.state.engine
     async with app.state.sync_lock:  # serialise: two concurrent creates = two webhooks
         try:
-            addresses, webhook_id = await run_in_threadpool(_sync_inputs, app.state.engine, settings)
+            addresses, webhook_id = await run_in_threadpool(_sync_inputs, engine, settings)
             async with HeliusClient(
                 settings.HELIUS_API_KEY, settings.RATE_LIMIT_RPS, max_retries=SYNC_MAX_RETRIES
             ) as client:
+                if not addresses:
+                    target = webhook_id or await client.find_webhook(url)
+                    if target:
+                        await client.delete_webhook(target)
+                        if settings.HELIUS_WEBHOOK_ID:
+                            log.warning("webhook sync: deleted the webhook pinned by HELIUS_WEBHOOK_ID; "
+                                        "clear that setting (the next add re-creates by URL)")
+                    await run_in_threadpool(_clear_webhook_id, engine)
+                    return "ok"
                 new_id = await client.upsert_webhook(
                     addresses, url, settings.HELIUS_WEBHOOK_SECRET, webhook_id)
-            if not settings.HELIUS_WEBHOOK_ID and new_id != webhook_id:
-                await run_in_threadpool(_store_webhook_id, app.state.engine, new_id)
         except Exception as e:
             log.warning("webhook sync failed: %s", type(e).__name__)
             return "error"
+        if new_id != webhook_id:
+            try:  # persist right away; if this fails the next sync finds the webhook by URL
+                await run_in_threadpool(_store_webhook_id, engine, new_id)
+            except Exception as e:
+                log.warning("webhook sync: could not persist webhook id (%s); "
+                            "next sync will re-resolve it by URL", type(e).__name__)
     return "ok"

@@ -1,4 +1,4 @@
-"""HADES command line: `hades init-db | seed | discover | backfill | tag | rescore | serve`."""
+"""HADES command line: `hades init-db | seed | discover | backfill | tag | rescore | serve | webhook-sync`."""
 
 from __future__ import annotations
 
@@ -121,14 +121,16 @@ def seed(mint: str) -> None:
 
 
 @app.command()
-def discover() -> None:
+def discover(
+    limit: int = typer.Option(0, "--limit", min=0, help="Max NEW runners to seed this run (0 = unlimited)"),
+) -> None:
     """Seed new runners from DexScreener boosted tokens."""
     settings = get_settings()
 
     async def run() -> list[tuple[str, str | None]]:
         async with _closing(make_helius(settings)) as helius, _closing(make_dex(settings)) as dex:
             with _session(settings) as session:
-                toks = await pipeline.discover(session, helius, dex, settings)
+                toks = await pipeline.discover(session, helius, dex, settings, limit=limit)
                 return [(t.mint, t.symbol) for t in toks]
 
     new = asyncio.run(run())
@@ -238,6 +240,34 @@ def rescore() -> None:
             typer.echo(f"  {score:6.2f}  {addr}  pnl={pnl:+.3f} SOL  closed={closed}")
     else:
         typer.echo("no wallet eligible for a score yet (needs >= 5 closed tokens, non-bot)")
+
+
+@app.command("webhook-sync")
+def webhook_sync() -> None:
+    """Push the current watchlist to the Helius webhook once (create/update/delete)."""
+    from types import SimpleNamespace
+
+    from hades.realtime import effective_webhook_id, sync_webhook
+
+    settings = get_settings()
+    engine = make_engine(settings.DATABASE_URL)
+    init_db(engine)
+
+    async def run() -> str:
+        state = SimpleNamespace(settings=settings, engine=engine, sync_lock=asyncio.Lock())
+        return await sync_webhook(SimpleNamespace(state=state))
+
+    try:
+        status = asyncio.run(run())
+        wid = effective_webhook_id(engine, settings)
+    finally:
+        engine.dispose()
+    typer.echo(f"webhook sync: {status}  webhook id: {wid or '-'}")
+    if status == "skipped":
+        typer.echo("PUBLIC_WEBHOOK_URL is not set; nothing to sync", err=True)
+    elif status == "error":
+        typer.echo("webhook sync failed (see log)", err=True)
+        raise typer.Exit(1)
 
 
 @app.command()

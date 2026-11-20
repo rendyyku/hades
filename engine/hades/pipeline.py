@@ -219,9 +219,13 @@ async def backfill_wallet(
 
 
 async def discover(
-    session: Session, helius: Any, dex: Any, settings: Settings, now: datetime | None = None
+    session: Session, helius: Any, dex: Any, settings: Settings, now: datetime | None = None,
+    limit: int = 0,
 ) -> list[Token]:
-    """Seed boosted tokens that are runners and not yet in the tokens table."""
+    """Seed boosted tokens that are runners and not yet in the tokens table.
+
+    ``limit`` > 0 caps how many NEW runners are seeded this run (0 = unlimited).
+    """
     now = _now(now)
     now_ms = int(now.timestamp() * 1000)
     mints = await dex.boosted_tokens()
@@ -235,6 +239,8 @@ async def discover(
 
     new: list[Token] = []
     for mint in mints:
+        if limit > 0 and len(new) >= limit:
+            break
         best = best_pair(by_mint.get(mint, []))
         if best is None or not is_runner(best, now_ms):
             continue
