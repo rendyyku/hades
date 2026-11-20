@@ -8,6 +8,9 @@ import respx
 from hades_hl.client import (
     FILLS_HISTORY_CAP,
     FILLS_PAGE_LIMIT,
+    FUNDING_PAGE_LIMIT,
+    MAX_FUNDING_PAGES,
+    FundingPage,
     HLClient,
     HLError,
     HLPage,
@@ -162,8 +165,10 @@ async def test_user_funding_real_fixture(fixture):
     respx.post(INFO).mock(return_value=httpx.Response(200, json=rows[:100]))
     async with make_client() as c:
         out = await c.user_funding(meta["address"], meta["start_ms"])
-    assert len(out) == min(100, len(rows))
-    assert all(r["delta"]["type"] == "funding" for r in out)
+    assert isinstance(out, FundingPage)
+    assert out.truncated is False
+    assert len(out.rows) == min(100, len(rows))
+    assert all(r["delta"]["type"] == "funding" for r in out.rows)
 
 
 @respx.mock
@@ -253,6 +258,41 @@ async def test_fills_page_of_identical_ms_still_advances():
     assert route.call_count == 2
     assert body(route.calls[1])["startTime"] == t0 + 1
     assert len(page.fills) == 2001
+    # (M1) fills of t0 beyond the 2000 returned are unreachable: flag it
+    assert page.truncated is True
+
+
+@respx.mock
+async def test_fills_same_ms_skip_logs_warning(caplog):
+    t0 = 1_700_000_000_000
+    page1 = [fill(i, t0) for i in range(2000)]
+    respx.post(INFO).mock(side_effect=[httpx.Response(200, json=page1),
+                                       httpx.Response(200, json=[])])
+    async with make_client() as c:
+        with caplog.at_level("WARNING", logger="hades_hl.client"):
+            await c.user_fills_by_time(ADDR, t0)
+    assert any("same millisecond" in r.getMessage() for r in caplog.records)
+
+
+@respx.mock
+async def test_fills_normal_paging_not_truncated():
+    t0 = 1_700_000_000_000
+    page1 = [fill(i, t0 + i) for i in range(2000)]
+    respx.post(INFO).mock(side_effect=[httpx.Response(200, json=page1),
+                                       httpx.Response(200, json=[fill(1999, t0 + 1999)])])
+    async with make_client() as c:
+        page = await c.user_fills_by_time(ADDR, t0)
+    assert page.truncated is False and len(page.fills) == 2000
+
+
+@respx.mock
+async def test_fill_missing_tid_raises():
+    bad = fill(1, 1_700_000_000_000)
+    del bad["tid"]
+    respx.post(INFO).mock(return_value=httpx.Response(200, json=[bad]))
+    async with make_client() as c:
+        with pytest.raises(HLError, match="tid"):
+            await c.user_fills_by_time(ADDR, 1_700_000_000_000)
 
 
 @respx.mock
@@ -269,7 +309,32 @@ async def test_user_funding_pages_on_500():
         out = await c.user_funding(ADDR, t0)
     assert route.call_count == 2
     assert body(route.calls[1])["startTime"] == t0 + 499
-    assert len(out) == 502
+    assert len(out.rows) == 502
+    assert out.truncated is False
+
+
+@respx.mock
+async def test_user_funding_max_pages_flags_truncated(caplog):
+    t0 = 1_700_000_000_000
+
+    def fr(t):
+        return {"time": t, "hash": "0x0", "delta": {"type": "funding", "coin": "BTC",
+                                                    "usdc": "1.0", "szi": "1.0",
+                                                    "fundingRate": "0.0001"}}
+    calls = {"n": 0}
+
+    def endless(request):
+        start = json.loads(request.content)["startTime"]
+        calls["n"] += 1
+        return httpx.Response(200, json=[fr(start + i) for i in range(FUNDING_PAGE_LIMIT)])
+
+    respx.post(INFO).mock(side_effect=endless)
+    async with make_client() as c:
+        with caplog.at_level("WARNING", logger="hades_hl.client"):
+            out = await c.user_funding(ADDR, t0)
+    assert calls["n"] == MAX_FUNDING_PAGES
+    assert out.truncated is True
+    assert any("MAX_FUNDING_PAGES" in r.getMessage() for r in caplog.records)
 
 
 # -- 429 / retries ------------------------------------------------------------

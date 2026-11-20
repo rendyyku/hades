@@ -119,11 +119,23 @@ class HLUnavailable(HLError):
 class HLPage:
     """Result of a paged fills read.
 
-    ``truncated``: the 10,000-fill history cap was reached, so fills older than the
-    first one returned may exist but are unreachable through the info API.
+    ``truncated``: the history is known to be incomplete. Either the 10,000-fill
+    history cap was reached (fills older than the first one returned may exist but are
+    unreachable through the info API), or a full 2000-row page was entirely one
+    millisecond and paging had to skip past that millisecond (more fills of that ms
+    may exist). Scoring treats both as partial history (ruling P17).
     """
 
     fills: list[dict] = field(default_factory=list)
+    truncated: bool = False
+
+
+@dataclass
+class FundingPage:
+    """Result of a paged funding read. ``truncated``: paging stopped at
+    MAX_FUNDING_PAGES while pages were still full, so later rows may be missing."""
+
+    rows: list[dict] = field(default_factory=list)
     truncated: bool = False
 
 
@@ -307,6 +319,7 @@ class HLClient:
         out: list[dict] = []
         seen: set[int] = set()
         cursor = int(start_ms)
+        skipped_ms = False
         while True:
             body: dict[str, Any] = {"type": "userFillsByTime", "user": addr, "startTime": cursor}
             if end_ms is not None:
@@ -316,6 +329,8 @@ class HLClient:
                 raise HLError("info userFillsByTime: expected a list")
             for f in page:
                 tid = f.get("tid")
+                if tid is None:
+                    raise HLError(f"info userFillsByTime: fill without tid at time {f.get('time')}")
                 if tid in seen:
                     continue
                 seen.add(tid)
@@ -323,15 +338,26 @@ class HLClient:
                 if len(out) >= FILLS_HISTORY_CAP:
                     return HLPage(out, truncated=True)
             if len(page) < FILLS_PAGE_LIMIT:
-                return HLPage(out, truncated=False)
+                return HLPage(out, truncated=skipped_ms)
             last = max(int(f["time"]) for f in page)
-            cursor = last + 1 if last <= cursor else last
+            if last <= cursor:
+                # a full page inside one millisecond: more fills of this ms may exist
+                # but cannot be paged to; skip ahead and flag the history as partial
+                log.warning("hl userFillsByTime %s: full page in the same millisecond %d, "
+                            "skipping 1 ms; history marked truncated", addr, last)
+                skipped_ms = True
+                cursor = last + 1
+            else:
+                cursor = last
 
-    async def user_funding(self, addr: str, start_ms: int, end_ms: int | None = None) -> list[dict]:
+    async def user_funding(
+        self, addr: str, start_ms: int, end_ms: int | None = None
+    ) -> FundingPage:
         """Funding payments of ``addr`` from ``start_ms`` (inclusive), oldest first.
 
         Pages while a page is full (500 rows), restarting inclusive at the last time
-        and de-duplicating by (time, coin) like :meth:`user_fills_by_time`.
+        and de-duplicating by (time, coin) like :meth:`user_fills_by_time`. Stops after
+        MAX_FUNDING_PAGES pages with ``truncated=True`` (and a warning).
         """
         out: list[dict] = []
         seen: set[tuple[int, str]] = set()
@@ -350,10 +376,12 @@ class HLClient:
                 seen.add(key)
                 out.append(r)
             if len(page) < FUNDING_PAGE_LIMIT:
-                break
+                return FundingPage(out, truncated=False)
             last = max(int(r["time"]) for r in page)
             cursor = last + 1 if last <= cursor else last
-        return out
+        log.warning("hl userFunding %s: stopped at MAX_FUNDING_PAGES=%d with full pages; "
+                    "funding marked truncated", addr, MAX_FUNDING_PAGES)
+        return FundingPage(out, truncated=True)
 
     async def clearinghouse_state(self, addr: str) -> dict:
         return await self._info({"type": "clearinghouseState", "user": addr})
