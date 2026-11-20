@@ -3,12 +3,30 @@
 Pure and deterministic: same events, same model, same config -> same result.
 
 Accounting:
-- equity = bankroll + realized PnL - fees + unrealized PnL of open positions.
-- Every position is isolated margin: its total loss (realized + unrealized, before
-  fees) is capped at its margin. When an observed price puts the loss at or beyond
-  the margin, the position is liquidated.
+- equity = bankroll + realized PnL - fees - holding costs + unrealized PnL of open
+  positions.
+- Every position is isolated margin: its total price loss (realized + unrealized,
+  before fees) is capped at its margin. When an observed price puts the loss at or
+  beyond the margin, the position is liquidated.
 - long / yes / no profit when their own price rises; short profits when it falls.
   Polymarket NO is its own token priced 0..1, so it behaves like yes on that price.
+- Holding cost (HL funding, ...): if the model defines
+  ``holding_cost(pos, start, end) -> Decimal``, every open position is charged for the
+  interval since its last charge at each processing step (each processed event, which
+  is also when marks are taken), the last processed step included, so a close charges
+  up to its own time first. Positive is a cost, negative is income. It moves cash
+  (equity) immediately and is deducted from the position's ClosedTrade pnl at close.
+  It is not part of the isolated-margin cap.
+
+Event handling:
+- Input is de-duplicated by ``source_ref`` (first occurrence in input order wins), then
+  sorted by ``(observed_time, source_ref)``.
+- Ignoring is per leader position *episode*: a position the leader opened before
+  ``follow_started_at`` (or that we missed / were liquidated out of) is ignored until
+  the episode ends: a close/resolve, or a reduce that takes the leader's tracked size
+  to 0. Then the key (position_id, or the wallet:market:direction fallback) is free.
+- An increase/reduce/close/resolve for a position we never held is a pure no-op: no
+  fill, no price observation, no equity point.
 """
 
 from __future__ import annotations
@@ -35,6 +53,10 @@ class ExecutionModel(Protocol):
         ...
 
     def fee(self, notional: Decimal) -> Decimal: ...
+
+    # Optional, detected with getattr (absent means 0):
+    # def holding_cost(self, pos: OpenPosition, start: datetime, end: datetime) -> Decimal
+    #     Cost of holding ``pos`` over [start, end]; positive = cost, negative = income.
 
 
 @dataclass
@@ -63,9 +85,10 @@ class PaperFill:
 class ClosedTrade:
     position_id: str
     market_id: str
-    pnl_usd: Decimal  # realized PnL net of every fee paid on the position
+    pnl_usd: Decimal  # realized PnL net of every fee and holding cost of the position
     opened_at: datetime
     closed_at: datetime
+    group_id: str | None = None  # TradeEvent.group_id of the opening event
 
 
 @dataclass
@@ -94,6 +117,9 @@ class _Pos:
     opened_at: datetime
     realized: Decimal = ZERO  # realized price PnL from partial reduces (before fees)
     fees: Decimal = ZERO
+    holding: Decimal = ZERO  # accumulated holding cost (positive = paid)
+    accrued_to: datetime | None = None
+    group_id: str | None = None
 
     def unit_pnl(self, price: Decimal) -> Decimal:
         diff = price - self.pos.entry_price
@@ -111,6 +137,17 @@ def _key(ev: TradeEvent) -> str:
     return f"{ev.wallet}:{ev.market_id}:{ev.direction}"
 
 
+def _dedupe(events: Iterable[TradeEvent]) -> list[TradeEvent]:
+    """Drop repeated source_refs; the first occurrence in input order wins."""
+    seen: set[str] = set()
+    out: list[TradeEvent] = []
+    for ev in events:
+        if ev.source_ref not in seen:
+            seen.add(ev.source_ref)
+            out.append(ev)
+    return out
+
+
 def simulate(
     events: Iterable[TradeEvent],
     model: ExecutionModel,
@@ -121,9 +158,30 @@ def simulate(
     require_utc("follow_started_at", follow_started_at)
     res = PaperResult(equity_curve=[(follow_started_at, cfg.bankroll)])
     book: dict[str, _Pos] = {}
-    ignored: set[str] = set()
+    # Ignored leader episodes -> the leader's tracked size in that episode
+    # (None = unknown: the episode then ends only on close/resolve).
+    ignored: dict[str, Decimal | None] = {}
     last_price: dict[str, Decimal] = {}
-    base = cfg.bankroll  # bankroll + realized - fees of closed/partial activity
+    base = cfg.bankroll  # bankroll + realized - fees - holding costs
+    holding_cost = getattr(model, "holding_cost", None)
+
+    def ignore_step(key: str, ev: TradeEvent) -> None:
+        """Apply a leader event to an ignored episode; end the episode when it is over."""
+        if ev.side in ("close", "resolve"):
+            ignored.pop(key, None)
+            return
+        size = ignored[key]
+        if size is None:
+            return
+        lead = abs(ev.size)
+        if ev.side == "reduce":
+            size -= lead
+            if size <= ZERO:
+                ignored.pop(key, None)
+                return
+        else:  # open / increase
+            size += lead
+        ignored[key] = size
 
     def close_out(key: str, price: Decimal | None, fee: Decimal, ref: str,
                   side: Side, at: datetime, liquidation: bool) -> None:
@@ -140,10 +198,11 @@ def simulate(
         res.fills.append(PaperFill(ref, pos.market_id, side, pos.direction, pos.qty, price,
                                    fee, price_pnl, False, pos.position_id, at))
         res.closed_trades.append(ClosedTrade(pos.position_id, pos.market_id,
-                                             p.realized + price_pnl - p.fees, p.opened_at, at))
+                                             p.realized + price_pnl - p.fees - p.holding,
+                                             p.opened_at, at, p.group_id))
         if liquidation:
-            # The copy is gone; ignore whatever the leader does with this position next.
-            ignored.add(key)
+            # The copy is gone; ignore the rest of the leader's episode.
+            ignored[key] = pos.leader_size
 
     def observe(market_id: str, price: Decimal, at: datetime, ref: str) -> None:
         last_price[market_id] = price
@@ -152,6 +211,18 @@ def simulate(
             if p.unit_pnl(price) * p.pos.qty <= -p.pos.margin:
                 close_out(key, price, ZERO, f"liquidation:{ref}", "close", at, True)
 
+    def accrue(at: datetime) -> None:
+        nonlocal base
+        if holding_cost is None:
+            return
+        for key in sorted(book):
+            p = book[key]
+            if p.accrued_to is not None and at > p.accrued_to:
+                cost = Decimal(holding_cost(p.pos, p.accrued_to, at))
+                base -= cost
+                p.holding += cost
+                p.accrued_to = at
+
     def equity() -> Decimal:
         total = base
         for p in book.values():
@@ -159,39 +230,45 @@ def simulate(
             total += p.unrealized(px)
         return total
 
-    ordered = sorted(events, key=lambda e: (e.observed_time, e.source_ref))
+    ordered = sorted(_dedupe(events), key=lambda e: (e.observed_time, e.source_ref))
     for ev in ordered:
         key = _key(ev)
         terminal = ev.side in ("close", "resolve")
 
-        if ev.leader_time < follow_started_at:
-            if key not in book:
-                ignored.add(key)
+        if ev.leader_time < follow_started_at and key not in book and key not in ignored:
+            # pre-follow episode: the leader's size is known only if we saw its open
+            ignored[key] = ZERO if ev.side == "open" else None
         if key in ignored:
-            if terminal and ev.leader_time >= follow_started_at:
-                # leader's pre-follow / uncopied position ended; the key may be reused
-                ignored.discard(key)
+            ignore_step(key, ev)
+            continue
+        if key not in book and ev.side != "open":
+            # increase/reduce/close/resolve for a position we never held: pure no-op
             continue
 
         at = ev.observed_time
+        accrue(at)
         # Mark open positions to the latest recorded prices before acting.
         if mark is not None:
             for mkt in sorted({p.pos.market_id for p in book.values()}):
                 px = mark(mkt, at)
                 if px is not None:
                     observe(mkt, px, at, ev.source_ref)
+        if key in ignored:  # our copy was just liquidated by a mark
+            ignore_step(key, ev)
+            res.equity_curve.append((at, equity()))
+            continue
 
+        lead = abs(ev.size)
         price = model.fill_price(ev)
         if price is None:
             res.fills.append(PaperFill(ev.source_ref, ev.market_id, ev.side, ev.direction,
                                        ZERO, None, ZERO, ZERO, True, ev.position_id, at))
             p = book.get(key)
-            if ev.side == "open" and p is None:
-                ignored.add(key)  # never opened: ignore the rest of this position
-            elif p is not None:
+            if p is None:  # missed open: never opened, ignore the rest of this episode
+                ignored[key] = lead
+            else:
                 # leader moved without us: keep tracking leader size, our qty is unchanged
-                lead = abs(ev.size)
-                if ev.side == "increase" or ev.side == "open":
+                if ev.side in ("increase", "open"):
                     p.pos.leader_size += lead
                 elif ev.side == "reduce":
                     p.pos.leader_size = max(p.pos.leader_size - lead, ZERO)
@@ -201,10 +278,13 @@ def simulate(
             continue
 
         observe(ev.market_id, price, at, ev.source_ref)
+        if key in ignored:  # liquidated by this very fill price
+            ignore_step(key, ev)
+            res.equity_curve.append((at, equity()))
+            continue
         p = book.get(key)
-        lead = abs(ev.size)
 
-        if p is None and ev.side == "open":
+        if p is None:  # open
             eq = equity()
             margin = cfg.risk_fraction * eq
             if margin > ZERO and price > ZERO:
@@ -214,15 +294,11 @@ def simulate(
                 base -= fee
                 book[key] = _Pos(
                     OpenPosition(key, ev.market_id, ev.direction, qty, price, margin, lev, lead),
-                    opened_at=at, fees=fee)
+                    opened_at=at, fees=fee, accrued_to=at, group_id=ev.group_id)
                 res.fills.append(PaperFill(ev.source_ref, ev.market_id, ev.side, ev.direction,
                                            qty, price, fee, ZERO, False, key, at))
             else:
-                ignored.add(key)
-        elif p is None:
-            # increase/reduce/close for a position we never held (e.g. liquidated
-            # then key reused, or stray event): nothing to copy.
-            pass
+                ignored[key] = lead
         elif terminal:
             close_out(key, price, model.fee(p.pos.qty * price), ev.source_ref, ev.side, at, False)
         elif ev.side in ("increase", "open"):
@@ -257,10 +333,6 @@ def simulate(
                 res.fills.append(PaperFill(ev.source_ref, ev.market_id, ev.side, ev.direction,
                                            cut, price, fee, pnl, False, key, at))
 
-        if terminal:
-            # The leader's position is over (even if our copy was just liquidated by
-            # this very price): a later event may legitimately reuse the key.
-            ignored.discard(key)
         res.equity_curve.append((at, equity()))
 
     res.open_positions = {k: book[k].pos for k in sorted(book)}

@@ -54,3 +54,4 @@ def test_event_optional_fields_default_none():
     ev = make()
     assert ev.leverage is None
     assert ev.position_id is None
+    assert ev.group_id is None

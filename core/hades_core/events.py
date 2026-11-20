@@ -23,6 +23,18 @@ def require_utc(name: str, value: datetime) -> None:
 
 @dataclass(frozen=True)
 class TradeEvent:
+    """One leader fill, as observed by a head.
+
+    - ``size``: the leader's absolute size delta of *this* fill (not the resulting
+      position size), always >= 0 in meaning; the simulator uses ``abs(size)``.
+    - ``price``: the leader's own fill price. Informational only: the paper copy never
+      fills at it, the ExecutionModel supplies our price.
+    - ``position_id``: groups every event of one leader position episode (open ..
+      close/resolve). When None the simulator keys by ``wallet:market_id:direction``.
+    - ``group_id``: optional wider grouping for gate concentration checks (Polymarket:
+      the event/condition id spanning several outcome tokens).
+    """
+
     head: str
     wallet: str
     market_id: str
@@ -38,6 +50,8 @@ class TradeEvent:
     leverage: Decimal | None = None
     # Groups every event of one leader position (open .. close/resolve).
     position_id: str | None = None
+    # Wider concentration group (Polymarket event/condition id); see GateConfig.
+    group_id: str | None = None
 
     def __post_init__(self) -> None:
         require_utc("leader_time", self.leader_time)

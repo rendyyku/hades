@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
+import pytest
+
 from hades_core.events import TradeEvent
 from hades_core.paper import (
     OpenPosition,
@@ -29,8 +31,10 @@ class FakeModel:
 
 
 def ev(ref, side, minutes, *, size="1", price="100", direction="long", pid="p1",
-       market="BTC", leverage=None, leader_minutes=None):
+       market="BTC", leverage=None, leader_minutes=None, group=None, **extra):
     lt = T0 + timedelta(minutes=minutes if leader_minutes is None else leader_minutes)
+    if group is not None:
+        extra["group_id"] = group
     return TradeEvent(
         head="hyperliquid",
         wallet="0xabc",
@@ -46,6 +50,7 @@ def ev(ref, side, minutes, *, size="1", price="100", direction="long", pid="p1",
         source_ref=ref,
         leverage=None if leverage is None else Decimal(leverage),
         position_id=pid,
+        **extra,
     )
 
 
@@ -248,6 +253,10 @@ def test_unrealized_loss_capped_and_liquidates_on_mark():
     assert [c.pnl_usd for c in res.closed_trades if c.position_id == "p1"] == [Decimal("-500")]
     assert "p1" not in res.open_positions
     assert not any(f.ev_ref == "c" and not f.missed for f in res.fills)
+    # loss capped at the 500 margin: equity right after the liquidation step and at the end
+    at_x = T0 + timedelta(minutes=5, seconds=1)
+    assert dict(res.equity_curve)[at_x] == Decimal("9500")
+    assert final_equity(res) == Decimal("9500")
 
 
 def test_fees_reduce_equity():
@@ -291,3 +300,156 @@ def test_sorted_by_observed_time_then_source_ref():
     c = ev("b-close", "close", 1)
     res = simulate([c, o], FakeModel({"a-open": Decimal("100"), "b-close": Decimal("110")}), CFG, FOLLOW)
     assert [f.ev_ref for f in res.fills] == ["a-open", "b-close"]
+
+
+# --- fix round 1 -----------------------------------------------------------------
+
+
+def test_fallback_key_pre_follow_episode_does_not_block_later_positions():
+    # no position_id: key falls back to wallet:market:direction
+    events = [
+        ev("old-open", "open", -60, pid=None),
+        ev("old-close", "close", -30, pid=None),
+        ev("new-open", "open", 5, pid=None),
+        ev("new-close", "close", 10, pid=None),
+    ]
+    model = FakeModel({"old-open": Decimal("100"), "old-close": Decimal("100"),
+                       "new-open": Decimal("100"), "new-close": Decimal("110")})
+    res = simulate(events, model, CFG, FOLLOW)
+    assert [f.ev_ref for f in res.fills] == ["new-open", "new-close"]
+    assert [c.pnl_usd for c in res.closed_trades] == [Decimal("50")]  # qty 5 * +10
+
+
+def test_fallback_key_pre_follow_reduce_to_zero_ends_episode():
+    events = [
+        ev("old-open", "open", -60, pid=None, size="2"),
+        ev("old-reduce", "reduce", 2, pid=None, size="2"),  # leader size -> 0: episode over
+        ev("new-open", "open", 5, pid=None),
+    ]
+    model = FakeModel({r: Decimal("100") for r in ["old-open", "old-reduce", "new-open"]})
+    res = simulate(events, model, CFG, FOLLOW)
+    assert [f.ev_ref for f in res.fills] == ["new-open"]
+    assert "0xabc:BTC:long" in res.open_positions
+
+
+def test_fallback_key_partial_reduce_keeps_ignoring():
+    events = [
+        ev("old-open", "open", -60, pid=None, size="2"),
+        ev("old-reduce", "reduce", 2, pid=None, size="1"),  # leader still holds 1
+        ev("old-incr", "increase", 5, pid=None, size="1"),
+    ]
+    model = FakeModel({r: Decimal("100") for r in ["old-open", "old-reduce", "old-incr"]})
+    res = simulate(events, model, CFG, FOLLOW)
+    assert res.fills == []
+    assert res.open_positions == {}
+
+
+def test_pre_follow_position_later_open_and_increase_labels_ignored():
+    events = [
+        ev("old-open", "open", -60, pid="p_old", leader_minutes=-60),
+        ev("old-incr", "increase", 2, pid="p_old"),
+        ev("old-open2", "open", 3, pid="p_old"),  # head re-labels an add as "open"
+        ev("old-close", "close", 10, pid="p_old"),
+    ]
+    model = FakeModel({r: Decimal("100") for r in ["old-open", "old-incr", "old-open2", "old-close"]})
+    res = simulate(events, model, CFG, FOLLOW)
+    assert res.fills == []
+    assert res.open_positions == {}
+    assert res.closed_trades == []
+
+
+def test_event_for_never_held_position_is_noop():
+    events = [
+        ev("o", "open", 1, leverage="10"),
+        # stray events for a position we never held, same market
+        ev("ghost-close", "close", 2, pid="ghost"),       # priced at 50: would liquidate p1
+        ev("ghost-reduce", "reduce", 3, pid="ghost"),     # no price: would be a missed fill
+    ]
+    model = FakeModel({"o": Decimal("100"), "ghost-close": Decimal("50"), "ghost-reduce": None})
+    res = simulate(events, model, CFG, FOLLOW)
+    assert [f.ev_ref for f in res.fills] == ["o"]
+    assert "p1" in res.open_positions
+    assert res.closed_trades == []
+    assert len(res.equity_curve) == 2  # start + the open only
+    assert final_equity(res) == Decimal("10000")
+
+
+def test_duplicate_source_ref_first_occurrence_wins():
+    first = ev("o", "open", 1, pid="p1")
+    dup = ev("o", "open", 1, pid="p2", market="ETH")
+    res = simulate([first, dup], FakeModel({"o": Decimal("100")}), CFG, FOLLOW)
+    assert list(res.open_positions) == ["p1"]
+    assert [f.ev_ref for f in res.fills] == ["o"]
+    res2 = simulate([dup, first], FakeModel({"o": Decimal("100")}), CFG, FOLLOW)
+    assert list(res2.open_positions) == ["p2"]
+
+
+def test_short_liquidated_by_price_rise():
+    events = [
+        ev("o", "open", 1, direction="short", leverage="10"),
+        ev("x", "open", 5, pid="other", market="ETH"),
+    ]
+    model = FakeModel({"o": Decimal("100"), "x": Decimal("10")})
+    marks = {"BTC": Decimal("110"), "ETH": Decimal("10")}  # +10% vs a 10x short = whole margin
+    res = simulate(events, model, CFG, FOLLOW, mark=lambda m, t: marks[m])
+    assert [(c.position_id, c.pnl_usd) for c in res.closed_trades] == [("p1", Decimal("-500"))]
+    assert "p1" not in res.open_positions
+    assert res.fills[1].ev_ref == "liquidation:x"
+
+
+def test_sizing_uses_marked_equity():
+    events = [
+        ev("o1", "open", 1, pid="a"),                 # 1x, qty 5 at 100
+        ev("o2", "open", 3, pid="b", market="ETH"),
+    ]
+    model = FakeModel({"o1": Decimal("100"), "o2": Decimal("10")})
+    marks = {"BTC": Decimal("200"), "ETH": Decimal("10")}
+    res = simulate(events, model, CFG, FOLLOW, mark=lambda m, t: marks[m])
+    # BTC marked at 200 -> unrealized +500 -> equity 10500 -> margin 525
+    assert res.open_positions["b"].margin == Decimal("525")
+
+
+def test_closed_trade_carries_group_id():
+    events = [
+        ev("o", "open", 1, direction="yes", market="tok", group="cond-1"),
+        ev("c", "close", 2, direction="yes", market="tok", group="cond-1"),
+    ]
+    model = FakeModel({"o": Decimal("0.5"), "c": Decimal("0.6")}, max_leverage=Decimal("1"))
+    res = simulate(events, model, CFG, FOLLOW)
+    assert res.closed_trades[0].group_id == "cond-1"
+
+
+class HourlyCostModel(FakeModel):
+    def __init__(self, prices, rate):
+        super().__init__(prices)
+        self.rate = rate
+        self.calls: list[tuple[str, datetime, datetime]] = []
+
+    def holding_cost(self, pos: OpenPosition, start: datetime, end: datetime) -> Decimal:
+        self.calls.append((pos.position_id, start, end))
+        return self.rate * Decimal(int((end - start).total_seconds())) / Decimal(3600)
+
+
+@pytest.mark.parametrize("rate", [Decimal("2.5"), Decimal("-1")])
+def test_holding_cost_charged_per_hour(rate):
+    events = [
+        ev("o", "open", 0),
+        ev("x", "open", 300, pid="other", market="ETH"),   # 5 h in: a step mid-hold
+        ev("xc", "close", 360, pid="other", market="ETH"),
+        ev("c", "close", 600),                               # 10 h hold
+    ]
+    prices = {"o": Decimal("100"), "x": Decimal("10"), "xc": Decimal("10"), "c": Decimal("100")}
+    res = simulate(events, HourlyCostModel(prices, rate), CFG, FOLLOW)
+    by_pid = {c.position_id: c.pnl_usd for c in res.closed_trades}
+    assert by_pid["p1"] == -10 * rate
+    assert by_pid["other"] == -1 * rate
+    curve = dict(res.equity_curve)
+    assert curve[T0 + timedelta(minutes=300, seconds=1)] == Decimal("10000") - 5 * rate
+    assert final_equity(res) == Decimal("10000") - 11 * rate
+
+
+def test_model_without_holding_cost_unchanged():
+    events = [ev("o", "open", 0), ev("c", "close", 600)]
+    res = simulate(events, FakeModel({"o": Decimal("100"), "c": Decimal("100")}), CFG, FOLLOW)
+    assert res.closed_trades[0].pnl_usd == Decimal("0")
+    assert final_equity(res) == Decimal("10000")
