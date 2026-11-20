@@ -37,6 +37,8 @@
 @layer base {
   html {
     color-scheme: dark;
+    /* Keep focus targets clear of the sticky nav (h-14 = 3.5rem). */
+    scroll-padding-top: 4rem;
   }
 
   body {
@@ -48,9 +50,15 @@
     color: var(--fg);
   }
 
+  /*
+   * Two-tone focus ring (WCAG 1.4.11): --primary alone is 2.94:1 on --bg, so the
+   * outer ring is --fg (16.6:1 on --bg) and --primary fills the 2px offset gap.
+   * The outline paints above box-shadow, so --fg must be the outline itself.
+   */
   :focus-visible {
-    outline: 2px solid var(--primary);
+    outline: 2px solid var(--fg);
     outline-offset: 2px;
+    box-shadow: 0 0 0 2px var(--primary);
   }
 }
 

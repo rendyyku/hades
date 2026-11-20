@@ -10,20 +10,21 @@ type Props = {
 
 /** Solana address: short form in Fira Code, Solscan link and a copy button. */
 export function Address({ value }: Props) {
-  const [copied, setCopied] = useState(false);
+  const [status, setStatus] = useState<"idle" | "copied" | "failed">("idle");
+  const copied = status === "copied";
 
   useEffect(() => {
-    if (!copied) return;
-    const t = setTimeout(() => setCopied(false), 1500);
+    if (status === "idle") return;
+    const t = setTimeout(() => setStatus("idle"), 1500);
     return () => clearTimeout(t);
-  }, [copied]);
+  }, [status]);
 
   async function copy() {
     try {
       await navigator.clipboard.writeText(value);
-      setCopied(true);
+      setStatus("copied");
     } catch {
-      setCopied(false);
+      setStatus("failed");
     }
   }
 
@@ -53,7 +54,7 @@ export function Address({ value }: Props) {
         )}
       </button>
       <span role="status" aria-live="polite" className="sr-only">
-        {copied ? "Address copied" : ""}
+        {status === "copied" ? "Address copied" : status === "failed" ? "Copy failed" : ""}
       </span>
     </span>
   );

@@ -19,7 +19,7 @@ export function Nav() {
           className="flex shrink-0 cursor-pointer items-center gap-2 font-display text-xl font-normal uppercase tracking-[0.18em] text-fg"
         >
           <span aria-hidden="true" className="inline-block size-2 rounded-full bg-ember" />
-          Hades
+          HADES
         </Link>
         <ul className="-mx-2 flex min-w-0 flex-1 items-center gap-1 overflow-x-auto sm:justify-end">
           {LINKS.map((l) => (

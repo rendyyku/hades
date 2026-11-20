@@ -25,7 +25,7 @@ export default async function OverviewPage() {
           Solana memecoin smart-money &amp; insider intelligence
         </p>
         <h1 className="font-display font-light uppercase leading-[0.85] tracking-tight text-fg text-[clamp(64px,12vw,160px)]">
-          Hades
+          HADES
         </h1>
         <p className="mt-6 max-w-xl text-lg text-fg sm:text-2xl">
           Smart money always leaves a trail<span className="text-ember">.</span>

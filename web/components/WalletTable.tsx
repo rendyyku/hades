@@ -34,7 +34,7 @@ export function WalletTable({ rows }: { rows: WalletRow[] }) {
     );
   }
   return (
-    <div className="overflow-x-auto rounded-lg border border-border bg-surface backdrop-blur-md">
+    <div className="overflow-x-auto rounded-lg border border-border">
       <table className="w-full min-w-[760px] border-collapse text-sm">
         <caption className="sr-only">Top wallets by score</caption>
         <thead className="border-b border-border">
@@ -52,7 +52,7 @@ export function WalletTable({ rows }: { rows: WalletRow[] }) {
           {rows.map((r, i) => (
             <tr
               key={r.address}
-              className="border-b border-border transition-colors duration-200 last:border-b-0 hover:bg-surface"
+              className="border-b border-border transition-colors duration-200 last:border-b-0 hover:bg-white/[0.03]"
             >
               <td className={`${TD} font-mono tabular-nums text-muted`}>{i + 1}</td>
               <td className={TD}>
