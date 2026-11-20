@@ -186,6 +186,8 @@ class PaperEvent(Base):
     json: Mapped[Any] = mapped_column(JSON)
     observed_time: Mapped[datetime] = mapped_column(UTCDateTime)
     delay_ms: Mapped[int | None] = mapped_column(Integer)
+    # per-address monotonic order (kv ``hl:seq:{addr}``, ruling P26) = TradeEvent.seq
+    seq: Mapped[int | None] = mapped_column(Integer)
 
 
 class Alert(Base):
@@ -235,6 +237,7 @@ def make_engine(url: str) -> Engine:
 _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("fills", "liquidated_user", "VARCHAR"),
     ("fills", "builder_fee", "VARCHAR"),
+    ("paper_events", "seq", "INTEGER"),
 )
 
 

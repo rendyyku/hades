@@ -422,7 +422,7 @@ async def load_pre_move_candles(
         for name, iv in CANDLE_INTERVALS:
             key = KV_CANDLES.format(lg.coin, name, lg.time_ms // iv * iv, hi)
             c = kv_get_json(session, key)
-            if isinstance(c, list):
+            if isinstance(c, list) and c:  # a cached [] is a miss: never trust a gap
                 hit = (name, c)
                 break
         if hit is not None:

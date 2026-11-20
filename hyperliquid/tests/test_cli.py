@@ -266,3 +266,21 @@ def test_tag_all_continues_after_value_error(env, monkeypatch):
     r = invoke("tag", "--all")
     assert r.exit_code == 0, r.output
     assert "invalid evidence" in r.output and "1 ok, 1 failed" in r.output
+
+
+def test_watch_without_addresses_exits_2(env):
+    res = invoke("watch", "--seconds", "0")
+    assert res.exit_code == 2 and "no addresses" in res.output
+
+
+def test_watch_reports_summary(env, monkeypatch):
+    """A short run against a dead WS URL still stops on time and prints the summary."""
+    monkeypatch.setenv("HL_WS_URL", "ws://127.0.0.1:9")  # nothing listens: reconnect loop
+    get_settings.cache_clear()
+    with respx.mock:
+        respx.post(INFO).mock(side_effect=lambda r: httpx.Response(
+            200, json={"universe": []} if json.loads(r.content)["type"] == "meta" else []))
+        res = invoke("watch", "--seconds", "0.3", "--address", A)
+    assert res.exit_code == 0, res.output
+    assert "watch done: ws 1 polled 0" in res.output
+    assert "fills observed 0, median delay_ms None" in res.output

@@ -528,6 +528,34 @@ class HLClient:
                     "funding marked truncated", addr, MAX_FUNDING_PAGES)
         return FundingPage(out, truncated=True)
 
+    async def funding_history(self, coin: str, start_ms: int,
+                              end_ms: int | None = None) -> FundingPage:
+        """Hourly funding rates of ``coin`` (``fundingHistory``: ``coin``, ``fundingRate``,
+        ``premium``, ``time``) from ``start_ms`` (inclusive), oldest first. Pages like
+        :meth:`user_funding` (500 rows per page, de-duplicated by ``time``)."""
+        out: list[dict] = []
+        seen: set[int] = set()
+        cursor = int(start_ms)
+        for _ in range(MAX_FUNDING_PAGES):
+            body: dict[str, Any] = {"type": "fundingHistory", "coin": coin, "startTime": cursor}
+            if end_ms is not None:
+                body["endTime"] = int(end_ms)
+            page = await self._info(body)
+            if not isinstance(page, list):
+                raise HLError("info fundingHistory: expected a list")
+            for r in page:
+                t = int(r["time"])
+                if t not in seen:
+                    seen.add(t)
+                    out.append(r)
+            if len(page) < FUNDING_PAGE_LIMIT:
+                return FundingPage(out, truncated=False)
+            last = max(int(r["time"]) for r in page)
+            cursor = last + 1 if last <= cursor else last
+        log.warning("hl fundingHistory %s: stopped at MAX_FUNDING_PAGES=%d with full pages",
+                    coin, MAX_FUNDING_PAGES)
+        return FundingPage(out, truncated=True)
+
     async def clearinghouse_state(self, addr: str) -> dict:
         return await self._info({"type": "clearinghouseState", "user": addr})
 

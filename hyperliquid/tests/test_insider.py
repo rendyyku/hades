@@ -661,3 +661,19 @@ def test_zero_hash_open_drops_out_of_fresh_whale_and_pre_listing():
     assert tag_fresh_whale(young, _zero(whale_fills(), 902), address=A, now=NOW) == []
     fills = _zero(baseline() + rt("NEW", LIST_MS + H, "50", "100", tid=777), 777)
     assert tag_pre_listing(fills, {"NEW": LIST_MS}, None, address=A) == []
+
+
+@respx.mock
+async def test_cached_empty_candle_slice_is_a_cache_miss(session):
+    t = NOW_MS - 3 * H  # recent: 1m candles
+    legs = open_legs(A, rt("ETH", t, "10", "100", tid=990, hold=2 * H))
+    lo, hi = t // MIN * MIN, t + 30 * MIN
+    # an empty slice in kv (e.g. written by an older build) must not count as cached
+    pipeline.kv_set_json(session, insider.KV_CANDLES.format("ETH", "1m", lo, hi), [])
+    calls: list = []
+    respx.post(INFO).mock(side_effect=router({}, pumpy, calls))
+    async with make_client() as c:
+        load = await insider.load_pre_move_candles(session, c, legs, NOW_MS)
+    assert load.cached == 0 and load.fetched == 1
+    assert [b["type"] for b in calls] == ["candleSnapshot"]
+    assert load.prices["ETH"]

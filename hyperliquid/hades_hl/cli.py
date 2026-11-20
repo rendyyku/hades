@@ -1,7 +1,8 @@
 """``hades-hl`` command line.
 
-``init-db | discover | backfill | rescore`` (Task 6) and ``tag`` (Task 7) are
-implemented here; ``serve | follow-sync | paper-run`` are stubs filled in by later tasks.
+``init-db | discover | backfill | rescore`` (Task 6), ``tag`` (Task 7) and the
+``watch`` debug command (Task 8) are implemented here; ``serve | follow-sync |
+paper-run`` are stubs filled in by later tasks.
 Nothing here ever prints ``HL_API_KEY`` (Settings hides it from repr; tracebacks
 never show locals).
 """
@@ -10,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import statistics
 from collections import Counter
 from typing import Any, Optional
 
@@ -18,10 +20,10 @@ from sqlalchemy import select
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 
-from hades_hl import __version__, insider, pipeline
+from hades_hl import __version__, insider, live, pipeline
 from hades_hl.client import HLClient, HLError, HLRateLimited
 from hades_hl.config import Settings, get_settings
-from hades_hl.db import Wallet, init_db, make_engine
+from hades_hl.db import Follow, PaperEvent, Wallet, init_db, make_engine
 
 # pretty_exceptions_show_locals=False: a traceback must never print locals (settings carry keys).
 app = typer.Typer(
@@ -285,6 +287,59 @@ def tag(
 def follow_sync() -> None:
     """Sync auto-follows (later task)."""
     _stub("follow-sync")
+
+
+@app.command()
+def watch(
+    seconds: float = typer.Option(60.0, "--seconds", min=0, help="run this long, then stop"),
+    address: Optional[list[str]] = typer.Option(
+        None, "--address", help="wallet to watch (repeatable); default: active follows"),
+    ws_max: int = typer.Option(live.WS_MAX_USER_SUBS, "--ws-max", min=0,
+                               max=live.WS_MAX_USER_SUBS,
+                               help="wallets on the WS; the rest are polled"),
+    price_feed: str = typer.Option("allMids", "--price-feed",
+                                   help="allMids (ruling default) or fastAssetCtxs"),
+) -> None:
+    """Debug: run the live fill watcher and price recorder for --seconds, then report
+    price rows recorded, fills observed and the median delay. Not a service: Task 9
+    wires the watcher into serve."""
+    if price_feed not in live.PRICE_FEEDS:
+        raise typer.BadParameter(f"--price-feed must be one of {live.PRICE_FEEDS}")
+    _setup_logging()
+    settings = get_settings()
+    engine = make_engine(settings.DATABASE_URL)
+    init_db(engine)
+    with Session(engine) as s:
+        if address:
+            follows = {a.lower(): None for a in address}
+        else:
+            follows = {f.address: f.started_at for f in s.scalars(
+                select(Follow).where(Follow.removed_at.is_(None)))}
+    if not follows:
+        typer.echo("watch: no addresses (pass --address or follow wallets first)")
+        raise typer.Exit(2)
+
+    async def run(client: HLClient):
+        rec = live.PriceRecorder(engine, settings.WS_URL, feed=price_feed)
+        w = live.FillWatcher(engine, client, follows, ws_url=settings.WS_URL,
+                             ws_max_user_subs=ws_max, weight_per_min=settings.RATE_WEIGHT_PER_MIN)
+        stop = asyncio.Event()
+        tasks = [asyncio.create_task(rec.run(stop)), asyncio.create_task(w.run(stop))]
+        await asyncio.sleep(seconds)
+        stop.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        return rec, w
+
+    typer.echo(f"watch: {len(follows)} wallets for {seconds:g}s on {settings.WS_URL}")
+    rec, w = asyncio.run(_with_client(settings, run))
+    refs = [e.source_ref for e in w.events]
+    with Session(engine) as s:
+        delays = sorted(d for d in s.scalars(select(PaperEvent.delay_ms).where(
+            PaperEvent.source_ref.in_(refs))) if d is not None) if refs else []
+    med = statistics.median(delays) if delays else None
+    typer.echo(f"watch done: ws {len(w.ws_addresses)} polled {len(w.poll_addresses)} "
+               f"connects {len(w.connects)}; {price_feed} messages {rec.messages}, price rows "
+               f"{rec.rows_written}; fills observed {len(w.events)}, median delay_ms {med}")
 
 
 @app.command("paper-run")
