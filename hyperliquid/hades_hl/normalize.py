@@ -22,6 +22,12 @@ full one ``close``; in a liquidation flip only the close leg is flagged liquidat
 Only fills whose ``liquidation.liquidatedUser`` is ``addr`` count (``addr`` is
 required). Fees are ``fee + builderFee`` (P20). Position ids: :func:`normalize_fills`.
 Spot fills (``@123`` or ``PURR/USDC``) are dropped; HIP-3 ``dex:COIN`` are perps.
+
+Tolerance (ruling P28): HL sends float noise in ``startPosition`` (``-613298.4300000001``
+where the chain gives ``-613298.43``). Every chain / zero comparison uses
+``tol = 10**-szDecimals / 2`` per coin (``1e-9`` when szDecimals is unknown): a start
+within ``tol`` of the previous end is snapped to it, and a start or end within ``tol``
+of 0 is snapped to 0. Pass ``sz_decimals`` (see :func:`sz_decimals_by_coin`).
 """
 
 from __future__ import annotations
@@ -98,6 +104,21 @@ def sz_decimals_by_coin(meta: Mapping | None) -> dict[str, int]:
     return out
 
 
+DEFAULT_TOL = Decimal("1e-9")
+SzDecimals = Mapping[str, int] | None
+
+
+def chain_tol(coin: str, sz_decimals: SzDecimals = None) -> Decimal:
+    """Half a size step of ``coin`` (``10**-szDecimals / 2``), else 1e-9 (ruling P28)."""
+    if sz_decimals and coin in sz_decimals:
+        return Decimal(10) ** -int(sz_decimals[coin]) / 2
+    return DEFAULT_TOL
+
+
+def _near(a: Decimal, b: Decimal, tol: Decimal) -> bool:
+    return abs(a - b) <= tol
+
+
 def _require_tid(f: Mapping) -> None:
     if f.get("tid") is None:
         raise ValueError(f"HL fill without tid (coin={f.get('coin')}, time={f.get('time')})")
@@ -111,12 +132,12 @@ def _end(f: Mapping) -> Decimal:
     return _start(f) + signed_delta(f)
 
 
-def order_fills(fills: Iterable[Mapping]) -> list[dict]:
+def order_fills(fills: Iterable[Mapping], *, sz_decimals: SzDecimals = None) -> list[dict]:
     """Perp fills, de-duplicated by tid, in true execution order (see module doc)."""
-    return _order(fills)[0]
+    return _order(fills, sz_decimals)[0]
 
 
-def _order(fills: Iterable[Mapping]) -> tuple[list[dict], int]:
+def _order(fills: Iterable[Mapping], sz_decimals: SzDecimals = None) -> tuple[list[dict], int]:
     """(ordered perp fills, number of same-ms groups with no full chain)."""
     seen: set = set()
     uniq: list[dict] = []
@@ -135,7 +156,7 @@ def _order(fills: Iterable[Mapping]) -> tuple[list[dict], int]:
     last_end: dict[str, Decimal] = {}
     for t in sorted(buckets):
         for coin in sorted(buckets[t]):
-            grp, ok = _chain(buckets[t][coin], last_end.get(coin))
+            grp, ok = _chain(buckets[t][coin], last_end.get(coin), chain_tol(coin, sz_decimals))
             if not ok:
                 broken += 1
                 log.warning("hl %s @%d: no full startPosition chain over %d same-ms fills; "
@@ -152,7 +173,8 @@ def _tie(f: Mapping) -> tuple:
     return (_start(f), f["tid"])
 
 
-def _chain(grp: list[dict], prev_end: Decimal | None) -> tuple[list[dict], bool]:
+def _chain(grp: list[dict], prev_end: Decimal | None,
+           tol: Decimal = DEFAULT_TOL) -> tuple[list[dict], bool]:
     """Order one coin's same-ms fills so each starts where the previous ended.
 
     Returns ``(order, full_chain)``. The first fill must start at ``prev_end``; if no
@@ -161,26 +183,29 @@ def _chain(grp: list[dict], prev_end: Decimal | None) -> tuple[list[dict], bool]
     ``(startPosition, tid)`` order, so the result does not depend on input order.
     Groups of <= CHAIN_SEARCH_MAX fills are searched exhaustively (backtracking),
     larger ones greedily. With no full chain: ``sorted by (startPosition, tid)``.
+    Positions match within ``tol`` (ruling P28).
     """
     fs = sorted(grp, key=_tie)
     if len(fs) == 1:
         return fs, True
     starts = [_start(f) for f in fs]
     ends = [_end(f) for f in fs]
-    free_first = sorted(range(len(fs)), key=lambda k: (starts[k] != 0, fs[k]["tid"]))
+    free_first = sorted(range(len(fs)),
+                        key=lambda k: (not _near(starts[k], ZERO, tol), fs[k]["tid"]))
     attempts = []
     if prev_end is not None:
-        attempts.append([k for k in range(len(fs)) if starts[k] == prev_end])
+        attempts.append([k for k in range(len(fs)) if _near(starts[k], prev_end, tol)])
     attempts.append(free_first)
     for firsts in attempts:
-        order = _search(starts, ends, firsts) if len(fs) <= CHAIN_SEARCH_MAX else \
-            _greedy(starts, ends, firsts)
+        order = _search(starts, ends, firsts, tol) if len(fs) <= CHAIN_SEARCH_MAX else \
+            _greedy(starts, ends, firsts, tol)
         if order is not None:
             return [fs[k] for k in order], True
     return fs, False
 
 
-def _search(starts: list, ends: list, firsts: list[int]) -> list[int] | None:
+def _search(starts: list, ends: list, firsts: list[int],
+            tol: Decimal = DEFAULT_TOL) -> list[int] | None:
     n = len(starts)
     full = (1 << n) - 1
     dead: set[tuple[int, int]] = set()
@@ -192,7 +217,7 @@ def _search(starts: list, ends: list, firsts: list[int]) -> list[int] | None:
         if (mask, last) in dead:
             return False
         for k in range(n):  # indices are already in (startPosition, tid) order
-            if not mask & (1 << k) and starts[k] == ends[last]:
+            if not mask & (1 << k) and _near(starts[k], ends[last], tol):
                 order.append(k)
                 if go(order, mask | (1 << k)):
                     return True
@@ -207,12 +232,14 @@ def _search(starts: list, ends: list, firsts: list[int]) -> list[int] | None:
     return None
 
 
-def _greedy(starts: list, ends: list, firsts: list[int]) -> list[int] | None:
+def _greedy(starts: list, ends: list, firsts: list[int],
+            tol: Decimal = DEFAULT_TOL) -> list[int] | None:
     n = len(starts)
     for first in firsts:
         order, used = [first], {first}
         while len(order) < n:
-            nxt = next((k for k in range(n) if k not in used and starts[k] == ends[order[-1]]),
+            nxt = next((k for k in range(n)
+                        if k not in used and _near(starts[k], ends[order[-1]], tol)),
                        None)
             if nxt is None:
                 break
@@ -262,12 +289,14 @@ class Normalized:
     chain_gaps: int
 
 
-def fill_legs(addr: str, fills: Iterable[Mapping]) -> list[Leg]:
+def fill_legs(addr: str, fills: Iterable[Mapping], *,
+              sz_decimals: SzDecimals = None) -> list[Leg]:
     """Ordered perp legs with stable position ids (see :func:`normalize_fills`)."""
-    return normalize_fills(addr, fills).legs
+    return normalize_fills(addr, fills, sz_decimals=sz_decimals).legs
 
 
-def normalize_fills(addr: str, fills: Iterable[Mapping]) -> Normalized:
+def normalize_fills(addr: str, fills: Iterable[Mapping], *,
+                    sz_decimals: SzDecimals = None) -> Normalized:
     """Ordered perp legs of ``addr`` with stable position ids (ruling P22).
 
     - ``{coin}:{tid}``: an episode opened (from flat) by fill ``tid``;
@@ -278,20 +307,28 @@ def normalize_fills(addr: str, fills: Iterable[Mapping]) -> Normalized:
       ``startPosition == 0`` gets the plain ``{coin}:{tid}`` (ruling P25) but is still
       counted in ``chain_gaps``.
     Ids depend only on the fills of the episode itself, so they are stable across
-    window shifts and re-normalization.
+    window shifts and re-normalization. ``sz_decimals`` sets the per-coin chain
+    tolerance (ruling P28): starts / ends are snapped to the previous end or to 0.
     """
     # a same-ms group with no full chain always leaves >= 1 break in its fallback order,
     # which the per-fill check below counts; _order only logs it
-    ordered, _ = _order(fills)
+    ordered, _ = _order(fills, sz_decimals)
     gaps = 0
     legs: list[Leg] = []
     cur: dict[str, str | None] = {}  # coin -> open episode id (None when flat)
     last_end: dict[str, Decimal] = {}
     for f in ordered:
         coin, tid = f["coin"], f["tid"]
+        tol = chain_tol(coin, sz_decimals)
         s = _start(f)
+        if coin in last_end and _near(s, last_end[coin], tol):
+            s = last_end[coin]  # float noise in startPosition (ruling P28)
+        elif _near(s, ZERO, tol):
+            s = ZERO
         d = signed_delta(f)
         e = s + d
+        if _near(e, ZERO, tol):
+            e = ZERO
         if coin not in last_end:
             cur[coin] = f"{coin}:{tid}" if s == 0 else f"{coin}:pre{tid}"
         elif s != last_end[coin]:
@@ -354,6 +391,7 @@ def fills_to_events(
     observed_time_fn: Callable[[Mapping], datetime] | None = None,
     *,
     leverage: Mapping[str, Decimal] | None = None,
+    sz_decimals: SzDecimals = None,
 ) -> list[TradeEvent]:
     """Map raw HL fills of ``addr`` to TradeEvents, in execution order.
 
@@ -361,10 +399,11 @@ def fills_to_events(
     leader time (historical normalization; the live watcher passes its own).
     ``leverage``: ``{coin: leverage}``, e.g. :func:`leverage_by_coin` of the wallet's
     clearinghouseState; coins without an entry get ``leverage=None``.
+    ``sz_decimals``: ``{coin: szDecimals}`` for the chain tolerance (ruling P28).
     """
     lev = leverage or {}
     out: list[TradeEvent] = []
-    for seq, lg in enumerate(fill_legs(addr, fills)):
+    for seq, lg in enumerate(fill_legs(addr, fills, sz_decimals=sz_decimals)):
         leader_time = ms_to_dt(lg.time_ms)
         observed = observed_time_fn(lg.fill) if observed_time_fn else leader_time
         out.append(TradeEvent(

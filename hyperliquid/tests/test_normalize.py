@@ -386,3 +386,51 @@ def test_simulate_sort_keeps_per_position_order_on_fixture(fixture):
     a, b = sides(evs), sides(resorted)
     assert len(a) > 40
     assert [k for k in a if a[k] != b[k]] == []
+
+
+# -- ruling P28: tolerant startPosition chain --------------------------------------
+
+def test_float_noise_start_positions_make_no_gaps(caplog):
+    fills = [
+        mk("BTC", "A", "613298.43", "10", "0", T0, tid=1),
+        mk("BTC", "A", "1", "10", "-613298.4300000001", T0 + 5, tid=2),  # HL float noise
+        mk("BTC", "B", "613299.43", "10", "-613299.43", T0 + 9, tid=3),
+    ]
+    with caplog.at_level("WARNING", logger="hades_hl.normalize"):
+        res = normalize_fills(ADDR, fills, sz_decimals={"BTC": 2})
+    assert res.chain_gaps == 0
+    assert [(lg.side, lg.position_id) for lg in res.legs] == [
+        ("open", "BTC:1"), ("increase", "BTC:1"), ("close", "BTC:1")]
+    assert not any("gap" in r.getMessage() for r in caplog.records)
+    # unknown szDecimals: 1e-9 fallback still absorbs the 1e-10 noise
+    assert normalize_fills(ADDR, fills).chain_gaps == 0
+
+
+def test_close_at_near_zero_end_is_a_close():
+    fills = [mk("ETH", "A", "1", "10", "1.0000000001", T0, tid=11),  # e = 1e-10
+             mk("ETH", "B", "2", "10", "0", T0 + 5, tid=12)]
+    res = normalize_fills(ADDR, fills, sz_decimals={"ETH": 4})
+    assert [(lg.side, lg.position_id) for lg in res.legs] == [
+        ("close", "ETH:pre11"), ("open", "ETH:12")]
+    assert res.legs[0].end == 0
+    assert res.chain_gaps == 0
+
+
+def test_same_ms_chain_tolerates_noise(caplog):
+    fills = [mk("SOL", "B", "0.3", "10", "0", T0, tid=21),
+             mk("SOL", "B", "0.3", "10", "0.30000000000000004", T0 + 1, tid=23),
+             mk("SOL", "B", "0.4", "10", "0.6000000000000001", T0 + 1, tid=22)]
+    with caplog.at_level("WARNING", logger="hades_hl.normalize"):
+        ordered = order_fills(fills, sz_decimals={"SOL": 1})
+    assert [f["tid"] for f in ordered] == [21, 23, 22]
+    assert not any("no full startPosition chain" in r.getMessage() for r in caplog.records)
+
+
+def test_tolerance_scales_with_sz_decimals():
+    fills = [mk("XYZ", "B", "1", "10", "0", T0, tid=31),
+             mk("XYZ", "B", "1", "10", "1.004", T0 + 5, tid=32)]  # within 0.005 at 2 dp
+    assert normalize_fills(ADDR, fills, sz_decimals={"XYZ": 2}).chain_gaps == 0
+    assert normalize_fills(ADDR, fills, sz_decimals={"XYZ": 3}).chain_gaps == 1
+    assert normalize_fills(ADDR, fills).chain_gaps == 1  # 1e-9 fallback
+    evs = fills_to_events(ADDR, fills, sz_decimals={"XYZ": 2})
+    assert [e.position_id for e in evs] == ["XYZ:31", "XYZ:31"]

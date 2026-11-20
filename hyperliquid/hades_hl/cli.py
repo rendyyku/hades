@@ -14,6 +14,7 @@ from typing import Any, Optional
 
 import typer
 from sqlalchemy import select
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 
 from hades_hl import __version__, pipeline
@@ -57,6 +58,15 @@ async def _with_client(settings: Settings, fn: Any) -> Any:
         await client.aclose()
 
 
+def masked_url(url: str) -> str:
+    """The database URL with any password masked (M11)."""
+    try:
+        u = make_url(url)
+    except Exception:  # unparseable: print nothing of it
+        return "<database url>"
+    return u.render_as_string(hide_password=True) if u.password else url
+
+
 def _stub(name: str) -> None:
     typer.echo(f"{name}: {NOT_IMPLEMENTED}")
     raise typer.Exit(2)
@@ -75,7 +85,7 @@ def init_db_cmd() -> None:
     """Create or migrate the HL SQLite database at HL_DATABASE_URL."""
     url = get_settings().DATABASE_URL
     init_db(make_engine(url))
-    typer.echo(f"initialised {url}")
+    typer.echo(f"initialised {masked_url(url)}")
 
 
 @app.command()
@@ -87,20 +97,34 @@ def discover(limit: int = typer.Option(200, "--limit", min=1, help="max candidat
         got = asyncio.run(_with_client(
             settings, lambda c: pipeline.discover(session, c, limit=limit)))
         total = len(session.scalars(select(Wallet.address)).all())
+    checked = "vaults checked: " + ("yes" if got.vaults_checked else
+                                    "no (vault list unavailable; vaults may be included)")
     if got.error:
         typer.echo(f"{got.error}. Discovered 0 wallets (the trades-WS fallback is not "
-                   f"implemented yet). Wallets in DB: {total}")
+                   f"implemented yet). Wallets in DB: {total}; {checked}")
         return
     typer.echo(f"discovered {len(got)} candidate wallets (limit {limit}); wallets in DB: {total}")
+    pf = got.prefilter or {}
+    if pf:
+        typer.echo(f"prefilter: {pf.get('before')} -> {pf.get('after')} candidates (excluded: "
+                   f"account value<10k {pf.get('account_value')}, no volume {pf.get('volume')}, "
+                   f"volume>200x AV {pf.get('churn')}, month pnl<=0 {pf.get('pnl')}, "
+                   f"vault {pf.get('vault')}); {checked}")
+    else:
+        typer.echo(f"prefilter: n/a (cached before the prefilter); {checked}")
 
 
 @app.command()
 def backfill(
     address: Optional[str] = typer.Option(None, "--address", help="one wallet"),
     all_: bool = typer.Option(False, "--all", help="every non-vault wallet in the DB"),
-    days: int = typer.Option(90, "--days", min=1, help="history for a first backfill"),
+    days: int = typer.Option(90, "--days", min=1,
+                             help="history window, honoured on every run"),
 ) -> None:
-    """Import fills + funding (idempotent; resumes from the last stored fill)."""
+    """Import fills (newest first, coverage tracked) + funding. Idempotent.
+
+    With --all, the exit code is 0 even when some wallets failed (rate limited or HL
+    errors): check the per-wallet lines."""
     if bool(address) == bool(all_):
         raise typer.BadParameter("pass exactly one of --address or --all")
     _setup_logging()
@@ -158,10 +182,19 @@ def rescore(
                 settings, lambda c: pipeline.load_sz_decimals(session, c, now)))
         res = pipeline.rescore(session, now, sz_decimals=szd, window_days=window_days)
         session.commit()
+        top = []
+        for a, s in res.top[:3]:
+            st = (session.get(Wallet, a).stats_json or {})
+            top.append((a, s, st))
     reasons = ", ".join(f"{k}: {v}" for k, v in res.reasons.most_common()) or "-"
     typer.echo(f"rescored: {res.scored} scored, {res.unscored} unscored ({reasons})")
-    for a, s in res.top[:3]:
-        typer.echo(f"  {a}  {s:.2f}")
+    for a, s, st in top:
+        wr = st.get("winrate")
+        typer.echo(f"  {a}  score {s:.2f}  net ${st.get('net_pnl_usd', 0):,.0f}  "
+                   f"n {st.get('n')}  winrate {'-' if wr is None else f'{wr:.0%}'}  "
+                   f"window {st.get('window_days', 0):.1f}d  "
+                   f"partial {bool(st.get('history_partial'))}  "
+                   f"chain_gaps {st.get('chain_gaps')}")
 
 
 @app.command()

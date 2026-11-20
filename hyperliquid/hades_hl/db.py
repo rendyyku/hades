@@ -21,6 +21,7 @@ from sqlalchemy import (
     Engine,
     Index,
     Integer,
+    PrimaryKeyConstraint,
     String,
     TypeDecorator,
     create_engine,
@@ -31,6 +32,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
+from sqlalchemy.schema import CreateIndex, CreateTable
 from sqlalchemy.pool import StaticPool
 
 
@@ -93,10 +95,14 @@ class Wallet(Base):
 
 
 class Fill(Base):
+    """One fill of one wallet, keyed by ``(address, tid)``: HL gives both counterparties
+    of a trade the same ``tid`` (verified live 2026-11-20), so ``tid`` alone is not unique
+    across wallets (finding I4)."""
+
     __tablename__ = "fills"
 
-    tid: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
-    address: Mapped[str] = mapped_column(String, index=True)
+    address: Mapped[str] = mapped_column(String)
+    tid: Mapped[int] = mapped_column(BigInteger, autoincrement=False)
     coin: Mapped[str] = mapped_column(String, index=True)
     px: Mapped[Decimal] = mapped_column(DecimalText)
     sz: Mapped[Decimal] = mapped_column(DecimalText)
@@ -114,7 +120,10 @@ class Fill(Base):
     liquidated_user: Mapped[str | None] = mapped_column(String)
     builder_fee: Mapped[Decimal | None] = mapped_column(DecimalText)  # ruling P20
 
-    __table_args__ = (Index("ix_fills_address_time", "address", "time"),)
+    __table_args__ = (
+        PrimaryKeyConstraint("address", "tid", name="pk_fills"),
+        Index("ix_fills_address_time", "address", "time"),
+    )
 
 
 class Funding(Base):
@@ -233,12 +242,64 @@ def _existing_columns(conn, table: str) -> set[str]:
 
 
 def init_db(engine: Engine) -> None:
-    """Create missing tables, then add columns missing from older databases."""
+    """Create missing tables, add columns missing from older databases, and rebuild
+    an old ``fills`` table keyed by ``tid`` alone (finding I4). Idempotent."""
     Base.metadata.create_all(engine)
     with engine.begin() as conn:
         for table, column, sql_type in _ADDED_COLUMNS:
             if column not in _existing_columns(conn, table):
                 conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}"))
+    _migrate_fills_pk(engine)
+
+
+FILLS_PK = ["address", "tid"]
+
+
+def _migrate_fills_pk(engine: Engine) -> None:
+    """Rebuild ``fills`` with the composite ``(address, tid)`` key if it still has the
+    pre-Task-6-fix single-column ``tid`` key: create the new table, copy every row,
+    drop the old table, rename, recreate the indexes, all in ONE SQLite transaction
+    (explicit ``BEGIN IMMEDIATE`` on the raw connection: pysqlite would otherwise
+    autocommit each DDL statement). No-op when the key is already composite."""
+    with engine.connect() as conn:
+        pk = inspect(conn).get_pk_constraint("fills")["constrained_columns"]
+        if list(pk) == FILLS_PK:
+            return
+        if conn.dialect.name != "sqlite":  # pragma: no cover - SQLite only for now
+            raise NotImplementedError(f"fills PK migration not implemented for {conn.dialect.name}")
+        old_cols = _existing_columns(conn, "fills")
+    table = Fill.__table__
+    cols = [c.name for c in table.columns if c.name in old_cols]
+    tmp = "fills__new"
+    create = str(CreateTable(table).compile(dialect=engine.dialect)).strip()
+    create = create.replace("CREATE TABLE fills ", f"CREATE TABLE {tmp} ", 1)
+    indexes = [str(CreateIndex(ix).compile(dialect=engine.dialect)).strip()
+               for ix in sorted(table.indexes, key=lambda ix: ix.name)]
+    col_list = ", ".join(cols)
+    raw = engine.raw_connection()
+    try:
+        dbapi = raw.driver_connection
+        prev = dbapi.isolation_level
+        dbapi.isolation_level = None  # manual transaction control
+        cur = dbapi.cursor()
+        try:
+            cur.execute("BEGIN IMMEDIATE")
+            cur.execute(f"DROP TABLE IF EXISTS {tmp}")
+            cur.execute(create)
+            cur.execute(f"INSERT INTO {tmp} ({col_list}) SELECT {col_list} FROM fills")
+            cur.execute("DROP TABLE fills")  # drops the old table's indexes too
+            cur.execute(f"ALTER TABLE {tmp} RENAME TO fills")
+            for ddl in indexes:
+                cur.execute(ddl)
+            cur.execute("COMMIT")
+        except Exception:
+            cur.execute("ROLLBACK")
+            raise
+        finally:
+            cur.close()
+            dbapi.isolation_level = prev
+    finally:
+        raw.close()
 
 
 @contextmanager
@@ -326,7 +387,8 @@ def _insert_ignore(session: Session, table, rows: list[dict]) -> None:
 
 
 def insert_fills(session: Session, address: str, fills: Iterable[dict]) -> int:
-    """Insert fills, silently skipping any ``tid`` already stored. Returns rows inserted."""
+    """Insert ``address``'s fills, silently skipping any ``(address, tid)`` already
+    stored (the counterparty's copy of a trade has the same tid). Returns rows inserted."""
     seen: set[int] = set()
     rows = []
     for f in fills:
@@ -341,7 +403,8 @@ def insert_fills(session: Session, address: str, fills: Iterable[dict]) -> int:
     tids = [r["tid"] for r in rows]
     for i in range(0, len(tids), 500):  # stay under SQLite's bound-parameter limit
         chunk = tids[i : i + 500]
-        existing.update(session.scalars(select(Fill.tid).where(Fill.tid.in_(chunk))))
+        existing.update(session.scalars(
+            select(Fill.tid).where(Fill.address == address, Fill.tid.in_(chunk))))
     new_rows = [r for r in rows if r["tid"] not in existing]
     if new_rows:
         # ON CONFLICT DO NOTHING still guards against a concurrent writer.

@@ -188,10 +188,11 @@ def wallet_pnl(
 
     ``addr`` tells liquidation fills where this wallet was the victim apart from ones
     where it was the liquidator (only the former count). ``sz_decimals``: optional
-    ``{coin: szDecimals}`` for the cross-check's HL-style entry truncation.
+    ``{coin: szDecimals}`` for the cross-check's HL-style entry truncation and the
+    startPosition chain tolerance (ruling P28).
     """
     funding = list(funding)
-    norm = normalize_fills(addr, fills)
+    norm = normalize_fills(addr, fills, sz_decimals=sz_decimals)
     legs = norm.legs
     realized = sum((lg.closed_pnl for lg in legs), ZERO)
     fees = sum((lg.fee for lg in legs), ZERO)

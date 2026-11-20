@@ -18,8 +18,11 @@ The per-item weight is only known once the response arrives, so it is charged to
 bucket afterwards (the bucket may go into debt and the next request waits it off).
 
 Paging caps (spec 8.2 and observed live): userFillsByTime returns at most 2000 rows per
-call, oldest first from ``startTime``, and only the 10,000 most recent fills are
-reachable. userFunding returns at most 500 rows per call, oldest first.
+call; when more fills match it returns the OLDEST 2000 of ``[startTime, endTime]``,
+ascending (live probe 2026-11-20, both bounds inclusive). The docs say only the 10,000
+most recent fills are reachable. :meth:`HLClient.user_fills_backward` therefore walks
+time windows newest-first (ruling P27). userFunding returns at most 500 rows per call,
+oldest first.
 
 The leaderboard is NOT part of the documented API: it is the static JSON the HL web
 app loads (``stats-data.hyperliquid.xyz/Mainnet/leaderboard``, ~38 MB, ~46k rows on
@@ -55,10 +58,15 @@ RATE_LIMITS_DOC = (
 
 FILLS_PAGE_LIMIT = 2000
 FILLS_HISTORY_CAP = 10_000
+# user_fills_backward: first window width, and a hard stop against a misbehaving API
+BACKWARD_WINDOW_MS = 3_600_000
+MAX_BACKWARD_REQUESTS = 500
 FUNDING_PAGE_LIMIT = 500
 MAX_FUNDING_PAGES = 200  # 100k funding rows: a hard stop against a misbehaving API
 MAX_ATTEMPTS = 5
 MAX_RETRY_AFTER_S = 120.0
+BUCKET_EPS = 1e-6  # weight units
+MIN_BUCKET_SLEEP_S = 1e-3
 
 # -- weights (source: RATE_LIMITS_DOC) ---------------------------------------------
 WEIGHT_PER_MIN = 1200
@@ -132,6 +140,11 @@ class HLPage:
 
     fills: list[dict] = field(default_factory=list)
     truncated: bool = False
+    # user_fills_backward only: ``capped`` = stopped at ``cap`` (older fills exist but
+    # were not fetched); ``cov_start`` = start (ms) of the contiguous range covered:
+    # ``start_ms`` normally, the oldest kept fill's time when capped.
+    capped: bool = False
+    cov_start: int | None = None
 
 
 @dataclass
@@ -170,10 +183,13 @@ class WeightBucket:
         async with self._lock:
             while True:
                 self._refill()
-                if self.tokens >= weight:
+                # tolerance: float rounding can leave tokens a hair below ``weight`` after
+                # a refill; the matching tiny sleep is lost in a large clock value and the
+                # loop would spin forever
+                if self.tokens >= weight - BUCKET_EPS:
                     self.tokens -= weight
                     return
-                await self._sleep((weight - self.tokens) / self.rate)
+                await self._sleep(max((weight - self.tokens) / self.rate, MIN_BUCKET_SLEEP_S))
 
     def charge(self, weight: float) -> None:
         self._refill()
@@ -368,6 +384,89 @@ class HLClient:
                 cursor = last + 1
             else:
                 cursor = last
+
+    async def _fills_window(self, addr: str, lo: int, hi: int) -> list[dict]:
+        page = await self._info(
+            {"type": "userFillsByTime", "user": addr, "startTime": lo, "endTime": hi})
+        if not isinstance(page, list):
+            raise HLError("info userFillsByTime: expected a list")
+        for f in page:
+            if f.get("tid") is None:
+                raise HLError(f"info userFillsByTime: fill without tid at time {f.get('time')}")
+        return page
+
+    async def user_fills_backward(
+        self, addr: str, start_ms: int, end_ms: int | None = None,
+        cap: int = FILLS_HISTORY_CAP, *, on_page: PageFn | None = None,
+        window_ms: int = BACKWARD_WINDOW_MS,
+    ) -> HLPage:
+        """Fills of ``addr`` in ``[start_ms, end_ms]`` (default end: now), fetched
+        NEWEST FIRST so a ``cap`` keeps the most recent fills (ruling P27).
+
+        HL's ``userFillsByTime`` returns the *oldest* <= 2000 fills of the requested
+        window, ascending (live probe 2026-11-20), so a single ``[start, cursor]``
+        window cannot page backward. Instead this walks adjacent, disjoint windows
+        ``[hi - w + 1, hi]`` from ``end_ms`` down to ``start_ms``:
+
+        - a page below 2000 rows is the window's complete content: keep it, move
+          ``hi`` below the window, and widen ``w`` (x2) when the page was small;
+        - a full page means the window may hold more: shrink ``w`` (to 3/4 of the
+          page's own span, at most half) and retry the same ``hi``; a full page of a
+          1 ms window cannot be split further: keep it and flag ``truncated``.
+
+        Empty windows widen geometrically, so sparse histories cost O(log range)
+        requests. Stops at ``start_ms``, at ``cap`` unique fills (``capped=True``,
+        ``truncated=True``; within the last window the newest fills are kept) or when
+        a non-empty page brings no new fill (the API ignoring the window). Inclusive
+        bounds; de-duplicated by ``tid``. ``on_page(new)`` after every kept page, newest
+        window first.
+        """
+        start_ms = int(start_ms)
+        hi = int(end_ms) if end_ms is not None else int(time.time() * 1000)
+        w = max(1, int(window_ms))
+        out: list[dict] = []
+        seen: set[int] = set()
+        capped = skipped_ms = False
+        for _ in range(MAX_BACKWARD_REQUESTS):
+            if hi < start_ms or capped:
+                break
+            lo = max(start_ms, hi - w + 1)
+            page = await self._fills_window(addr, lo, hi)
+            if len(page) >= FILLS_PAGE_LIMIT:
+                if hi > lo:
+                    times = [int(f["time"]) for f in page]
+                    span = max(times) - min(times) + 1
+                    w = max(1, min((hi - lo + 1) // 2, span * 3 // 4))
+                    continue
+                log.warning("hl userFillsByTime %s: full page in the single millisecond %d; "
+                            "more fills of that ms may exist; history marked truncated",
+                            addr, hi)
+                skipped_ms = True
+            new = [f for f in page if f["tid"] not in seen]
+            if page and not new:
+                log.warning("hl userFillsByTime %s: window [%d, %d] brought no new fills; "
+                            "stopping", addr, lo, hi)
+                break
+            room = cap - len(out)
+            if len(new) > room or (len(new) == room and lo > start_ms):
+                new.sort(key=lambda f: int(f["time"]), reverse=True)
+                new = new[:room]
+                capped = True
+            seen.update(f["tid"] for f in new)
+            out.extend(new)
+            if on_page is not None and new:
+                on_page(new)
+            if len(page) < FILLS_PAGE_LIMIT // 2:
+                w *= 2
+            hi = lo - 1
+        else:
+            log.warning("hl userFillsByTime %s: stopped after %d requests; history marked "
+                        "truncated", addr, MAX_BACKWARD_REQUESTS)
+            skipped_ms = True
+        cov_start = start_ms
+        if capped:
+            cov_start = min(int(f["time"]) for f in out) if out else hi + 1
+        return HLPage(out, truncated=capped or skipped_ms, capped=capped, cov_start=cov_start)
 
     async def user_funding(
         self, addr: str, start_ms: int, end_ms: int | None = None, *,

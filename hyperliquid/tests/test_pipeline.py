@@ -1,6 +1,7 @@
 """Task 6: discovery, backfill, rescore (respx for HTTP)."""
 
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -12,7 +13,7 @@ from sqlalchemy.orm import Session
 from hades_hl import pipeline
 from hades_hl.client import HLClient, HLRateLimited
 from hades_hl.db import Fill, Funding, Kv, Wallet, init_db, insert_fills, make_engine
-from hlfills import DAY_MS, mk
+from hlfills import DAY_MS, FakeFillsAPI, mk
 
 INFO = "https://api.hyperliquid.xyz/info"
 LB = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
@@ -54,11 +55,12 @@ def session(engine):
         yield s
 
 
-def lb_row(addr: str, month_pnl: str, account_value: str = "1000", name=None) -> dict:
+def lb_row(addr: str, month_pnl: str, account_value: str = "20000", name=None,
+           vlm: str = "100000") -> dict:
     return {"ethAddress": addr, "accountValue": account_value, "displayName": name, "prize": 0,
             "windowPerformances": [
                 ["day", {"pnl": "1", "roi": "0.1", "vlm": "10"}],
-                ["month", {"pnl": month_pnl, "roi": "0.2", "vlm": "100"}],
+                ["month", {"pnl": month_pnl, "roi": "0.2", "vlm": vlm}],
                 ["allTime", {"pnl": "5", "roi": "0.3", "vlm": "1000"}]]}
 
 
@@ -81,25 +83,43 @@ def funding_row(t: int, coin: str = "BTC", usdc: str = "-0.5") -> dict:
                                                 "szi": "1", "fundingRate": "0.0001"}}
 
 
-def info_router(fills_pages=(), funding_pages=(), meta=None):
-    """respx side effect dispatching on the info request type."""
-    fills_q = list(fills_pages)
-    fund_q = list(funding_pages)
+def sim_router(fills: dict[str, FakeFillsAPI] | None = None, funding=None, meta=None,
+               fail_after: int | None = None):
+    """respx side effect: ``userFillsByTime`` served by per-address FakeFillsAPIs
+    (HL semantics), ``userFunding`` from ``{addr: rows}``. After ``fail_after``
+    requests every request gets HTTP 429."""
+    fills = fills or {}
+    funding = funding or {}
+    n = [0]
 
     def handler(request):
+        n[0] += 1
+        if fail_after is not None and n[0] > fail_after:
+            return httpx.Response(429)
         body = json.loads(request.content)
         t = body["type"]
         if t == "userFillsByTime":
-            r = fills_q.pop(0) if fills_q else []
-        elif t == "userFunding":
-            r = fund_q.pop(0) if fund_q else []
-        elif t == "meta":
-            r = meta
-        else:  # pragma: no cover
-            raise AssertionError(t)
-        return r if isinstance(r, httpx.Response) else httpx.Response(200, json=r)
+            api = fills.get(body["user"]) or FakeFillsAPI()
+            return httpx.Response(200, json=api.query(body["startTime"], body.get("endTime")))
+        if t == "userFunding":
+            rows = [r for r in funding.get(body["user"], []) if r["time"] >= body["startTime"]]
+            return httpx.Response(200, json=rows)
+        if t == "meta":
+            return httpx.Response(200, json=meta)
+        raise AssertionError(t)  # pragma: no cover
 
     return handler
+
+
+def cov(session, addr):
+    return pipeline.kv_get_json(session, f"hl:cov:{addr}")
+
+
+def n_fills(session, addr=None):
+    q = select(func.count()).select_from(Fill)
+    if addr:
+        q = q.where(Fill.address == addr)
+    return session.scalar(q)
 
 
 # -- discover -------------------------------------------------------------------
@@ -114,10 +134,44 @@ async def test_discover_dedupes_ranks_and_excludes_vaults(session):
         got = await pipeline.discover(session, c, limit=2, now=NOW)
     assert list(got) == [B, A]  # by month pnl, vault skipped, deduped case-insensitively
     assert got.error is None
+    assert got.vaults_checked is True
     stored = {w.address: w for w in session.scalars(select(Wallet))}
     assert set(stored) == {A, B}
     assert stored[B].stats_json["leaderboard"]["pnl_month"] == 300.0
     assert stored[B].is_vault is False
+
+
+@respx.mock
+async def test_discover_prefilter_excludes_each_reason_before_cache_cap(
+        session, monkeypatch, caplog):
+    monkeypatch.setattr(pipeline, "CANDIDATE_CACHE_MAX", 3)
+    g1, g2, g3, edge = ("0x" + h * 20 for h in ("01", "02", "03", "0e"))
+    low_av, no_vlm, churn, loser = ("0x" + h * 20 for h in ("11", "12", "13", "14"))
+    rows = [
+        # excluded rows have the HIGHEST month pnl: a filter applied after the cache cap
+        # would leave the cache full of them
+        lb_row(low_av, "9000000", account_value="9999.99"),
+        lb_row(no_vlm, "8000000", vlm="0"),
+        lb_row(churn, "7000000", account_value="20000", vlm="4000001"),  # > 200 x AV
+        lb_row(V, "6000000"),
+        lb_row(loser, "-5"),
+        lb_row(g1, "500"), lb_row(g2, "400"), lb_row(g3, "300"),
+        lb_row(edge, "10", account_value="10000", vlm="2000000"),  # boundaries are kept
+    ]
+    respx.get(LB).mock(return_value=httpx.Response(200, json={"leaderboardRows": rows}))
+    respx.get(VAULTS).mock(return_value=httpx.Response(200, json=[vault_row(V)]))
+    async with make_client() as c:
+        with caplog.at_level(logging.INFO, logger="hades_hl.pipeline"):
+            got = await pipeline.discover(session, c, limit=10, now=NOW)
+    assert list(got) == [g1, g2, g3]  # top 3 by month pnl among the 4 that pass
+    cached = json.loads(session.get(Kv, pipeline.KV_LEADERBOARD).value)
+    assert [r["address"] for r in cached["rows"]] == [g1, g2, g3]
+    assert cached["prefilter"] == {"before": 9, "after": 4, "account_value": 1, "volume": 1,
+                                   "churn": 1, "pnl": 1, "vault": 1}
+    assert cached["vaults_checked"] is True
+    assert got.prefilter == cached["prefilter"]
+    msgs = " ".join(r.getMessage() for r in caplog.records)
+    assert "9" in msgs and "prefilter" in msgs
 
 
 @respx.mock
@@ -149,81 +203,153 @@ async def test_discover_leaderboard_unavailable_returns_empty(session, caplog):
 
 
 @respx.mock
-async def test_discover_vault_list_unavailable_still_discovers(session):
+async def test_discover_vault_list_unavailable_still_discovers_unchecked(session, caplog):
     respx.get(LB).mock(return_value=httpx.Response(
         200, json={"leaderboardRows": [lb_row(A, "5")]}))
     respx.get(VAULTS).mock(return_value=httpx.Response(503))
     async with make_client(max_attempts=1) as c:
-        got = await pipeline.discover(session, c, limit=5, now=NOW)
+        with caplog.at_level("WARNING", logger="hades_hl.pipeline"):
+            got = await pipeline.discover(session, c, limit=5, now=NOW)
     assert list(got) == [A]
+    assert got.vaults_checked is False  # M6
+    cached = json.loads(session.get(Kv, pipeline.KV_LEADERBOARD).value)
+    assert cached["vaults_checked"] is False
+    assert any("vault" in r.getMessage() for r in caplog.records)
 
 
 @respx.mock
 async def test_discover_marks_existing_wallet_as_vault(session):
-    session.add(Wallet(address=V))
+    V2 = "0x" + "ee" * 20  # a known wallet that is not on the leaderboard at all
+    session.add_all([Wallet(address=V), Wallet(address=V2)])
     session.commit()
     respx.get(LB).mock(return_value=httpx.Response(
         200, json={"leaderboardRows": [lb_row(V, "5"), lb_row(A, "1")]}))
-    respx.get(VAULTS).mock(return_value=httpx.Response(200, json=[vault_row(V)]))
+    respx.get(VAULTS).mock(return_value=httpx.Response(200, json=[vault_row(V), vault_row(V2)]))
     async with make_client() as c:
         got = await pipeline.discover(session, c, limit=5, now=NOW)
     assert list(got) == [A]
     assert session.get(Wallet, V).is_vault is True
+    assert session.get(Wallet, V2).is_vault is True
 
 
-# -- backfill -------------------------------------------------------------------
+# -- backfill (ruling P27: newest first, contiguous coverage) -----------------------
 
 @respx.mock
 async def test_backfill_rerun_inserts_zero(session):
     t0 = NOW_MS - 5 * DAY_MS
-    fills = [fill(i, t0 + i * 1000) for i in range(10)]
+    api = FakeFillsAPI([fill(i, t0 + i * 1000) for i in range(10)])
     fund = [funding_row(t0 + 3600_000 * k) for k in range(3)]
-    route = respx.post(INFO).mock(side_effect=info_router(
-        fills_pages=[fills, fills[-1:]], funding_pages=[fund, fund[-1:]]))
+    route = respx.post(INFO).mock(side_effect=sim_router({A: api}, {A: fund}))
     async with make_client() as c:
         r1 = await pipeline.backfill(session, c, A, days=30, now=NOW)
+        n_calls = len(api.calls)
         r2 = await pipeline.backfill(session, c, A, days=30, now=NOW)
     assert (r1.new_fills, r1.new_funding, r1.truncated) == (10, 3, False)
     assert (r2.new_fills, r2.new_funding) == (0, 0)
+    assert min(s for s, _ in api.calls[:n_calls]) == NOW_MS - 30 * DAY_MS
+    assert all(s >= NOW_MS for s, _ in api.calls[n_calls:])  # rerun: only [cov_end, now]
+    assert cov(session, A) == {"start": NOW_MS - 30 * DAY_MS, "end": NOW_MS, "capped": False}
     bodies = [json.loads(call.request.content) for call in route.calls]
-    fills_bodies = [b for b in bodies if b["type"] == "userFillsByTime"]
-    assert fills_bodies[0]["startTime"] == NOW_MS - 30 * DAY_MS
-    assert fills_bodies[1]["startTime"] == fills[-1]["time"]  # resume: max stored, inclusive
     fund_bodies = [b for b in bodies if b["type"] == "userFunding"]
     assert fund_bodies[1]["startTime"] == fund[-1]["time"]
-    assert session.scalar(select(func.count()).select_from(Fill)) == 10
+    assert n_fills(session) == 10
     assert session.scalar(select(func.count()).select_from(Funding)) == 3
-    w = session.get(Wallet, A)
-    assert w.stats_json["backfill"]["history_partial"] is False
+    assert session.get(Wallet, A).stats_json["backfill"]["history_partial"] is False
+
+
+@respx.mock
+async def test_backfill_capped_wallet_stores_newest_10k(session):
+    fills = [fill(i, NOW_MS - 15_000 * 10_000 + i * 10_000) for i in range(15_000)]
+    respx.post(INFO).mock(side_effect=sim_router({A: FakeFillsAPI(fills)}))
+    async with make_client() as c:
+        r = await pipeline.backfill(session, c, A, days=30, now=NOW)
+    assert r.truncated is True and r.new_fills == 10_000
+    stored = set(session.scalars(select(Fill.tid).where(Fill.address == A)))
+    assert stored == set(range(5_000, 15_000))  # the newest 10k, not the oldest
+    assert cov(session, A) == {"start": fills[5_000]["time"], "end": NOW_MS, "capped": True}
+    assert session.get(Wallet, A).stats_json["backfill"]["history_partial"] is True
+
+
+@respx.mock
+async def test_backfill_rerun_after_new_fills_extends_cov_end(session):
+    t0 = NOW_MS - 2 * DAY_MS
+    api = FakeFillsAPI([fill(i, t0 + i * 60_000) for i in range(100)])
+    respx.post(INFO).mock(side_effect=sim_router({A: api}))
+    later = NOW + timedelta(hours=1)
+    async with make_client() as c:
+        await pipeline.backfill(session, c, A, days=30, now=NOW)
+        n_calls = len(api.calls)
+        api.fills += [fill(1000 + i, NOW_MS + 1 + i * 60_000) for i in range(50)]
+        r2 = await pipeline.backfill(session, c, A, days=30, now=later)
+    assert r2.new_fills == 50 and r2.truncated is False
+    assert all(s >= NOW_MS for s, _ in api.calls[n_calls:])
+    assert cov(session, A) == {"start": NOW_MS - 30 * DAY_MS,
+                               "end": NOW_MS + 3_600_000, "capped": False}
+
+
+@respx.mock
+async def test_backfill_rerun_hitting_cap_resets_cov_start(session):
+    api = FakeFillsAPI([fill(i, NOW_MS - DAY_MS + i * 1000) for i in range(100)])
+    respx.post(INFO).mock(side_effect=sim_router({A: api}))
+    later = NOW + timedelta(days=1)
+    async with make_client() as c:
+        await pipeline.backfill(session, c, A, days=30, now=NOW)
+        assert cov(session, A)["capped"] is False
+        new = [fill(10_000 + i, NOW_MS + 1 + i * 5) for i in range(12_000)]
+        api.fills += new
+        r2 = await pipeline.backfill(session, c, A, days=30, now=later)
+        assert r2.truncated is True and r2.new_fills == 10_000
+        assert cov(session, A) == {"start": new[2_000]["time"],
+                                   "end": NOW_MS + DAY_MS, "capped": True}
+        assert session.get(Wallet, A).stats_json["backfill"]["history_partial"] is True
+        # an uncapped rerun extends the end but keeps the capped start (still partial)
+        api.fills.append(fill(99_999, NOW_MS + DAY_MS + 5))
+        r3 = await pipeline.backfill(session, c, A, days=30, now=later + timedelta(hours=1))
+    assert r3.new_fills == 1
+    assert cov(session, A)["start"] == new[2_000]["time"]
+    assert session.get(Wallet, A).stats_json["backfill"]["history_partial"] is True
+
+
+@respx.mock
+async def test_backfill_stale_coverage_resets_to_days_floor(session):
+    api = FakeFillsAPI([fill(0, NOW_MS - DAY_MS)])
+    respx.post(INFO).mock(side_effect=sim_router({A: api}))
+    much_later = NOW + timedelta(days=40)
+    async with make_client() as c:
+        await pipeline.backfill(session, c, A, days=30, now=NOW)
+        await pipeline.backfill(session, c, A, days=30, now=much_later)
+    end = NOW_MS + 40 * DAY_MS
+    assert cov(session, A) == {"start": end - 30 * DAY_MS, "end": end, "capped": False}
+
+
+@respx.mock
+async def test_backfill_more_days_extends_cov_start(session):
+    old = fill(0, NOW_MS - 20 * DAY_MS)
+    api = FakeFillsAPI([old, fill(2, NOW_MS - DAY_MS)])
+    respx.post(INFO).mock(side_effect=sim_router({A: api}))
+    async with make_client() as c:
+        r1 = await pipeline.backfill(session, c, A, days=7, now=NOW)
+        r2 = await pipeline.backfill(session, c, A, days=30, now=NOW)
+    assert (r1.new_fills, r2.new_fills) == (1, 1)
+    assert cov(session, A)["start"] == NOW_MS - 30 * DAY_MS
 
 
 @respx.mock
 async def test_429_mid_backfill_keeps_earlier_pages(engine):
-    t0 = NOW_MS - 5 * DAY_MS
-    page1 = [fill(i, t0 + i) for i in range(2000)]
-    respx.post(INFO).mock(side_effect=info_router(
-        fills_pages=[page1] + [httpx.Response(429)] * 2))
+    # newest window (1 h) holds 1500 fills; the next request is rate limited
+    fills = [fill(i, NOW_MS - 3_000_000 + i * 1000) for i in range(1500)]
+    fills += [fill(5000 + i, NOW_MS - 10 * DAY_MS + i) for i in range(10)]
+    respx.post(INFO).mock(side_effect=sim_router({A: FakeFillsAPI(fills)}, fail_after=1))
     with Session(engine) as s:
         async with make_client(max_attempts=2) as c:
             with pytest.raises(HLRateLimited):
                 await pipeline.backfill(s, c, A, days=30, now=NOW)
     with Session(engine) as fresh:  # committed, not just flushed
-        assert fresh.scalar(select(func.count()).select_from(Fill)) == 2000
-        assert fresh.get(Wallet, A) is not None
-
-
-@respx.mock
-async def test_backfill_truncated_sets_history_partial_sticky(session):
-    t0 = NOW_MS - 5 * DAY_MS
-    pages = [[fill(p * 2000 + i, t0 + p * 2000 + i) for i in range(2000)] for p in range(5)]
-    respx.post(INFO).mock(side_effect=info_router(fills_pages=pages + [[]]))
-    async with make_client() as c:
-        r = await pipeline.backfill(session, c, A, days=30, now=NOW)
-        assert r.truncated is True and r.new_fills == 10_000
-        assert session.get(Wallet, A).stats_json["backfill"]["history_partial"] is True
-        r2 = await pipeline.backfill(session, c, A, days=30, now=NOW)  # not truncated now
-    assert r2.truncated is False
-    assert session.get(Wallet, A).stats_json["backfill"]["history_partial"] is True
+        assert n_fills(fresh) == 1500
+        w = fresh.get(Wallet, A)
+        assert w is not None
+        assert w.stats_json["backfill"]["last_error"] == "rate_limited"  # M12
+        assert cov(fresh, A) is None  # incomplete segment: no coverage recorded
 
 
 # -- sz decimals / rescore ----------------------------------------------------------
@@ -231,7 +357,7 @@ async def test_backfill_truncated_sets_history_partial_sticky(session):
 @respx.mock
 async def test_load_sz_decimals_cached_24h(session):
     meta = {"universe": [{"name": "BTC", "szDecimals": 5}, {"name": "ETH", "szDecimals": 4}]}
-    route = respx.post(INFO).mock(side_effect=info_router(meta=meta))
+    route = respx.post(INFO).mock(side_effect=sim_router(meta=meta))
     async with make_client() as c:
         assert await pipeline.load_sz_decimals(session, c, NOW) == {"BTC": 5, "ETH": 4}
         await pipeline.load_sz_decimals(session, c, NOW + timedelta(hours=23))
@@ -277,6 +403,7 @@ def test_rescore_persists_scores_reasons_and_passes_sz_decimals(session, monkeyp
     assert w[A].score > w[B].score
     assert w[C].score is None and w[C].stats_json["score_reason"] == "n<30"
     assert w[V].score is None and w[V].stats_json["score_reason"] == "bot"
+    assert w[V].is_bot is True  # M5: is_bot(st, w.is_vault)
     assert w[A].stats_json["funding_usd"] == pytest.approx(-1.5)
     assert w[A].scored_at is not None
     assert res.scored == 2 and res.unscored == 2
@@ -307,3 +434,29 @@ def test_stored_fill_roundtrip_keeps_liquidation_victim_and_builder_fee(session)
     assert got["liquidation"]["liquidatedUser"] == B
     assert got["builderFee"] == "0.25"
     assert got["startPosition"] == "1" or got["startPosition"] == "1.0"
+
+
+def test_rescore_uses_coverage_window(session, monkeypatch):
+    """P17 with P27: oldest_fill_time = cov_start; only fills in [cov_start, cov_end]."""
+    cov_start = NOW_MS - 10 * DAY_MS
+    session.add(Wallet(address=A, stats_json={"backfill": {"history_partial": True}}))
+    insert_fills(session, A, round_trips(40, NOW_MS - 9 * DAY_MS, DAY_MS // 5))
+    # a stored fill outside the coverage (e.g. from an older, superseded segment)
+    insert_fills(session, A, [mk("ETH", "B", "1", "100", "0", NOW_MS - 20 * DAY_MS)])
+    pipeline.kv_set_json(session, f"hl:cov:{A}",
+                         {"start": cov_start, "end": NOW_MS, "capped": True})
+    session.commit()
+    seen = {}
+    real = pipeline.wallet_stats
+
+    def spy(addr, fills, funding, now, window_days=30, **kw):
+        seen[addr] = kw
+        return real(addr, fills, funding, now, window_days, **kw)
+
+    monkeypatch.setattr(pipeline, "wallet_stats", spy)
+    pipeline.rescore(session, NOW, sz_decimals={})
+    w = session.get(Wallet, A)
+    assert seen[A]["oldest_fill_time"] == datetime.fromtimestamp(cov_start / 1000, tz=timezone.utc)
+    assert w.stats_json["window_days"] == pytest.approx(10.0)  # now - cov_start
+    assert w.stats_json["trades"] == 80  # the ETH fill outside the coverage is ignored
+    assert w.stats_json["history_partial"] is True

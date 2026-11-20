@@ -60,8 +60,8 @@ def invoke(*args):
 
 
 def lb_row(addr, pnl):
-    return {"ethAddress": addr, "accountValue": "10", "displayName": None, "prize": 0,
-            "windowPerformances": [["month", {"pnl": pnl, "roi": "0.1", "vlm": "1"}]]}
+    return {"ethAddress": addr, "accountValue": "100000", "displayName": None, "prize": 0,
+            "windowPerformances": [["month", {"pnl": pnl, "roi": "0.1", "vlm": "1000"}]]}
 
 
 def fill(tid, t):
@@ -79,11 +79,17 @@ def test_full_flow_never_prints_key_and_backfill_all_survives_429(env):
         200, json={"leaderboardRows": [lb_row(A, "9"), lb_row(B, "5")]}))
     respx.get(VAULTS).mock(return_value=httpx.Response(200, json=[]))
 
+    a_calls = [0]
+
     def info(request):
         body = json.loads(request.content)
         if body["type"] == "meta":
             return httpx.Response(200, json={"universe": [{"name": "BTC", "szDecimals": 5}]})
-        if body["user"] == A:  # wallet A is rate limited
+        if body["user"] == A:  # wallet A: one partial page, then rate limited (M12)
+            a_calls[0] += 1
+            if a_calls[0] == 1 and body["type"] == "userFillsByTime":
+                rows = [fill(100 + i, now_ms - 600_000 + i * 1000) for i in range(3)]
+                return httpx.Response(200, json=rows)
             return httpx.Response(429)
         if body["type"] == "userFillsByTime":
             rows = [fill(i, now_ms - 86_400_000 + i * 3_600_000) for i in range(4)]
@@ -95,7 +101,8 @@ def test_full_flow_never_prints_key_and_backfill_all_survives_429(env):
     assert invoke("init-db").exit_code == 0
     r = invoke("discover", "--limit", "5")
     assert r.exit_code == 0, r.output
-    assert "2" in r.output
+    assert "discovered 2" in r.output
+    assert "prefilter" in r.output and "vaults checked: yes" in r.output
     r = invoke("backfill", "--all", "--days", "30")
     assert r.exit_code == 0, r.output
     assert "rate limited" in r.output.lower()
@@ -105,7 +112,9 @@ def test_full_flow_never_prints_key_and_backfill_all_survives_429(env):
 
     eng = make_engine(env)
     with Session(eng) as s:
-        assert {f.address for f in s.scalars(select(Fill))} == {B}
+        fills = list(s.scalars(select(Fill)))
+        assert {f.address for f in fills} == {A, B}
+        assert sorted(f.tid for f in fills if f.address == A) == [100, 101, 102]  # kept
         w = s.get(Wallet, B)
         assert w.stats_json["score_reason"] == "n<30"
         assert w.scored_at is not None
@@ -118,6 +127,23 @@ def test_discover_leaderboard_down_exit_0_with_message(env):
     r = invoke("discover", "--limit", "5")
     assert r.exit_code == 0
     assert "leaderboard unavailable" in r.output.lower()
+
+
+@respx.mock
+def test_discover_vault_list_down_says_unchecked(env):
+    respx.get(LB).mock(return_value=httpx.Response(
+        200, json={"leaderboardRows": [lb_row(A, "9")]}))
+    respx.get(VAULTS).mock(return_value=httpx.Response(503))
+    r = invoke("discover", "--limit", "5")
+    assert r.exit_code == 0, r.output
+    assert "vaults checked: no" in r.output
+
+
+def test_init_db_masks_password():
+    shown = cli.masked_url("postgresql://hades:s3cretpw@db.local:5432/hl")
+    assert "s3cretpw" not in shown and "db.local" in shown
+    win = "sqlite:///C:/Users/x/hl.db"  # no password: printed as given (no %3A escaping)
+    assert cli.masked_url(win) == win
 
 
 def test_backfill_requires_address_or_all(env):

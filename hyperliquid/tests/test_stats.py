@@ -254,3 +254,15 @@ def test_score_accepts_mapping():
 def test_none_metric_ranks_lowest():
     s = score([row("a", sharpe=None), row("b", sharpe=0.0)])
     assert s["b"] > s["a"]
+
+
+def test_sz_decimals_reach_the_chain_in_stats_and_pnl():
+    """P28: wallet_stats / wallet_pnl pass sz_decimals down to the chain tolerance."""
+    from hades_hl.pnl import wallet_pnl
+
+    fills = [mk("XYZ", "B", "1", "100", "0", T0 + DAY_MS),
+             mk("XYZ", "A", "1", "110", "1.004", T0 + DAY_MS + 5, closed_pnl="10")]
+    assert wallet_stats(ADDR, fills, [], NOW, sz_decimals={"XYZ": 2})["chain_gaps"] == 0
+    assert wallet_stats(ADDR, fills, [], NOW, sz_decimals={"XYZ": 2})["n"] == 1
+    assert wallet_stats(ADDR, fills, [], NOW)["chain_gaps"] == 1
+    assert wallet_pnl(ADDR, fills, [], sz_decimals={"XYZ": 2}).chain_gaps == 0

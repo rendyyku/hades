@@ -22,9 +22,10 @@ Definitions (all outputs are plain floats/ints/None so they serialize as JSON):
 - Days are 24 h buckets anchored at the window start.
 
 Partial history (ruling P17): with ``history_partial=True`` (the fills read hit the
-10k-fill cap) the window starts at the oldest *fetched* fill (``oldest_fill_time``,
-else the oldest of the given fills; never before the nominal window start) and
-``window_days`` reports the covered span ``(now - that start)`` in days.
+10k-fill cap) the window starts at ``oldest_fill_time`` (the backfill coverage start,
+ruling P27; else the oldest of the given fills; never before the nominal window start)
+and ``window_days`` reports the covered span ``(now - that start)`` in days.
+``sz_decimals`` also sets the startPosition chain tolerance (ruling P28).
 
 - ``chain_gaps``: startPosition chain breaks (missing fills) in the window, see
   :func:`hades_hl.normalize.normalize_fills`.
@@ -84,7 +85,7 @@ def wallet_stats(
     fund = [r for r in funding if start_ms <= int(r["time"]) <= now_ms]
 
     pnl = wallet_pnl(addr, perp, fund, sz_decimals=sz_decimals)
-    legs = normalize_fills(addr, perp).legs
+    legs = normalize_fills(addr, perp, sz_decimals=sz_decimals).legs
 
     # -- margin / leverage ------------------------------------------------------
     lev = leverage_by_coin(clearinghouse)

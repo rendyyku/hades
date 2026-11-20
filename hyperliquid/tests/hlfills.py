@@ -60,5 +60,23 @@ def round_trip(coin: str, t_open: int, hold_ms: int, pnl, *, sz="1", px="100",
     ]
 
 
+class FakeFillsAPI:
+    """In-memory ``userFillsByTime`` with HL's verified semantics (live probe
+    2026-11-20): ``startTime``/``endTime`` inclusive, ascending order, and when more
+    than 2000 fills match, the OLDEST 2000 of the window are returned.
+    ``fills`` may be mutated between calls (new fills arriving)."""
+
+    def __init__(self, fills: list[dict] | None = None) -> None:
+        self.fills: list[dict] = list(fills or [])
+        self.calls: list[tuple[int, int | None]] = []
+
+    def query(self, start: int, end: int | None) -> list[dict]:
+        self.calls.append((start, end))
+        hit = [f for f in self.fills
+               if int(f["time"]) >= start and (end is None or int(f["time"]) <= end)]
+        hit.sort(key=lambda f: (int(f["time"]), f["tid"]))
+        return hit[:2000]
+
+
 def ms_dt(ms: int) -> datetime:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)

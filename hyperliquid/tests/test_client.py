@@ -21,6 +21,7 @@ from hades_hl.client import (
     item_weight,
 )
 from hades_hl.config import Settings
+from hlfills import FakeFillsAPI
 
 INFO = "https://api.hyperliquid.xyz/info"
 LB = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
@@ -108,6 +109,25 @@ async def test_bucket_waits_when_budget_spent():
     b.charge(100)  # post-hoc per-item weight puts the bucket in debt
     await b.acquire(20)
     assert sum(clock.sleeps) == pytest.approx(1.0 + 6.0)
+
+
+async def test_bucket_float_rounding_does_not_spin():
+    """Found by the P27 pager: after debt, refill can leave tokens a hair (1e-13) below
+    the weight; the tiny sleep is lost in a large clock value and acquire looped forever."""
+    clock = FakeClock()
+    clock.now = 1_000_000.123
+    b = WeightBucket(1200, sleep=clock.sleep, clock=clock)
+    b.tokens = 20 - 1e-12  # just below one request's weight after a refill
+    b.updated = clock.now
+
+    async def bounded_sleep(s: float) -> None:
+        await clock.sleep(s)
+        if len(clock.sleeps) > 50:
+            raise RuntimeError("acquire is spinning")
+
+    b._sleep = bounded_sleep
+    await b.acquire(20)
+    assert len(clock.sleeps) <= 2
 
 
 # -- fixture-backed endpoints -------------------------------------------------
@@ -423,3 +443,72 @@ async def test_funding_on_page_called():
     async with make_client() as c:
         await c.user_funding(ADDR, 0, on_page=got.append)
     assert [len(g) for g in got] == [3]
+
+
+# -- backward (newest-first) paging: ruling P27 ------------------------------------
+
+def sim_route(api):
+    """respx side effect serving ``userFillsByTime`` from a FakeFillsAPI."""
+    def handler(request):
+        b = json.loads(request.content)
+        assert b["type"] == "userFillsByTime"
+        return httpx.Response(200, json=api.query(b["startTime"], b.get("endTime")))
+    return handler
+
+
+@respx.mock
+async def test_backward_capped_keeps_newest_fills():
+    t0 = 1_700_000_000_000
+    api = FakeFillsAPI([fill(i, t0 + i * 10) for i in range(25_000)])  # 250 s of dense fills
+    end = t0 + 25_000 * 10
+    respx.post(INFO).mock(side_effect=sim_route(api))
+    async with make_client() as c:
+        page = await c.user_fills_backward(ADDR, t0 - 86_400_000, end)
+    tids = {f["tid"] for f in page.fills}
+    assert len(page.fills) == len(tids) == FILLS_HISTORY_CAP
+    assert tids == set(range(15_000, 25_000))  # the NEWEST 10k, not the oldest
+    assert page.truncated is True and page.capped is True
+    assert page.cov_start == t0 + 15_000 * 10
+    assert all(e is not None and e <= end for _, e in api.calls)
+
+
+@respx.mock
+async def test_backward_sparse_history_crosses_empty_windows():
+    t0 = 1_700_000_000_000
+    day = 86_400_000
+    fills = [fill(i, t0 + i * 3 * day + 5) for i in range(10)]  # one fill every 3 days
+    api = FakeFillsAPI(fills)
+    respx.post(INFO).mock(side_effect=sim_route(api))
+    async with make_client() as c:
+        page = await c.user_fills_backward(ADDR, t0, t0 + 30 * day)
+    assert sorted(f["tid"] for f in page.fills) == list(range(10))
+    assert page.truncated is False and page.capped is False
+    assert page.cov_start == t0
+    assert len(api.calls) < 40  # empty windows widen geometrically
+    assert min(s for s, _ in api.calls) == t0
+
+
+@respx.mock
+async def test_backward_newest_fills_come_first_in_on_page():
+    t0 = 1_700_000_000_000
+    api = FakeFillsAPI([fill(i, t0 + i * 1000) for i in range(5000)])
+    respx.post(INFO).mock(side_effect=sim_route(api))
+    seen: list[list[int]] = []
+    async with make_client() as c:
+        await c.user_fills_backward(ADDR, t0, t0 + 5000 * 1000,
+                                    on_page=lambda new: seen.append([f["tid"] for f in new]))
+    assert seen and 4999 in seen[0]  # first persisted page holds the newest fill
+    flat = [t for pg in seen for t in pg]
+    assert sorted(flat) == list(range(5000)) and len(flat) == 5000
+
+
+@respx.mock
+async def test_backward_same_ms_overflow_flags_truncated_not_capped():
+    t0 = 1_700_000_000_000
+    api = FakeFillsAPI([fill(i, t0) for i in range(2500)] + [fill(9000, t0 + 10)])
+    respx.post(INFO).mock(side_effect=sim_route(api))
+    async with make_client() as c:
+        page = await c.user_fills_backward(ADDR, t0 - 1000, t0 + 1000)
+    assert page.truncated is True and page.capped is False
+    assert 9000 in {f["tid"] for f in page.fills}
+    assert len(page.fills) == 2001

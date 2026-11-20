@@ -94,7 +94,7 @@ def test_decimal_round_trip(engine, fixture):
     with session_scope(engine) as s:
         insert_fills(s, ADDR, [raw])
     with session_scope(engine) as s:
-        f = s.get(Fill, raw["tid"])
+        f = s.get(Fill, {"address": ADDR, "tid": raw["tid"]})
         assert f.px == Decimal(raw["px"]) and isinstance(f.px, Decimal)
         assert f.closed_pnl == Decimal(raw["closedPnl"])
         assert f.crossed is raw["crossed"]
@@ -120,3 +120,85 @@ def test_basic_rows(engine):
         assert w.is_vault is False and w.is_bot is False
         assert w.first_seen.tzinfo is not None
         assert s.get(PaperEvent, "hl:1").observed_time.tzinfo is not None
+
+
+# -- I4: fills keyed by (address, tid) --------------------------------------------
+
+OTHER = "0x" + "ef" * 20
+
+
+def test_fills_pk_is_address_tid(engine):
+    pk = inspect(engine).get_pk_constraint("fills")["constrained_columns"]
+    assert pk == ["address", "tid"]
+
+
+def test_same_tid_for_two_addresses_stored_twice(engine, fixture):
+    row = fixture("user_fills_by_time.json")[0]  # HL gives both counterparties one tid
+    with session_scope(engine) as s:
+        assert insert_fills(s, ADDR, [row]) == 1
+        assert insert_fills(s, OTHER, [row]) == 1
+        assert insert_fills(s, OTHER, [row]) == 0
+    with session_scope(engine) as s:
+        assert s.scalar(select(text("count(*)")).select_from(Fill)) == 2
+
+
+OLD_FILLS_DDL = """
+CREATE TABLE fills (
+    tid BIGINT NOT NULL, address VARCHAR NOT NULL, coin VARCHAR NOT NULL,
+    px VARCHAR NOT NULL, sz VARCHAR NOT NULL, side VARCHAR NOT NULL, dir VARCHAR NOT NULL,
+    start_position VARCHAR NOT NULL, closed_pnl VARCHAR NOT NULL, fee VARCHAR NOT NULL,
+    time BIGINT NOT NULL, hash VARCHAR, crossed BOOLEAN NOT NULL,
+    liquidation BOOLEAN DEFAULT 0 NOT NULL,
+    PRIMARY KEY (tid)
+)"""
+
+
+def _old_db(tmp_path):
+    e = make_engine(f"sqlite:///{(tmp_path / 'old.db').as_posix()}")
+    with e.begin() as c:
+        c.execute(text(OLD_FILLS_DDL))
+        c.execute(text("CREATE INDEX ix_fills_address ON fills (address)"))
+        c.execute(text("CREATE INDEX ix_fills_coin ON fills (coin)"))
+        c.execute(text("CREATE INDEX ix_fills_address_time ON fills (address, time)"))
+        for tid in (1, 2, 3):
+            c.execute(text(
+                "INSERT INTO fills (tid, address, coin, px, sz, side, dir, start_position, "
+                "closed_pnl, fee, time, hash, crossed, liquidation) VALUES "
+                "(:tid, :a, 'BTC', '100.5', '0.1', 'B', 'Open Long', '0', '0', '0.01', "
+                ":t, '0xh', 1, :liq)"), {"tid": tid, "a": ADDR, "t": 1000 + tid,
+                                          "liq": tid == 3})
+    return e
+
+
+def test_migration_from_single_tid_pk_keeps_rows(tmp_path):
+    e = _old_db(tmp_path)
+    init_db(e)
+    insp = inspect(e)
+    assert insp.get_pk_constraint("fills")["constrained_columns"] == ["address", "tid"]
+    assert {c["name"] for c in insp.get_columns("fills")} >= EXPECTED["fills"]
+    assert "fills__old" not in insp.get_table_names()
+    with session_scope(e) as s:
+        rows = {f.tid: f for f in s.scalars(select(Fill))}
+        assert sorted(rows) == [1, 2, 3]
+        assert str(rows[1].px) == "100.5" and rows[3].liquidation is True
+        assert rows[1].liquidated_user is None
+        # the new key works on the migrated table
+        assert insert_fills(s, OTHER, [{"tid": 1, "coin": "BTC", "px": "1", "sz": "1",
+                                        "side": "B", "dir": "Open Long", "startPosition": "0",
+                                        "closedPnl": "0", "fee": "0", "time": 5,
+                                        "crossed": True}]) == 1
+
+
+def test_init_db_twice_after_migration_is_noop(tmp_path):
+    e = _old_db(tmp_path)
+    init_db(e)
+    with e.connect() as c:
+        before = sorted(tuple(r) for r in c.execute(text(
+            "SELECT type, name, sql FROM sqlite_master WHERE tbl_name = 'fills'")))
+    init_db(e)
+    with e.connect() as c:
+        after = sorted(tuple(r) for r in c.execute(text(
+            "SELECT type, name, sql FROM sqlite_master WHERE tbl_name = 'fills'")))
+        assert c.execute(text("SELECT count(*) FROM fills")).scalar() == 3
+    assert before == after
+    assert any(name == "ix_fills_address_time" for _, name, _ in after)
