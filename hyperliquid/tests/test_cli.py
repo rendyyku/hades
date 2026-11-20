@@ -85,14 +85,18 @@ def test_full_flow_never_prints_key_and_backfill_all_survives_429(env):
         body = json.loads(request.content)
         if body["type"] == "meta":
             return httpx.Response(200, json={"universe": [{"name": "BTC", "szDecimals": 5}]})
+        if body["type"] == "userFills":  # the discovery activity probe (P30): human pace
+            return httpx.Response(200, json=[fill(i, now_ms - 86_400_000 + i * 3_600_000)
+                                             for i in range(4)])
         if body["user"] == A:  # wallet A: one partial page, then rate limited (M12)
             a_calls[0] += 1
             if a_calls[0] == 1 and body["type"] == "userFillsByTime":
                 rows = [fill(100 + i, now_ms - 600_000 + i * 1000) for i in range(3)]
                 return httpx.Response(200, json=rows)
             return httpx.Response(429)
-        if body["type"] == "userFillsByTime":
+        if body["type"] == "userFillsByTime":  # honours the window, like HL
             rows = [fill(i, now_ms - 86_400_000 + i * 3_600_000) for i in range(4)]
+            rows = [f for f in rows if body["startTime"] <= f["time"] <= body["endTime"]]
             return httpx.Response(200, json=rows)
         return httpx.Response(200, json=[])
 
@@ -103,6 +107,8 @@ def test_full_flow_never_prints_key_and_backfill_all_survives_429(env):
     assert r.exit_code == 0, r.output
     assert "discovered 2" in r.output
     assert "prefilter" in r.output and "vaults checked: yes" in r.output
+    assert "volume>30x AV" in r.output
+    assert "probe: 2 probed (0 cached), 0 rejected, 2 accepted" in r.output
     r = invoke("backfill", "--all", "--days", "30")
     assert r.exit_code == 0, r.output
     assert "rate limited" in r.output.lower()
@@ -121,6 +127,31 @@ def test_full_flow_never_prints_key_and_backfill_all_survives_429(env):
 
 
 @respx.mock
+def test_discover_prints_probe_reject_breakdown(env):
+    import time
+    now_ms = int(time.time() * 1000)
+    respx.get(LB).mock(return_value=httpx.Response(
+        200, json={"leaderboardRows": [lb_row(A, "9"), lb_row(B, "5")]}))
+    respx.get(VAULTS).mock(return_value=httpx.Response(200, json=[]))
+
+    def info(request):
+        body = json.loads(request.content)
+        if body["type"] == "meta":
+            return httpx.Response(200, json={"universe": [{"name": "BTC", "szDecimals": 5}]})
+        assert body["type"] == "userFills"
+        if body["user"] == A:  # 2000 fills in ~33 minutes: a bot
+            return httpx.Response(200, json=[fill(i, now_ms - 2_000_000 + i * 1000)
+                                             for i in range(2000)])
+        return httpx.Response(200, json=[])  # no fills at all: inactive
+
+    respx.post(INFO).mock(side_effect=info)
+    r = invoke("discover", "--limit", "5")
+    assert r.exit_code == 0, r.output
+    assert "discovered 0" in r.output
+    assert "probe: 2 probed (0 cached), 2 rejected (fills_per_day 1, inactive 1), 0 accepted"         in r.output
+
+
+@respx.mock
 def test_discover_leaderboard_down_exit_0_with_message(env):
     respx.get(LB).mock(return_value=httpx.Response(503))
     respx.get(VAULTS).mock(return_value=httpx.Response(200, json=[]))
@@ -134,6 +165,9 @@ def test_discover_vault_list_down_says_unchecked(env):
     respx.get(LB).mock(return_value=httpx.Response(
         200, json={"leaderboardRows": [lb_row(A, "9")]}))
     respx.get(VAULTS).mock(return_value=httpx.Response(503))
+    now_ms = int(__import__("time").time() * 1000)
+    respx.post(INFO).mock(return_value=httpx.Response(
+        200, json=[fill(i, now_ms - 86_400_000 + i * 3_600_000) for i in range(4)]))
     r = invoke("discover", "--limit", "5")
     assert r.exit_code == 0, r.output
     assert "vaults checked: no" in r.output

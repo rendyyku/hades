@@ -512,3 +512,51 @@ async def test_backward_same_ms_overflow_flags_truncated_not_capped():
     assert page.truncated is True and page.capped is False
     assert 9000 in {f["tid"] for f in page.fills}
     assert len(page.fills) == 2001
+
+
+# -- round 2: early-exit coverage, userFills ------------------------------------------
+
+@respx.mock
+async def test_backward_max_requests_exit_reports_coverage_only_down_to_fetched():
+    t0 = 1_700_000_000_000
+    day, hour = 86_400_000, 3_600_000
+    end = t0 + 30 * day
+    api = FakeFillsAPI([fill(i, t0 + i * 3 * day + 5) for i in range(10)]
+                       + [fill(100, end - 30 * 60_000)])
+    respx.post(INFO).mock(side_effect=sim_route(api))
+    async with make_client() as c:
+        page = await c.user_fills_backward(ADDR, t0, end, max_requests=2)
+    # windows: [end-1h+1, end] then (doubled) [end-3h+1, end-1h]; then out of requests
+    assert len(api.calls) == 2
+    assert page.cov_start == end - 3 * hour + 1
+    assert page.truncated is True and page.capped is False
+    assert [f["tid"] for f in page.fills] == [100]
+
+
+@respx.mock
+async def test_backward_stalled_window_reports_coverage_to_hi():
+    t0 = 1_700_000_000_000
+    hour = 3_600_000
+    end = t0 + 86_400_000
+    same = [fill(7, end - 10)]
+
+    def handler(request):  # an API that ignores the window: always the same fill
+        return httpx.Response(200, json=same)
+
+    respx.post(INFO).mock(side_effect=handler)
+    async with make_client() as c:
+        page = await c.user_fills_backward(ADDR, t0, end)
+    # window 1 [end-1h+1, end] brings tid 7; window 2 (hi = end-1h) brings nothing new
+    assert page.cov_start == end - hour + 1
+    assert page.truncated is True and page.capped is False
+    assert [f["tid"] for f in page.fills] == [7]
+
+
+@respx.mock
+async def test_user_fills_latest_sample():
+    rows = [fill(i, 1_700_000_000_000 + i) for i in range(3)]
+    route = respx.post(INFO).mock(return_value=httpx.Response(200, json=rows))
+    async with make_client() as c:
+        got = await c.user_fills(ADDR)
+    assert got == rows
+    assert body(route.calls[0]) == {"type": "userFills", "user": ADDR}

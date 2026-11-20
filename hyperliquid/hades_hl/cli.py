@@ -90,7 +90,8 @@ def init_db_cmd() -> None:
 
 @app.command()
 def discover(limit: int = typer.Option(200, "--limit", min=1, help="max candidates")) -> None:
-    """Pick candidate wallets from the HL leaderboard (cached 24 h), vaults excluded."""
+    """Pick candidate wallets from the HL leaderboard (cached 24 h), vaults excluded;
+    each must pass a one-request activity probe (the bot rule on its latest fills)."""
     _setup_logging()
     settings = get_settings()
     with _session(settings) as session:
@@ -108,10 +109,22 @@ def discover(limit: int = typer.Option(200, "--limit", min=1, help="max candidat
     if pf:
         typer.echo(f"prefilter: {pf.get('before')} -> {pf.get('after')} candidates (excluded: "
                    f"account value<10k {pf.get('account_value')}, no volume {pf.get('volume')}, "
-                   f"volume>200x AV {pf.get('churn')}, month pnl<=0 {pf.get('pnl')}, "
+                   f"volume>30x AV {pf.get('churn')}, month pnl<=0 {pf.get('pnl')}, "
                    f"vault {pf.get('vault')}); {checked}")
     else:
         typer.echo(f"prefilter: n/a (cached before the prefilter); {checked}")
+    pr = got.probe or {}
+    if pr:
+        rej = pr.get("rejected") or {}
+        why = (" (" + ", ".join(f"{k} {v}" for k, v in sorted(rej.items())) + ")") if rej else ""
+        extra = []
+        if pr.get("budget_exhausted"):
+            extra.append(f"probe budget {pr.get('budget')} exhausted")
+        if pr.get("rate_limited"):
+            extra.append("stopped: rate limited")
+        typer.echo(f"probe: {pr.get('probed')} probed ({pr.get('cached')} cached), "
+                   f"{sum(rej.values())} rejected{why}, {pr.get('accepted')} accepted"
+                   + ("; " + "; ".join(extra) if extra else ""))
 
 
 @app.command()

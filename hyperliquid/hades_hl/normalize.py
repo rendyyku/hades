@@ -98,7 +98,9 @@ def leverage_by_coin(clearinghouse_state: Mapping | None) -> dict[str, Decimal]:
 def sz_decimals_by_coin(meta: Mapping | None) -> dict[str, int]:
     """``{coin: szDecimals}`` from a ``meta`` response ({} if unavailable)."""
     out: dict[str, int] = {}
-    for u in (meta or {}).get("universe") or []:
+    if not isinstance(meta, Mapping):  # unavailable or an unexpected shape
+        return out
+    for u in meta.get("universe") or []:
         if u and u.get("name") is not None and u.get("szDecimals") is not None:
             out[u["name"]] = int(u["szDecimals"])
     return out

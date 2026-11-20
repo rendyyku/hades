@@ -398,7 +398,7 @@ class HLClient:
     async def user_fills_backward(
         self, addr: str, start_ms: int, end_ms: int | None = None,
         cap: int = FILLS_HISTORY_CAP, *, on_page: PageFn | None = None,
-        window_ms: int = BACKWARD_WINDOW_MS,
+        window_ms: int = BACKWARD_WINDOW_MS, max_requests: int | None = None,
     ) -> HLPage:
         """Fills of ``addr`` in ``[start_ms, end_ms]`` (default end: now), fetched
         NEWEST FIRST so a ``cap`` keeps the most recent fills (ruling P27).
@@ -420,16 +420,27 @@ class HLClient:
         a non-empty page brings no new fill (the API ignoring the window). Inclusive
         bounds; de-duplicated by ``tid``. ``on_page(new)`` after every kept page, newest
         window first.
+
+        Early exits (``max_requests``, default MAX_BACKWARD_REQUESTS, spent; or a stalled
+        window) leave ``[start_ms, hi]`` unfetched: ``cov_start = hi + 1`` (only what
+        was fetched is covered; empty when that is above ``end_ms``) and
+        ``truncated=True`` (history partial), ``capped=False``.
         """
         start_ms = int(start_ms)
         hi = int(end_ms) if end_ms is not None else int(time.time() * 1000)
         w = max(1, int(window_ms))
+        budget = MAX_BACKWARD_REQUESTS if max_requests is None else int(max_requests)
         out: list[dict] = []
         seen: set[int] = set()
-        capped = skipped_ms = False
-        for _ in range(MAX_BACKWARD_REQUESTS):
-            if hi < start_ms or capped:
+        capped = skipped_ms = early = False
+        n_req = 0
+        while hi >= start_ms and not capped:
+            if n_req >= budget:
+                log.warning("hl userFillsByTime %s: stopped after %d requests; coverage only "
+                            "down to %d; history marked truncated", addr, n_req, hi + 1)
+                early = True
                 break
+            n_req += 1
             lo = max(start_ms, hi - w + 1)
             page = await self._fills_window(addr, lo, hi)
             if len(page) >= FILLS_PAGE_LIMIT:
@@ -445,7 +456,9 @@ class HLClient:
             new = [f for f in page if f["tid"] not in seen]
             if page and not new:
                 log.warning("hl userFillsByTime %s: window [%d, %d] brought no new fills; "
-                            "stopping", addr, lo, hi)
+                            "stopping; coverage only down to %d; history marked truncated",
+                            addr, lo, hi, hi + 1)
+                early = True
                 break
             room = cap - len(out)
             if len(new) > room or (len(new) == room and lo > start_ms):
@@ -459,14 +472,22 @@ class HLClient:
             if len(page) < FILLS_PAGE_LIMIT // 2:
                 w *= 2
             hi = lo - 1
-        else:
-            log.warning("hl userFillsByTime %s: stopped after %d requests; history marked "
-                        "truncated", addr, MAX_BACKWARD_REQUESTS)
-            skipped_ms = True
-        cov_start = start_ms
         if capped:
             cov_start = min(int(f["time"]) for f in out) if out else hi + 1
-        return HLPage(out, truncated=capped or skipped_ms, capped=capped, cov_start=cov_start)
+        elif early:
+            cov_start = hi + 1
+        else:
+            cov_start = start_ms
+        return HLPage(out, truncated=capped or skipped_ms or early, capped=capped,
+                      cov_start=cov_start)
+
+    async def user_fills(self, addr: str) -> list[dict]:
+        """The latest <= 2000 fills of ``addr`` (``userFills``; one request). Used as the
+        cheap discovery activity probe (ruling P30)."""
+        page = await self._info({"type": "userFills", "user": addr})
+        if not isinstance(page, list):
+            raise HLError("info userFills: expected a list")
+        return page
 
     async def user_funding(
         self, addr: str, start_ms: int, end_ms: int | None = None, *,

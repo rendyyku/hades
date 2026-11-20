@@ -1,10 +1,12 @@
 """Discovery, backfill and rescore for the Hyperliquid head (spec 8.2).
 
 - :func:`discover`: leaderboard candidates (unofficial feed, see :mod:`hades_hl.client`),
-  prefiltered (ruling P29: account value >= 10k, 0 < month volume <= 200 x account
-  value, month PnL > 0, not a vault) and then ranked by the leaderboard's 30-day
-  ("month") PnL only to pick *who to backfill*; the real ranking is our own recomputed
-  score (:func:`rescore`). The leaderboard (~38 MB) is fetched at most once per 24 h:
+  prefiltered (ruling P29: account value >= 10k, 0 < month volume <= 30 x account
+  value (the P30 bot proxy), month PnL > 0, not a vault) and then ranked by the
+  leaderboard's 30-day ("month") PnL only to pick *who to backfill*; the real ranking
+  is our own recomputed score (:func:`rescore`). Each candidate, in ranked order, must
+  pass a one-request activity probe (ruling P30, :func:`probe_activity`) before it
+  is accepted. The leaderboard (~38 MB) is fetched at most once per 24 h:
   only the filtered candidate list is cached in ``kv``. Vaults come from the HL app's
   vault list (also cached 24 h).
 - :func:`backfill`: idempotent fills + funding import. Fills are fetched NEWEST FIRST
@@ -33,7 +35,13 @@ from sqlalchemy.orm import Session
 from hades_hl.client import FILLS_HISTORY_CAP, HLClient, HLError, HLRateLimited, HLUnavailable
 from hades_hl.db import Fill, Funding, Kv, Wallet, insert_fills, insert_funding, utcnow
 from hades_hl.normalize import sz_decimals_by_coin
-from hades_hl.scoring import is_bot, score_detailed
+from hades_hl.scoring import (
+    BOT_MAX_FILLS_PER_DAY,
+    BOT_MAX_MAKER_SHARE,
+    BOT_MIN_HOLD_S,
+    is_bot,
+    score_detailed,
+)
 from hades_hl.stats import wallet_stats
 
 log = logging.getLogger(__name__)
@@ -47,9 +55,15 @@ KV_SZ_DECIMALS = "hl:sz_decimals"
 LB_WINDOW = "month"  # the leaderboard's 30-day window
 KV_COV = "hl:cov:{}"  # per-address fills coverage (ruling P27)
 
-# discovery prefilter (ruling P29), applied before the cache cap
+# discovery prefilter (ruling P29; bot-proxy ceiling 30x per P30), before the cache cap
 MIN_ACCOUNT_VALUE = 10_000.0
-MAX_VLM_TO_ACCOUNT_VALUE = 200.0
+MAX_VLM_TO_ACCOUNT_VALUE = 30.0
+
+# discovery activity probe (ruling P30)
+KV_PROBE = "hl:probe:{}"  # per-address probe verdict, 24 h TTL
+PROBE_BUDGET_PER_LIMIT = 5  # at most 5 x limit probe requests per discover run
+PROBE_ACTIVE_DAYS = 30  # a sample with no fill in the last 30 days is inactive
+PROBE_OK = "ok"
 
 # stats_json keys that are metadata, not stats: kept across rescore
 META_KEYS = ("backfill", "leaderboard")
@@ -99,11 +113,13 @@ class Discovered(list):
     ``vaults_checked``: False when the vault list was unavailable with no cache (M6),
     so vaults may be among the candidates (they are flagged on a later successful run).
     ``prefilter``: the P29 counts (``before``, ``after`` and one count per exclusion).
+    ``probe``: the P30 activity-probe counts (see :func:`discover`).
     """
 
     error: str | None = None
     vaults_checked: bool = True
     prefilter: dict | None = None
+    probe: dict | None = None
 
 
 def _f(x: Any) -> float | None:
@@ -204,8 +220,8 @@ async def leaderboard_candidates(
         vaults = await vault_addresses(session, client, now)
     ranked = rank_candidates(rows)
     kept, counts = prefilter_candidates(ranked, vaults)
-    log.info("leaderboard: %d rows, %d unique candidates; prefilter (P29) %d -> %d "
-             "(excluded: account value<10k %d, no volume %d, volume>200x AV %d, "
+    log.info("leaderboard: %d rows, %d unique candidates; prefilter (P29/P30) %d -> %d "
+             "(excluded: account value<10k %d, no volume %d, volume>30x AV %d, "
              "month pnl<=0 %d, vault %d)%s", len(rows), len(ranked), counts["before"],
              counts["after"], counts["account_value"], counts["volume"], counts["churn"],
              counts["pnl"], counts["vault"],
@@ -249,12 +265,94 @@ async def vault_addresses(
     return VaultSet(vaults)
 
 
+# -- activity probe (ruling P30) ----------------------------------------------------
+
+def probe_verdict(addr: str, sample: list[dict], now: datetime,
+                  sz_decimals: dict[str, int] | None = None) -> dict:
+    """Bot/activity verdict from a ``userFills`` sample (the latest <= 2000 fills).
+
+    Checked in this order (the global bot rule, plus inactivity):
+
+    - ``inactive``: no fill in the last PROBE_ACTIVE_DAYS days (or no fill at all);
+    - ``fills_per_day``: fills / probe span > 300, the span being ``now - oldest fill``
+      (at least 1 day, so a burst of a few fills does not read as hyperactive);
+    - ``hold``: median hold of the closed positions seen in the sample < 60 s;
+    - ``maker_share``: share of perp fills with ``crossed == False`` > 70%;
+    - else ``ok``.
+
+    Hold and maker share come from :func:`wallet_stats` over the sample; if that
+    fails, only fills/day and a direct maker share are used.
+    """
+    now_ms = _ms(now)
+    times = [int(f["time"]) for f in sample if f.get("time") is not None]
+    res: dict[str, Any] = {"n": len(times), "newest": max(times) if times else None,
+                           "oldest": min(times) if times else None, "fills_per_day": None,
+                           "median_fills_per_day": None, "median_hold_s": None,
+                           "maker_share": None}
+    if not times or max(times) < now_ms - PROBE_ACTIVE_DAYS * DAY_MS:
+        return {**res, "verdict": "inactive"}
+    oldest = min(times)
+    span_days = max(now_ms - oldest, DAY_MS) / DAY_MS
+    res["fills_per_day"] = len(times) / span_days
+    try:
+        st = wallet_stats(
+            addr, sample, [], now, span_days + 1, history_partial=True,
+            oldest_fill_time=datetime.fromtimestamp(oldest / 1000, tz=timezone.utc),
+            sz_decimals=sz_decimals)
+        res.update(median_fills_per_day=st["median_fills_per_day"],
+                   median_hold_s=st["median_hold_s"], maker_share=st["maker_share"])
+    except Exception as e:  # noqa: BLE001 - odd sample: fall back to fills/day + maker
+        log.warning("probe %s: stats over the sample failed (%s); using fills/day and "
+                    "maker share only", addr, type(e).__name__)
+        res["maker_share"] = sum(1 for f in sample if f.get("crossed") is False) / len(sample)
+    if res["fills_per_day"] > BOT_MAX_FILLS_PER_DAY:
+        verdict = "fills_per_day"
+    elif res["median_hold_s"] is not None and res["median_hold_s"] < BOT_MIN_HOLD_S:
+        verdict = "hold"
+    elif res["maker_share"] is not None and res["maker_share"] > BOT_MAX_MAKER_SHARE:
+        verdict = "maker_share"
+    else:
+        verdict = PROBE_OK
+    return {**res, "verdict": verdict}
+
+
+def cached_probe(session: Session, addr: str, now: datetime | None = None) -> dict | None:
+    """The kv probe verdict of ``addr`` if < 24 h old, else None."""
+    c = kv_get_json(session, KV_PROBE.format(addr.lower()))
+    return c if _fresh(c, _ms(_now(now))) and isinstance(c.get("verdict"), str) else None
+
+
+async def probe_activity(session: Session, client: HLClient, addr: str,
+                         now: datetime | None = None,
+                         sz_decimals: dict[str, int] | None = None) -> dict:
+    """One ``userFills`` request -> :func:`probe_verdict`, stored in kv
+    ``hl:probe:{addr}`` (``fetched_at`` + the verdict fields). Check
+    :func:`cached_probe` first to honour the 24 h TTL. ``sz_decimals`` (ruling P28
+    chain tolerance; see :func:`load_sz_decimals`) defaults to the kv cache."""
+    now = _now(now)
+    addr = addr.lower()
+    sample = await client.user_fills(addr)
+    szd = sz_decimals
+    if szd is None:
+        cached = kv_get_json(session, KV_SZ_DECIMALS)
+        szd = dict(cached["sz_decimals"]) if isinstance(cached, dict) else None
+    res = {"fetched_at": _ms(now), **probe_verdict(addr, sample, now, szd)}
+    kv_set_json(session, KV_PROBE.format(addr), res)
+    session.commit()
+    return res
+
+
 async def discover(
     session: Session, client: HLClient, limit: int = 200, *, now: datetime | None = None
 ) -> Discovered:
-    """Top ``limit`` non-vault leaderboard candidates by month PnL, upserted into
-    ``wallets`` (leaderboard fields under ``stats_json['leaderboard']``, informational
-    only). Known wallets that turn out to be vaults get ``is_vault=True``.
+    """Up to ``limit`` non-vault leaderboard candidates, in month-PnL order, that pass
+    the activity probe (ruling P30), upserted into ``wallets`` (leaderboard fields
+    under ``stats_json['leaderboard']``, informational only). Rejected candidates are
+    not stored. Probing stops once ``limit`` are accepted or ``5 x limit`` probe
+    requests were spent (cached verdicts, < 24 h old, are free); on HLRateLimited it
+    stops and keeps what was accepted. ``Discovered.probe`` = ``{probed, cached,
+    accepted, rejected: {reason: n}, budget, budget_exhausted, rate_limited}``.
+    Known wallets that turn out to be vaults get ``is_vault=True``.
 
     If the leaderboard is unavailable (and uncached) this logs and returns an empty
     result with ``error`` set; the ``trades``-WS fallback is a later task.
@@ -278,6 +376,13 @@ async def discover(
             w.is_vault = True
             marked += 1
     skipped_vaults = 0
+    budget = PROBE_BUDGET_PER_LIMIT * limit
+    spent = 0
+    rejected: Counter = Counter()
+    pr: dict[str, Any] = {"probed": 0, "cached": 0, "accepted": 0, "rejected": {},
+                          "budget": budget, "budget_exhausted": False, "rate_limited": False}
+    out.probe = pr
+    szd: dict[str, int] | None = None  # loaded (meta, cached 24 h) before the 1st probe
     for c in cands:
         addr = c["address"]
         if addr in vaults:  # cached before the vault list was available
@@ -285,6 +390,32 @@ async def discover(
             continue
         if len(out) >= limit:
             break
+        probe = cached_probe(session, addr, now)
+        if probe is not None:
+            pr["cached"] += 1
+        else:
+            if spent >= budget:
+                pr["budget_exhausted"] = True
+                break
+            spent += 1
+            try:
+                if szd is None:
+                    szd = await load_sz_decimals(session, client, now)
+                probe = await probe_activity(session, client, addr, now, szd)
+            except HLRateLimited:
+                pr["rate_limited"] = True
+                log.warning("discover: rate limited while probing; keeping %d accepted",
+                            len(out))
+                break
+            except HLError as e:
+                pr["probed"] += 1
+                rejected["error"] += 1
+                log.warning("discover: probe %s failed (%s); skipped", addr, type(e).__name__)
+                continue
+        pr["probed"] += 1
+        if probe["verdict"] != PROBE_OK:
+            rejected[probe["verdict"]] += 1
+            continue
         out.append(addr)
         lb = {k: v for k, v in c.items() if k != "address"}
         w = existing.get(addr)
@@ -292,10 +423,15 @@ async def discover(
             session.add(Wallet(address=addr, stats_json={"leaderboard": lb}))
         else:
             w.stats_json = {**(w.stats_json or {}), "leaderboard": lb}
+    pr["accepted"] = len(out)
+    pr["rejected"] = dict(rejected)
     session.commit()
     log.info("discover: %d candidates (%d cached vaults skipped, %d known wallets marked "
-             "as vaults)%s", len(out), skipped_vaults, marked,
-             "" if out.vaults_checked else "; vault list NOT checked")
+             "as vaults)%s; probe: %d probed (%d cached), rejected %s, %d accepted%s",
+             len(out), skipped_vaults, marked,
+             "" if out.vaults_checked else "; vault list NOT checked", pr["probed"],
+             pr["cached"], pr["rejected"] or "{}", len(out),
+             "; probe budget exhausted" if pr["budget_exhausted"] else "")
     return out
 
 
@@ -353,7 +489,13 @@ async def backfill(
     kept, the coverage is NOT advanced, ``last_error="rate_limited"`` is recorded and
     the error re-raised. ``stats_json['backfill']['history_partial']`` = the coverage
     start was set by the cap (or a same-ms overflow was seen).
-    Funding resumes from the max stored funding ``time`` (else ``now - days``).
+    A segment that stops short of its start (cap, or the pager's early exit) restarts
+    the coverage at what was fetched (``capped=True``; empty if nothing was).
+    Funding (ruling P31) is fetched only over the fills coverage ``[cov_start,
+    cov_end]``, for the segment just fetched: it resumes from ``backfill.funding_end``
+    (recorded only after a complete funding read, so a 429 mid-funding is retried; the
+    max stored funding ``time`` for legacy rows), never before ``cov_start``. No funding
+    request when the coverage is empty.
     """
     addr = addr.lower()
     now_dt = _now(now)
@@ -378,26 +520,51 @@ async def backfill(
 
     meta = (w.stats_json or {}).get("backfill") or {}
     same_ms = bool(meta.get("same_ms_overflow")) if cov is not None else False
+    fund = None
     try:
         seg_start = floor if cov is None else cov["end"]
         fpage = await client.user_fills_backward(addr, seg_start, now_ms, on_page=on_fills)
         same_ms = same_ms or (fpage.truncated and not fpage.capped)
-        if cov is None or fpage.capped:
-            cov = {"start": fpage.cov_start, "end": now_ms, "capped": fpage.capped}
+        # the segment's coverage stops short of seg_start: capped, or an early exit
+        # (request budget / stalled window; ruling r2): the coverage restarts there
+        short = fpage.capped or fpage.cov_start > seg_start
+        fund_start = None  # funding is fetched over the coverage only (ruling P31)
+        extended = False
+        if cov is None or short:
+            cov = {"start": fpage.cov_start, "end": now_ms, "capped": short}
+            fund_start = cov["start"]
         else:
+            fund_start = cov["end"]
             cov = {**cov, "end": now_ms}
             if not cov["capped"] and cov["start"] > floor:  # more days than before
                 older = await client.user_fills_backward(
                     addr, floor, cov["start"], FILLS_HISTORY_CAP, on_page=on_fills)
                 same_ms = same_ms or (older.truncated and not older.capped)
-                cov = {"start": older.cov_start, "end": now_ms, "capped": older.capped}
+                o_short = older.capped or older.cov_start > floor
+                cov = {"start": older.cov_start, "end": now_ms, "capped": o_short}
+                fund_start = cov["start"]
+                extended = True
         truncated = fpage.truncated or cov["capped"]
         kv_set_json(session, KV_COV.format(addr), cov)
         _set_backfill_meta(w, history_partial=cov["capped"] or same_ms,
                            same_ms_overflow=same_ms)
         session.commit()
-        fund = await client.user_funding(
-            addr, last_fund if last_fund is not None else floor, on_page=on_funding)
+        # resume where the funding coverage ended (set only after a successful funding
+        # read, so a 429 during funding is retried next run), never before cov_start;
+        # an older-days extension refetches from the new cov_start
+        f_end = meta.get("funding_end")
+        if not extended:
+            if isinstance(f_end, int):
+                fund_start = min(fund_start, f_end)
+            elif last_fund is not None:  # legacy rows without funding_end
+                fund_start = min(fund_start, last_fund)
+            else:  # funding never completed: the whole coverage
+                fund_start = cov["start"]
+        fund_start = max(fund_start, cov["start"])
+        if cov["start"] <= cov["end"]:
+            fund = await client.user_funding(addr, fund_start, cov["end"], on_page=on_funding)
+        else:
+            log.info("backfill %s: empty fills coverage; no funding fetched", addr)
     except HLRateLimited:
         session.rollback()
         _set_backfill_meta(w, last_error="rate_limited", attempted_at=now_dt.isoformat())
@@ -405,10 +572,12 @@ async def backfill(
         log.warning("backfill %s: rate limited; kept %d new fills, %d new funding rows",
                     addr, counts["fills"], counts["funding"])
         raise
-    _set_backfill_meta(w, funding_partial=fund.truncated, last_error=None,
-                       backfilled_at=now_dt.isoformat(), days=days)
+    fund_trunc = bool(fund.truncated) if fund is not None else False
+    extra = {"funding_end": cov["end"]} if fund is not None and not fund_trunc else {}
+    _set_backfill_meta(w, funding_partial=fund_trunc, last_error=None,
+                       backfilled_at=now_dt.isoformat(), days=days, **extra)
     session.commit()
-    return BackfillResult(counts["fills"], truncated, counts["funding"], fund.truncated)
+    return BackfillResult(counts["fills"], truncated, counts["funding"], fund_trunc)
 
 
 # -- rescore -------------------------------------------------------------------------
@@ -538,6 +707,7 @@ def rescore(
 
 __all__ = [
     "BackfillResult", "Discovered", "RescoreResult", "VaultSet", "backfill", "discover",
-    "get_coverage", "leaderboard_candidates", "load_sz_decimals", "prefilter_candidates",
+    "cached_probe", "get_coverage", "leaderboard_candidates", "load_sz_decimals",
+    "prefilter_candidates", "probe_activity", "probe_verdict",
     "rescore", "stored_fills", "stored_funding", "utcnow", "vault_addresses",
 ]

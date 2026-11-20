@@ -30,8 +30,15 @@ hades-hl rescore
   one transaction.
 - Backfill fetches fills newest first and records the contiguous covered range in kv
   `hl:cov:<address>`; stats use only that range. Wallets with more than 10,000 fills
-  in the window are capped (`history_partial`), keeping the newest 10,000.
-- Discovery prefilters the leaderboard (account value >= 10k, 0 < month volume <= 200 x
+  in the window are capped (`history_partial`), keeping the newest 10,000. If the
+  pager stops early (request budget, or a window that brings nothing new) the coverage
+  starts where fetching stopped and the history is marked partial. Funding is fetched
+  only over the fills coverage.
+- Discovery prefilters the leaderboard (account value >= 10k, 0 < month volume <= 30 x
   account value, month PnL > 0, not a vault) before ranking by month PnL. If the vault
   list is unavailable and uncached, `discover` says `vaults checked: no`; vaults are
   flagged on the next successful run and are never scored.
+- Each candidate then gets a one-request activity probe (`userFills`, latest <= 2000
+  fills), cached 24 h in kv `hl:probe:<address>`. It is rejected if it has no fill in
+  30 days, or if fills/day > 300, median hold < 60 s or maker share > 70% (the bot
+  rule). Probing stops at `--limit` accepted or 5 x `--limit` probe requests.

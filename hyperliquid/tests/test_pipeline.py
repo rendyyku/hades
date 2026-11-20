@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from hades_hl import pipeline
 from hades_hl.client import HLClient, HLRateLimited
 from hades_hl.db import Fill, Funding, Kv, Wallet, init_db, insert_fills, make_engine
-from hlfills import DAY_MS, FakeFillsAPI, mk
+from hlfills import DAY_MS, FakeFillsAPI, mk, round_trip
 
 INFO = "https://api.hyperliquid.xyz/info"
 LB = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
@@ -83,13 +83,26 @@ def funding_row(t: int, coin: str = "BTC", usdc: str = "-0.5") -> dict:
                                                 "szi": "1", "fundingRate": "0.0001"}}
 
 
+def human_sample(now_ms: int = NOW_MS, days: int = 20, per_day: int = 2) -> list[dict]:
+    """A human-looking ``userFills`` sample: a few 1 h round trips a day, takers."""
+    out: list[dict] = []
+    for d in range(days):
+        for k in range(per_day):
+            out += round_trip("BTC", now_ms - (d + 1) * DAY_MS + k * 4 * 3_600_000,
+                              3_600_000, "5")
+    return out
+
+
 def sim_router(fills: dict[str, FakeFillsAPI] | None = None, funding=None, meta=None,
-               fail_after: int | None = None):
+               fail_after: int | None = None, probes: dict[str, list] | None = None,
+               probe_calls: list | None = None):
     """respx side effect: ``userFillsByTime`` served by per-address FakeFillsAPIs
-    (HL semantics), ``userFunding`` from ``{addr: rows}``. After ``fail_after``
-    requests every request gets HTTP 429."""
+    (HL semantics), ``userFunding`` from ``{addr: rows}`` (inclusive bounds),
+    ``userFills`` (the discovery probe) from ``probes`` (default: a human sample).
+    After ``fail_after`` requests every request gets HTTP 429."""
     fills = fills or {}
     funding = funding or {}
+    probes = probes or {}
     n = [0]
 
     def handler(request):
@@ -102,8 +115,15 @@ def sim_router(fills: dict[str, FakeFillsAPI] | None = None, funding=None, meta=
             api = fills.get(body["user"]) or FakeFillsAPI()
             return httpx.Response(200, json=api.query(body["startTime"], body.get("endTime")))
         if t == "userFunding":
-            rows = [r for r in funding.get(body["user"], []) if r["time"] >= body["startTime"]]
+            end = body.get("endTime")
+            rows = [r for r in funding.get(body["user"], []) if r["time"] >= body["startTime"]
+                    and (end is None or r["time"] <= end)]
             return httpx.Response(200, json=rows)
+        if t == "userFills":
+            if probe_calls is not None:
+                probe_calls.append(body["user"])
+            sample = probes.get(body["user"])
+            return httpx.Response(200, json=human_sample() if sample is None else sample)
         if t == "meta":
             return httpx.Response(200, json=meta)
         raise AssertionError(t)  # pragma: no cover
@@ -130,6 +150,7 @@ async def test_discover_dedupes_ranks_and_excludes_vaults(session):
             lb_row(V, "999"), lb_row(C, "10"), lb_row(B, "300")]
     respx.get(LB).mock(return_value=httpx.Response(200, json={"leaderboardRows": rows}))
     respx.get(VAULTS).mock(return_value=httpx.Response(200, json=[vault_row(V)]))
+    respx.post(INFO).mock(side_effect=sim_router())
     async with make_client() as c:
         got = await pipeline.discover(session, c, limit=2, now=NOW)
     assert list(got) == [B, A]  # by month pnl, vault skipped, deduped case-insensitively
@@ -152,14 +173,15 @@ async def test_discover_prefilter_excludes_each_reason_before_cache_cap(
         # would leave the cache full of them
         lb_row(low_av, "9000000", account_value="9999.99"),
         lb_row(no_vlm, "8000000", vlm="0"),
-        lb_row(churn, "7000000", account_value="20000", vlm="4000001"),  # > 200 x AV
+        lb_row(churn, "7000000", account_value="20000", vlm="600001"),  # > 30 x AV (P30)
         lb_row(V, "6000000"),
         lb_row(loser, "-5"),
         lb_row(g1, "500"), lb_row(g2, "400"), lb_row(g3, "300"),
-        lb_row(edge, "10", account_value="10000", vlm="2000000"),  # boundaries are kept
+        lb_row(edge, "10", account_value="10000", vlm="300000"),  # boundaries are kept
     ]
     respx.get(LB).mock(return_value=httpx.Response(200, json={"leaderboardRows": rows}))
     respx.get(VAULTS).mock(return_value=httpx.Response(200, json=[vault_row(V)]))
+    respx.post(INFO).mock(side_effect=sim_router())
     async with make_client() as c:
         with caplog.at_level(logging.INFO, logger="hades_hl.pipeline"):
             got = await pipeline.discover(session, c, limit=10, now=NOW)
@@ -179,6 +201,7 @@ async def test_discover_caches_candidates_not_raw_body_for_24h(session):
     lb = respx.get(LB).mock(return_value=httpx.Response(
         200, json={"leaderboardRows": [lb_row(A, "5"), lb_row(B, "7")]}))
     vr = respx.get(VAULTS).mock(return_value=httpx.Response(200, json=[]))
+    respx.post(INFO).mock(side_effect=sim_router())
     async with make_client() as c:
         await pipeline.discover(session, c, limit=5, now=NOW)
         await pipeline.discover(session, c, limit=5, now=NOW + timedelta(hours=23))
@@ -207,6 +230,7 @@ async def test_discover_vault_list_unavailable_still_discovers_unchecked(session
     respx.get(LB).mock(return_value=httpx.Response(
         200, json={"leaderboardRows": [lb_row(A, "5")]}))
     respx.get(VAULTS).mock(return_value=httpx.Response(503))
+    respx.post(INFO).mock(side_effect=sim_router())
     async with make_client(max_attempts=1) as c:
         with caplog.at_level("WARNING", logger="hades_hl.pipeline"):
             got = await pipeline.discover(session, c, limit=5, now=NOW)
@@ -225,6 +249,7 @@ async def test_discover_marks_existing_wallet_as_vault(session):
     respx.get(LB).mock(return_value=httpx.Response(
         200, json={"leaderboardRows": [lb_row(V, "5"), lb_row(A, "1")]}))
     respx.get(VAULTS).mock(return_value=httpx.Response(200, json=[vault_row(V), vault_row(V2)]))
+    respx.post(INFO).mock(side_effect=sim_router())
     async with make_client() as c:
         got = await pipeline.discover(session, c, limit=5, now=NOW)
     assert list(got) == [A]
@@ -251,7 +276,8 @@ async def test_backfill_rerun_inserts_zero(session):
     assert cov(session, A) == {"start": NOW_MS - 30 * DAY_MS, "end": NOW_MS, "capped": False}
     bodies = [json.loads(call.request.content) for call in route.calls]
     fund_bodies = [b for b in bodies if b["type"] == "userFunding"]
-    assert fund_bodies[1]["startTime"] == fund[-1]["time"]
+    assert fund_bodies[0]["startTime"] == NOW_MS - 30 * DAY_MS  # P31: cov_start
+    assert fund_bodies[1]["startTime"] == NOW_MS  # rerun: the segment [cov_end, now]
     assert n_fills(session) == 10
     assert session.scalar(select(func.count()).select_from(Funding)) == 3
     assert session.get(Wallet, A).stats_json["backfill"]["history_partial"] is False
@@ -460,3 +486,201 @@ def test_rescore_uses_coverage_window(session, monkeypatch):
     assert w.stats_json["window_days"] == pytest.approx(10.0)  # now - cov_start
     assert w.stats_json["trades"] == 80  # the ETH fill outside the coverage is ignored
     assert w.stats_json["history_partial"] is True
+
+
+# -- round 2 / P30: activity probe ---------------------------------------------------
+
+def lb_route(*rows):
+    respx.get(LB).mock(return_value=httpx.Response(200, json={"leaderboardRows": list(rows)}))
+    respx.get(VAULTS).mock(return_value=httpx.Response(200, json=[]))
+
+
+def hfmt(i: int) -> str:
+    return "0x" + f"{i:02x}" * 20
+
+
+def bot_hft_sample() -> list[dict]:  # 2000 fills in the last ~33 min
+    return [fill(i, NOW_MS - 2_000_000 + i * 1000) for i in range(2000)]
+
+
+def bot_maker_sample() -> list[dict]:  # human pace and holds, but all maker fills
+    out: list[dict] = []
+    for d in range(20):
+        out += round_trip("BTC", NOW_MS - (d + 1) * DAY_MS, 3_600_000, "5", crossed=False)
+    return out
+
+
+def bot_hold_sample() -> list[dict]:  # human pace, takers, 10 s holds
+    out: list[dict] = []
+    for d in range(20):
+        out += round_trip("BTC", NOW_MS - (d + 1) * DAY_MS, 10_000, "5")
+    return out
+
+
+@respx.mock
+async def test_discover_probe_rejects_bot_shapes_accepts_human(session):
+    hft, maker, hold, human = hfmt(0x31), hfmt(0x32), hfmt(0x33), hfmt(0x34)
+    lb_route(lb_row(hft, "400"), lb_row(maker, "300"), lb_row(hold, "200"),
+             lb_row(human, "100"))
+    calls: list[str] = []
+    respx.post(INFO).mock(side_effect=sim_router(probes={
+        hft: bot_hft_sample(), maker: bot_maker_sample(), hold: bot_hold_sample(),
+        human: human_sample()}, probe_calls=calls))
+    async with make_client() as c:
+        got = await pipeline.discover(session, c, limit=5, now=NOW)
+    assert list(got) == [human]
+    assert calls == [hft, maker, hold, human]  # ranked order
+    assert got.probe["probed"] == 4 and got.probe["accepted"] == 1
+    assert got.probe["rejected"] == {"fills_per_day": 1, "maker_share": 1, "hold": 1}
+    assert set(session.scalars(select(Wallet.address))) == {human}  # rejects not stored
+    p = pipeline.kv_get_json(session, f"hl:probe:{hft}")
+    assert p["verdict"] == "fills_per_day" and p["fills_per_day"] > 300
+    p = pipeline.kv_get_json(session, f"hl:probe:{human}")
+    assert p["verdict"] == "ok" and p["median_hold_s"] == 3600.0 and p["maker_share"] == 0.0
+
+
+@respx.mock
+async def test_discover_probe_rejects_inactive(session):
+    stale, empty, human = hfmt(0x41), hfmt(0x42), hfmt(0x43)
+    lb_route(lb_row(stale, "300"), lb_row(empty, "200"), lb_row(human, "100"))
+    respx.post(INFO).mock(side_effect=sim_router(probes={
+        stale: human_sample(NOW_MS - 31 * DAY_MS), empty: []}))
+    async with make_client() as c:
+        got = await pipeline.discover(session, c, limit=5, now=NOW)
+    assert list(got) == [human]
+    assert got.probe["rejected"] == {"inactive": 2}
+
+
+@respx.mock
+async def test_discover_probe_budget_is_5x_limit(session):
+    bots = [hfmt(0x50 + i) for i in range(8)]
+    lb_route(*(lb_row(a, str(100 - i)) for i, a in enumerate(bots)))
+    calls: list[str] = []
+    respx.post(INFO).mock(side_effect=sim_router(
+        probes={a: bot_hft_sample() for a in bots}, probe_calls=calls))
+    async with make_client() as c:
+        got = await pipeline.discover(session, c, limit=1, now=NOW)
+    assert list(got) == []
+    assert calls == bots[:5]
+    assert got.probe["probed"] == 5 and got.probe["budget_exhausted"] is True
+
+
+@respx.mock
+async def test_discover_probe_stops_once_limit_accepted(session):
+    addrs = [hfmt(0x60 + i) for i in range(4)]
+    lb_route(*(lb_row(a, str(100 - i)) for i, a in enumerate(addrs)))
+    calls: list[str] = []
+    respx.post(INFO).mock(side_effect=sim_router(probe_calls=calls))
+    async with make_client() as c:
+        got = await pipeline.discover(session, c, limit=2, now=NOW)
+    assert list(got) == addrs[:2] and calls == addrs[:2]
+
+
+@respx.mock
+async def test_discover_probe_cached_24h(session):
+    a, b = hfmt(0x71), hfmt(0x72)
+    lb_route(lb_row(a, "200"), lb_row(b, "100"))
+    calls: list[str] = []
+    respx.post(INFO).mock(side_effect=sim_router(probes={b: bot_hft_sample()},
+                                                 probe_calls=calls))
+    async with make_client() as c:
+        g1 = await pipeline.discover(session, c, limit=5, now=NOW)
+        g2 = await pipeline.discover(session, c, limit=5, now=NOW + timedelta(hours=23))
+        assert len(calls) == 2  # second run: both verdicts from kv
+        assert list(g1) == list(g2) == [a]
+        assert g2.probe["cached"] == 2 and g2.probe["rejected"] == {"fills_per_day": 1}
+        await pipeline.discover(session, c, limit=5, now=NOW + timedelta(hours=25))
+    assert len(calls) == 4
+
+
+# -- round 2 / P31: funding over the fills coverage only ----------------------------
+
+@respx.mock
+async def test_backfill_funding_only_over_coverage(session):
+    fills = [fill(i, NOW_MS - 15_000 * 10_000 + i * 10_000) for i in range(15_000)]
+    fund = [funding_row(NOW_MS - 30 * DAY_MS + k * 3_600_000) for k in range(30 * 24)]
+    route = respx.post(INFO).mock(side_effect=sim_router({A: FakeFillsAPI(fills)}, {A: fund}))
+    async with make_client() as c:
+        await pipeline.backfill(session, c, A, days=30, now=NOW)
+    c0 = cov(session, A)
+    assert c0["capped"] is True
+    fb = [json.loads(x.request.content) for x in route.calls]
+    fb = [b for b in fb if b["type"] == "userFunding"]
+    assert fb and all(b["startTime"] >= c0["start"] for b in fb)
+    assert all(b["endTime"] == c0["end"] for b in fb)
+    times = list(session.scalars(select(Funding.time).where(Funding.address == A)))
+    assert times and min(times) >= c0["start"]
+    assert len(times) == sum(1 for r in fund if c0["start"] <= r["time"] <= NOW_MS)
+
+
+@respx.mock
+async def test_backfill_no_funding_call_when_coverage_empty(session, monkeypatch):
+    from hades_hl import client as client_mod
+    monkeypatch.setattr(client_mod, "MAX_BACKWARD_REQUESTS", 0)
+    route = respx.post(INFO).mock(side_effect=sim_router(
+        {A: FakeFillsAPI([fill(0, NOW_MS - DAY_MS)])}, {A: [funding_row(NOW_MS - DAY_MS)]}))
+    async with make_client() as c:
+        r = await pipeline.backfill(session, c, A, days=30, now=NOW)
+    types = [json.loads(x.request.content)["type"] for x in route.calls]
+    assert "userFunding" not in types
+    c0 = cov(session, A)
+    assert c0["start"] > c0["end"]  # empty
+    assert r.new_funding == 0 and r.truncated is True
+    assert session.get(Wallet, A).stats_json["backfill"]["history_partial"] is True
+
+
+@respx.mock
+async def test_backfill_early_exit_records_only_fetched_coverage(session, monkeypatch):
+    from hades_hl import client as client_mod
+    monkeypatch.setattr(client_mod, "MAX_BACKWARD_REQUESTS", 2)
+    api = FakeFillsAPI([fill(0, NOW_MS - 10 * DAY_MS), fill(2, NOW_MS - 600_000)])
+    respx.post(INFO).mock(side_effect=sim_router({A: api}))
+    async with make_client() as c:
+        r = await pipeline.backfill(session, c, A, days=30, now=NOW)
+    assert r.new_fills == 1 and r.truncated is True
+    assert cov(session, A)["start"] == NOW_MS - 3 * 3_600_000 + 1
+    assert session.get(Wallet, A).stats_json["backfill"]["history_partial"] is True
+
+
+@respx.mock
+async def test_backfill_429_during_funding_is_refetched_next_run(session):
+    t0 = NOW_MS - 5 * DAY_MS
+    fund = [funding_row(t0 + 3_600_000 * k) for k in range(3)]
+    inner = sim_router({A: FakeFillsAPI([fill(0, t0)])}, {A: fund})
+    fail = [True]
+
+    def handler(request):
+        if fail[0] and json.loads(request.content)["type"] == "userFunding":
+            return httpx.Response(429)
+        return inner(request)
+
+    route = respx.post(INFO).mock(side_effect=handler)
+    later = NOW + timedelta(hours=1)
+    async with make_client(max_attempts=1) as c:
+        with pytest.raises(HLRateLimited):
+            await pipeline.backfill(session, c, A, days=30, now=NOW)
+        fail[0] = False
+        r = await pipeline.backfill(session, c, A, days=30, now=later)
+    assert r.new_funding == 3
+    fb = [json.loads(x.request.content) for x in route.calls]
+    fb = [b for b in fb if b["type"] == "userFunding"]
+    assert fb[-1]["startTime"] == NOW_MS - 30 * DAY_MS
+    assert session.get(Wallet, A).stats_json["backfill"]["funding_end"] == NOW_MS + 3_600_000
+
+
+@respx.mock
+async def test_discover_probe_loads_sz_decimals_once(session, monkeypatch):
+    a, b = hfmt(0x81), hfmt(0x82)
+    lb_route(lb_row(a, "200"), lb_row(b, "100"))
+    meta = {"universe": [{"name": "BTC", "szDecimals": 5}]}
+    route = respx.post(INFO).mock(side_effect=sim_router(meta=meta))
+    seen: list = []
+    real = pipeline.probe_verdict
+    monkeypatch.setattr(pipeline, "probe_verdict",
+                        lambda addr, sample, now, szd=None: seen.append(szd) or real(
+                            addr, sample, now, szd))
+    async with make_client() as c:
+        await pipeline.discover(session, c, limit=5, now=NOW)
+    types = [json.loads(x.request.content)["type"] for x in route.calls]
+    assert types.count("meta") == 1
+    assert seen == [{"BTC": 5}, {"BTC": 5}]  # the P28 chain tolerance reaches the probe
