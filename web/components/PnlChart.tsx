@@ -1,7 +1,6 @@
 "use client";
 
 import {
-  ColorType,
   createChart,
   LastPriceAnimationMode,
   LineSeries,
@@ -10,11 +9,9 @@ import {
 } from "lightweight-charts";
 import { useEffect, useId, useMemo, useRef } from "react";
 import type { PnlPoint } from "@/lib/api";
+import { buildChartOptions, CHART_HEIGHT_PX } from "@/lib/chartOptions";
 import { formatSol } from "@/lib/format";
 import { toChartPoints } from "@/lib/pnl";
-
-/** Space (px) kept free left of the first point so the TradingView logo never covers it. */
-const LEFT_GUTTER_PX = 24;
 
 function cssVar(name: string): string {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -35,24 +32,10 @@ export function PnlChart({ curve }: { curve: PnlPoint[] }) {
     const border = cssVar("--border");
     const line = cssVar(final >= 0 ? "--gain" : "--loss");
 
-    const chart = createChart(el, {
-      autoSize: true,
-      height: 260,
-      layout: {
-        background: { type: ColorType.Solid, color: "transparent" },
-        textColor: muted,
-        fontFamily: getComputedStyle(el).fontFamily,
-        fontSize: 12,
-        // TradingView attribution stays ON (license); it remains a normal named link.
-        attributionLogo: true,
-      },
-      grid: { vertLines: { color: border }, horzLines: { color: border } },
-      rightPriceScale: { borderColor: border },
-      timeScale: { borderColor: border, timeVisible: true, secondsVisible: false },
-      crosshair: { vertLine: { color: muted }, horzLine: { color: muted } },
-      // No inertia/kinetic scrolling: nothing animates (reduced-motion safe by default).
-      kineticScroll: { mouse: false, touch: false },
-    });
+    // Logo clearance comes from rightPriceScale.scaleMargins.bottom (see lib/chartOptions):
+    // the lowest point stays above the logo band at any width, zoom or pan, so no
+    // horizontal gutter is needed (and none can be lost on resize).
+    const chart = createChart(el, buildChartOptions({ muted, border, fontFamily: getComputedStyle(el).fontFamily }));
     const series = chart.addSeries(LineSeries, {
       color: line,
       lineWidth: 2,
@@ -61,18 +44,8 @@ export function PnlChart({ curve }: { curve: PnlPoint[] }) {
     });
     series.setData(points.map((p) => ({ time: p.time as UTCTimestamp, value: p.value }) satisfies LineData));
 
-    const ts = chart.timeScale();
-    ts.fitContent();
-    // Widen the visible range so ~24px stay empty left of the first point (logo gutter).
-    const frame = requestAnimationFrame(() => {
-      const range = ts.getVisibleLogicalRange();
-      const width = ts.width();
-      if (!range || width <= 0) return;
-      const barsPerPx = (range.to - range.from) / width;
-      ts.setVisibleLogicalRange({ from: range.from - LEFT_GUTTER_PX * barsPerPx, to: range.to });
-    });
+    chart.timeScale().fitContent();
     return () => {
-      cancelAnimationFrame(frame);
       chart.remove();
     };
   }, [points, final]);
@@ -91,7 +64,7 @@ export function PnlChart({ curve }: { curve: PnlPoint[] }) {
         }, ending at ${formatSol(final)}`}
       </figcaption>
       {/* Canvas host: no role, so the TradingView attribution link inside stays a normal link. */}
-      <div ref={ref} className="h-[260px] w-full font-mono" />
+      <div ref={ref} className="w-full font-mono" style={{ height: CHART_HEIGHT_PX }} />
     </figure>
   );
 }

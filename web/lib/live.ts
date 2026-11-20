@@ -23,6 +23,11 @@ export function parseAlertEvent(data: string): AlertRow | null {
   } catch {
     return null;
   }
+  return toAlertRow(v);
+}
+
+/** Validate one decoded value as an AlertRow (null if it is not AlertRow-shaped). */
+function toAlertRow(v: unknown): AlertRow | null {
   if (!v || typeof v !== "object") return null;
   const o = v as Record<string, unknown>;
   const str = (k: string) => typeof o[k] === "string";
@@ -46,4 +51,20 @@ export function mergeAlerts(existing: AlertRow[], incoming: AlertRow[], cap: num
   for (const a of existing) byId.set(a.id, a);
   for (const a of incoming) byId.set(a.id, a);
   return [...byId.values()].sort((a, b) => b.id - a.id).slice(0, Math.max(0, cap));
+}
+
+/** Parse a decoded /api/alerts JSON body: keeps the AlertRow-shaped items, [] for non-arrays. */
+export function parseAlertList(data: unknown): AlertRow[] {
+  if (!Array.isArray(data)) return [];
+  return data.map(toAlertRow).filter((a): a is AlertRow => a !== null);
+}
+
+/** "N new" for alerts received while paused; "cap+ new" once more arrived than the buffer keeps. */
+export function pausedNewLabel(received: number, cap: number = FEED_CAP): string {
+  return received > cap ? `${cap}+ new` : `${received} new`;
+}
+
+/** Backfill missed alerts on every (re)open except the very first one (the server render covers it). */
+export function shouldBackfill(previousOpens: number): boolean {
+  return previousOpens > 0;
 }

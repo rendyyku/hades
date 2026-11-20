@@ -4,7 +4,7 @@ import { Pause, Play } from "lucide-react";
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { AlertRow } from "@/lib/api";
-import { mergeAlerts, parseAlertEvent } from "@/lib/live";
+import { mergeAlerts, parseAlertEvent, parseAlertList, pausedNewLabel, shouldBackfill } from "@/lib/live";
 import { AlertTable } from "./AlertTable";
 import { LiveBadge } from "./LiveBadge";
 
@@ -12,6 +12,7 @@ const TICK_MS = 5_000;
 const ANNOUNCE_DEBOUNCE_MS = 1_500;
 const RETRY_MIN_MS = 2_000;
 const RETRY_MAX_MS = 30_000;
+const BACKFILL_URL = "/api/alerts?limit=50";
 
 const BTN =
   "inline-flex min-h-11 cursor-pointer items-center gap-2 rounded-lg border px-4 text-sm transition-colors duration-200";
@@ -27,6 +28,8 @@ function plural(n: number, word: string) {
 export function LiveFeed({ initial }: { initial: AlertRow[] }) {
   const [alerts, setAlerts] = useState<AlertRow[]>(() => mergeAlerts([], initial));
   const [buffer, setBuffer] = useState<AlertRow[]>([]);
+  // True number of alerts received while paused (the buffer itself is capped at 200).
+  const [pausedCount, setPausedCount] = useState(0);
   const [paused, setPaused] = useState(false);
   const [connected, setConnected] = useState(false);
   const [lastEventAt, setLastEventAt] = useState<number | null>(null);
@@ -62,12 +65,31 @@ export function LiveFeed({ initial }: { initial: AlertRow[] }) {
     let retry: ReturnType<typeof setTimeout> | null = null;
     let backoff = RETRY_MIN_MS;
     let disposed = false;
+    let opens = 0;
+
+    // After a reconnect, fetch what was missed while disconnected (same-origin proxy;
+    // the key stays on the server). Failures are ignored: the live stream continues.
+    const backfill = async () => {
+      try {
+        const res = await fetch(BACKFILL_URL, { cache: "no-store" });
+        if (!res.ok || disposed) return;
+        const rows = parseAlertList(await res.json());
+        if (disposed || rows.length === 0) return;
+        if (pausedRef.current) setBuffer((b) => mergeAlerts(b, rows));
+        else setAlerts((a) => mergeAlerts(a, rows));
+      } catch {
+        /* ignore */
+      }
+    };
 
     const connect = () => {
       es = new EventSource("/api/stream");
       es.onopen = () => {
         setConnected(true);
         backoff = RETRY_MIN_MS;
+        // The first open is covered by the server-rendered list; every reopen backfills.
+        if (shouldBackfill(opens)) void backfill();
+        opens += 1;
       };
       es.onerror = () => {
         setConnected(false);
@@ -84,8 +106,10 @@ export function LiveFeed({ initial }: { initial: AlertRow[] }) {
         setLastEventAt(Date.now());
         const row = parseAlertEvent((ev as MessageEvent<string>).data);
         if (!row) return;
-        if (pausedRef.current) setBuffer((b) => mergeAlerts(b, [row]));
-        else setAlerts((a) => mergeAlerts(a, [row]));
+        if (pausedRef.current) {
+          setBuffer((b) => mergeAlerts(b, [row]));
+          setPausedCount((n) => n + 1);
+        } else setAlerts((a) => mergeAlerts(a, [row]));
         announce();
       });
     };
@@ -104,6 +128,7 @@ export function LiveFeed({ initial }: { initial: AlertRow[] }) {
     setPaused(false);
     setAlerts((a) => mergeAlerts(a, buffer));
     setBuffer([]);
+    setPausedCount(0);
   }
 
   function togglePause() {
@@ -111,6 +136,7 @@ export function LiveFeed({ initial }: { initial: AlertRow[] }) {
       resume();
     } else {
       pausedRef.current = true;
+      setPausedCount(0);
       setPaused(true);
     }
   }
@@ -129,7 +155,7 @@ export function LiveFeed({ initial }: { initial: AlertRow[] }) {
               onClick={resume}
               className={`${BTN} border-ember/60 text-fg hover:border-ember`}
             >
-              <span className="font-mono tabular-nums text-ember">{buffer.length} new</span>
+              <span className="font-mono tabular-nums text-ember">{pausedNewLabel(pausedCount)}</span>
               <span aria-hidden="true">·</span>
               Resume
             </button>

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AlertRow } from "./api";
-import { liveBadge, mergeAlerts, parseAlertEvent } from "./live";
+import { liveBadge, mergeAlerts, parseAlertEvent, parseAlertList, pausedNewLabel, shouldBackfill } from "./live";
 
 const NOW = Date.parse("2026-11-20T12:00:00Z");
 
@@ -115,5 +115,47 @@ describe("parseAlertEvent", () => {
     delete min.sol_amount;
     delete min.block_time;
     expect(parseAlertEvent(JSON.stringify(min))).toEqual({ ...row(3), symbol: null, sol_amount: null, block_time: null });
+  });
+});
+
+describe("pausedNewLabel", () => {
+  it("shows the true count up to the cap", () => {
+    expect(pausedNewLabel(0)).toBe("0 new");
+    expect(pausedNewLabel(3)).toBe("3 new");
+    expect(pausedNewLabel(200)).toBe("200 new");
+  });
+  it("shows cap+ once more alerts arrived than the buffer keeps", () => {
+    expect(pausedNewLabel(201)).toBe("200+ new");
+    expect(pausedNewLabel(5000)).toBe("200+ new");
+    expect(pausedNewLabel(11, 10)).toBe("10+ new");
+  });
+});
+
+describe("shouldBackfill", () => {
+  it("is false on the very first open and true on every reopen", () => {
+    expect(shouldBackfill(0)).toBe(false);
+    expect(shouldBackfill(1)).toBe(true);
+    expect(shouldBackfill(7)).toBe(true);
+  });
+});
+
+describe("parseAlertList", () => {
+  const good = {
+    id: 3,
+    wallet: "W",
+    mint: "M",
+    symbol: null,
+    side: "sell",
+    sol_amount: 2,
+    signature: "S",
+    block_time: null,
+  };
+  it("keeps AlertRow-shaped items and drops the rest", () => {
+    expect(parseAlertList([good, { id: "x" }, null, 5])).toEqual([good]);
+  });
+  it("returns [] for non-arrays", () => {
+    expect(parseAlertList({})).toEqual([]);
+    expect(parseAlertList(null)).toEqual([]);
+    expect(parseAlertList("[]")).toEqual([]);
   });
 });
