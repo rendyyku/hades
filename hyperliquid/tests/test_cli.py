@@ -245,3 +245,24 @@ def test_tag_all_continues_after_rate_limit(env, monkeypatch):
     assert seen == sorted([A, B])
     assert "rate limited" in r.output
     assert "pre_move 1" in r.output and "1 ok, 1 failed" in r.output
+
+
+def test_tag_all_continues_after_value_error(env, monkeypatch):
+    from hades_hl import insider
+    from hades_hl.insider import Tag
+    _seed_wallets(env, [A, B])
+
+    async def fake_tag_wallet(session, client, addr, *, now=None, sz_decimals=None):
+        if addr == A:
+            raise ValueError("tag pre_move: evidence row with an empty hash")
+        return {"pre_move": Tag(addr, "pre_move", [
+            {"tid": 1, "hash": "0xh", "coin": "BTC", "time": 1, "detail": {}}] * 3)}
+
+    async def fake_szd(session, client, now=None):
+        return {}
+
+    monkeypatch.setattr(insider, "tag_wallet", fake_tag_wallet)
+    monkeypatch.setattr(cli.pipeline, "load_sz_decimals", fake_szd)
+    r = invoke("tag", "--all")
+    assert r.exit_code == 0, r.output
+    assert "invalid evidence" in r.output and "1 ok, 1 failed" in r.output

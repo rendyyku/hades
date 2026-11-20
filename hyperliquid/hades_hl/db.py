@@ -87,7 +87,8 @@ class Wallet(Base):
 
     address: Mapped[str] = mapped_column(String, primary_key=True)
     # earliest fill time HL can give us (set by ``hades-hl tag``; Task 7): the oldest
-    # stored fill of an uncapped coverage, None when unknown (capped history)
+    # stored fill of an uncapped coverage, or an older one found by the pre-coverage
+    # check; None when unknown (capped / partial history). A failed check keeps it.
     first_seen: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
     is_vault: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
     is_bot: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())

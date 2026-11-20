@@ -260,6 +260,13 @@ def tag(
                     typer.echo(f"[{i}/{len(addrs)}] {a}: HL error {type(e).__name__} "
                                f"(status {e.status}); tags unchanged; continuing")
                     continue
+                except ValueError as e:  # invalid evidence: persist_tags refused it
+                    session.rollback()
+                    failed += 1
+                    log.error("tag %s: invalid evidence: %s", a, e)
+                    typer.echo(f"[{i}/{len(addrs)}] {a}: invalid evidence ({e}); tags "
+                               "unchanged; continuing")
+                    continue
                 ok += 1
                 counts.update(got.keys())
                 desc = ", ".join(f"{k} ({len(t.evidence)} evidence)"

@@ -221,7 +221,7 @@ def test_fresh_whale_negative_cases():
 
 # -- persist ----------------------------------------------------------------------------
 
-EV = {"tid": 1, "hash": "0xh1", "coin": "BTC", "time": NOW_MS, "detail": {}}
+EV = {"tid": 1, "hash": "0xh1", "coin": "BTC", "time": NOW_MS, "detail": {"interval": "1m"}}
 
 
 def test_persist_rejects_empty_or_incomplete_evidence(session):
@@ -249,8 +249,7 @@ def test_persist_is_idempotent_and_removes_stale(session):
 
 # -- pipeline: tag_wallet over the stored coverage --------------------------------------
 
-def router(listing: dict[str, int], price_fn, calls: list, pre_cov: dict | None = None,
-           fail: dict | None = None):
+def router(listing: dict[str, int], price_fn, calls: list, pre_cov: dict | None = None):
     """candleSnapshot: 1d from 0 -> one empty pre-listing candle then the listing day;
     finer intervals -> candles over the range with close ``price_fn(coin, T)``.
     userFillsByTime -> ``pre_cov[user]`` (the fills before the coverage)."""
@@ -259,8 +258,6 @@ def router(listing: dict[str, int], price_fn, calls: list, pre_cov: dict | None 
     def handler(request):
         body = json.loads(request.content)
         calls.append(body)
-        if fail and fail.get("type") == body["type"]:
-            return httpx.Response(429)
         if body["type"] == "candleSnapshot":
             r = body["req"]
             iv = ivs[r["interval"]]
@@ -424,3 +421,243 @@ def test_meta_non_dict_raises():
     import asyncio
     with pytest.raises(HLError):
         asyncio.run(go())
+
+
+# -- fix round 1 ------------------------------------------------------------------------
+
+def failing_router(base, *, what: str, mode: str):
+    """Wrap ``base``: requests matching ``what`` fail with ``mode`` (an HTTP status as
+    str, or "net" for a network error). ``what``: "candles" (non-1d candleSnapshot),
+    "listing" (1d candleSnapshot) or "precov" (userFillsByTime)."""
+    def handler(request):
+        b = json.loads(request.content)
+        hit = (
+            (what == "candles" and b["type"] == "candleSnapshot"
+             and b["req"]["interval"] != "1d")
+            or (what == "listing" and b["type"] == "candleSnapshot"
+                and b["req"]["interval"] == "1d")
+            or (what == "precov" and b["type"] == "userFillsByTime"))
+        if hit:
+            if mode == "net":
+                raise httpx.ConnectError("boom", request=request)
+            return httpx.Response(int(mode))
+        return base(request)
+    return handler
+
+
+def _rows(session):
+    session.expire_all()
+    return {r.tag: r.evidence_json for r in session.scalars(select(TagRow))}
+
+
+@pytest.mark.parametrize("mode", ["500", "net"])
+@respx.mock
+async def test_pre_move_tag_survives_candle_fetch_failure(session, mode, caplog):
+    fills, _ = move_case(3, 0.10)
+    store(session, A, fills, cov_start=NOW_MS - 30 * DAY)
+    persist_tags(session, A, [Tag(A, "pre_move", [EV]), Tag(A, "fresh_whale", [EV])])
+    session.commit()
+    respx.post(INFO).mock(side_effect=failing_router(
+        router({"ETH": NOW_MS - 900 * DAY}, pumpy, []), what="candles", mode=mode))
+    async with make_client(max_attempts=2) as c:
+        res = await insider.tag_wallet(session, c, A, now=NOW, sz_decimals={})
+    rows = _rows(session)
+    assert rows["pre_move"] == [EV]  # incomplete inputs: the tag is kept
+    assert "fresh_whale" not in rows  # a complete rule still removes its stale tag
+    assert "pre_move" not in res
+    assert any("pre_move" in r.getMessage() and A in r.getMessage()
+               and r.levelname == "WARNING" for r in caplog.records)
+
+
+@pytest.mark.parametrize("mode", ["500", "net"])
+@respx.mock
+async def test_pre_listing_tag_survives_listing_fetch_failure(session, mode):
+    store(session, A, baseline(), cov_start=NOW_MS - 30 * DAY)
+    persist_tags(session, A, [Tag(A, "pre_listing", [EV])])
+    session.commit()
+    respx.post(INFO).mock(side_effect=failing_router(
+        router({"BTC": NOW_MS - 900 * DAY}, pumpy, []), what="listing", mode=mode))
+    async with make_client(max_attempts=2) as c:
+        await insider.tag_wallet(session, c, A, now=NOW, sz_decimals={})
+    assert _rows(session) == {"pre_listing": [EV]}
+    assert pipeline.kv_get_json(session, "hl:listing:BTC") is None  # failure not cached
+
+
+@pytest.mark.parametrize("mode", ["500", "net"])
+@respx.mock
+async def test_fresh_whale_survives_precoverage_failure(session, mode, caplog):
+    fills = whale_fills(big_sz="1")  # would no longer fire
+    store(session, A, fills, cov_start=NOW_MS - 30 * DAY)
+    known = datetime(2026, 11, 14, 1, 2, 3, tzinfo=timezone.utc)
+    session.get(Wallet, A).first_seen = known
+    persist_tags(session, A, [Tag(A, "fresh_whale", [EV])])
+    session.commit()
+    respx.post(INFO).mock(side_effect=failing_router(
+        router({"SOL": NOW_MS - 900 * DAY}, pumpy, []), what="precov", mode=mode))
+    async with make_client(max_attempts=2) as c:
+        await insider.tag_wallet(session, c, A, now=NOW, sz_decimals={})
+    assert _rows(session) == {"fresh_whale": [EV]}
+    assert session.get(Wallet, A).first_seen == known  # not overwritten
+    assert any("fresh_whale" in r.getMessage() and r.levelname == "WARNING"
+               for r in caplog.records)
+
+
+@respx.mock
+async def test_rate_limit_midway_leaves_every_tag_unchanged(session):
+    from hades_hl.client import HLRateLimited
+    fills, _ = move_case(3, 0.10)
+    store(session, A, fills, cov_start=NOW_MS - 30 * DAY)
+    known = datetime(2026, 11, 14, tzinfo=timezone.utc)
+    session.get(Wallet, A).first_seen = known
+    persist_tags(session, A, [Tag(A, k, [EV]) for k in insider.TAG_KINDS])
+    session.commit()
+    respx.post(INFO).mock(side_effect=failing_router(
+        router({"ETH": NOW_MS - 900 * DAY}, pumpy, []), what="candles", mode="429"))
+    async with make_client(max_attempts=1) as c:
+        with pytest.raises(HLRateLimited):
+            await insider.tag_wallet(session, c, A, now=NOW, sz_decimals={})
+    session.rollback()
+    assert _rows(session) == {k: [EV] for k in insider.TAG_KINDS}
+    assert session.get(Wallet, A).first_seen == known
+
+
+# P38: pre_move only considers opens with notional >= the median open notional
+
+def test_pre_move_open_at_median_counts():
+    movers, prices = move_case(3, 0.10, sz="10")  # notional 1000
+    flat, _ = move_case(4, 0.0, sz="10", coin="BTC", tid0=600)  # 1000, no prices
+    tags = tag_pre_move(movers + flat, prices, address=A)
+    assert len(tags) == 1 and len(tags[0].evidence) == 3
+    assert tags[0].evidence[0]["detail"]["median_open_notional_usd"] == 1000.0
+
+
+def test_pre_move_open_below_median_ignored():
+    movers, prices = move_case(3, 0.10, sz="9.99")  # 999 < median 1000
+    flat, _ = move_case(4, 0.0, sz="10", coin="BTC", tid0=600)
+    assert tag_pre_move(movers + flat, prices, address=A) == []
+
+
+def test_pre_move_floor_applies_before_cap():
+    movers, _ = move_case(3, 0.10, sz="10")  # 1000 each
+    small, _ = move_case(3, 0.0, sz="5", coin="BTC", tid0=600)  # 500 each
+    legs = open_legs(A, movers + small)  # median 750
+    sel = insider.select_pre_move_opens(legs, max_opens=200)
+    assert sorted(lg.fill["tid"] for lg in sel) == [500, 501, 502]
+    assert len(insider.select_pre_move_opens(legs, max_opens=2)) == 2
+
+
+# P40: distinct move events
+
+def pump_case(starts, *, step=5 * MIN, n=3, tid0=700):
+    """For each start, ``n`` quick opens ``step`` apart (each closed after 1 min), and
+    one +10% close 20 min after the start."""
+    fills, candles = [], []
+    for k, s in enumerate(starts):
+        for j in range(n):
+            t = s + j * step
+            fills += rt("ETH", t, "10", "100", tid=tid0 + 10 * k + j, hold=MIN)
+        candles += [candle(s + MIN - 1, 100), candle(s + 20 * MIN + 1, 110)]
+    return fills, {"ETH": candles}
+
+
+def test_pre_move_three_opens_in_one_pump_do_not_fire():
+    fills, prices = pump_case([NOW_MS - DAY])
+    assert tag_pre_move(fills, prices, address=A) == []
+
+
+def test_pre_move_distinct_events_fire_and_mark_event_index():
+    fills, prices = pump_case([NOW_MS - 3 * DAY, NOW_MS - 2 * DAY, NOW_MS - DAY], n=2)
+    tags = tag_pre_move(fills, prices, address=A)
+    assert len(tags) == 1
+    ev = tags[0].evidence
+    assert len(ev) == 6  # every row kept
+    assert [e["detail"]["event_index"] for e in ev] == [1, 1, 2, 2, 3, 3]
+
+
+def test_pre_move_event_window_boundary():
+    t0 = NOW_MS - DAY
+    # exactly 30 min after the previous qualifying open: a new event
+    fills, candles = [], []
+    for j in range(3):
+        t = t0 + j * 30 * MIN
+        fills += rt("ETH", t, "10", "100", tid=800 + j, hold=MIN)
+        candles += [candle(t + 10 * MIN, 110)]
+    tags = tag_pre_move(fills, {"ETH": candles}, address=A)
+    assert [e["detail"]["event_index"] for e in tags[0].evidence] == [1, 2, 3]
+    # 30 min - 1 ms apart: one chained event
+    fills, candles = [], []
+    for j in range(3):
+        t = t0 + j * (30 * MIN - 1)
+        fills += rt("ETH", t, "10", "100", tid=810 + j, hold=MIN)
+        candles += [candle(t + 10 * MIN, 110)]
+    assert tag_pre_move(fills, {"ETH": candles}, address=A) == []
+
+
+# M1
+
+def test_pre_listing_evidence_has_listing_resolution():
+    fills = baseline() + rt("NEW", LIST_MS + H, "50", "100", tid=777)
+    ev = tag_pre_listing(fills, {"NEW": LIST_MS}, None, address=A)[0].evidence[0]
+    assert ev["detail"]["listing_resolution"] == "1d"
+
+
+# M4
+
+@respx.mock
+async def test_empty_candle_slices_not_cached(session):
+    from hades_hl.db import Kv
+    fills, _ = move_case(3, 0.10)
+    store(session, A, fills, cov_start=NOW_MS - 30 * DAY)
+    base = router({"ETH": NOW_MS - 900 * DAY}, pumpy, [])
+
+    def handler(request):
+        b = json.loads(request.content)
+        if b["type"] == "candleSnapshot" and b["req"]["interval"] != "1d":
+            return httpx.Response(200, json=[])
+        return base(request)
+
+    respx.post(INFO).mock(side_effect=handler)
+    async with make_client() as c:
+        await insider.tag_wallet(session, c, A, now=NOW, sz_decimals={})
+    keys = [k for k in session.scalars(select(Kv.key)) if k.startswith("hl:candles:")]
+    assert keys == []
+
+
+# M5
+
+def test_persist_requires_interval_for_pre_move(session):
+    with pytest.raises(ValueError):
+        persist_tags(session, A, [Tag(A, "pre_move", [{**EV, "detail": {}}])])
+    with pytest.raises(ValueError):
+        persist_tags(session, A, [Tag(A, "pre_move", [{**EV, "detail": {"interval": None}}])])
+    persist_tags(session, A, [Tag(A, "pre_listing", [{**EV, "detail": {}}])])  # not needed
+
+
+# M6: zero-hash fills are not evidence
+
+ZERO = "0x" + "0" * 64
+
+
+def test_persist_rejects_zero_hash(session):
+    with pytest.raises(ValueError):
+        persist_tags(session, A, [Tag(A, "pre_listing", [{**EV, "hash": ZERO}])])
+
+
+def _zero(fills, tid):
+    for f in fills:
+        if f["tid"] == tid:
+            f["hash"] = ZERO
+    return fills
+
+
+def test_zero_hash_open_drops_out_of_pre_move():
+    fills, prices = move_case(3, 0.10)
+    assert tag_pre_move(fills, prices, address=A) != []
+    assert tag_pre_move(_zero(fills, 501), prices, address=A) == []
+
+
+def test_zero_hash_open_drops_out_of_fresh_whale_and_pre_listing():
+    young = NOW - timedelta(days=6)
+    assert tag_fresh_whale(young, _zero(whale_fills(), 902), address=A, now=NOW) == []
+    fills = _zero(baseline() + rt("NEW", LIST_MS + H, "50", "100", tid=777), 777)
+    assert tag_pre_listing(fills, {"NEW": LIST_MS}, None, address=A) == []

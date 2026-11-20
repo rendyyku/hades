@@ -15,16 +15,21 @@ with ``szDecimals``, ruling P24). Notional = leg size x fill price.
   old coins with empty ``n == 0`` candles: BTC's series starts in 2020 at volume 0),
   cached permanently in kv ``hl:listing:{coin}``. Only coins the wallet opened are
   fetched.
-- ``pre_move`` (:func:`tag_pre_move`): among the wallet's 200 largest opens, the
-  best close in the position's favour (up for long, down for short) within 30 min after
-  the open is >= 5% above (below) the open fill price, at least 3 times. Closes come
+- ``pre_move`` (:func:`tag_pre_move`): among the wallet's opens with notional >= its
+  median open notional over the coverage (ruling P38), the 200 largest (cap applied
+  after the floor): the best close in the position's favour (up for long, down for
+  short) within 30 min after the open is >= 5% above (below) the open fill price, in at
+  least 3 DISTINCT move events (ruling P40: qualifying opens of one coin less than
+  30 min after the previous qualifying open belong to the same event; every row is kept
+  as evidence with its ``event_index``). Closes come
   from candles whose close time ``T`` is in ``[open, open + 30 min)``. HL serves only
   the latest 5000 candles per interval (live probe 2026-11-21), so the finest interval
   that still reaches the open is used: 1m (~3.4 d), 5m (~17 d), 15m (~51 d), 1h
   (~204 d; only when an hourly close falls inside the window); older opens are
   unmeasured. Each open's candles are cached in kv ``hl:candles:{coin}:{iv}:{lo}:{hi}``
   (reruns are free); missing ones are fetched with at most one request per open (opens
-  of one coin are merged into one request when close together).
+  of one coin are merged into one request when close together). Empty slices are
+  never cached.
 - ``fresh_whale`` (:func:`tag_fresh_whale`): the first fill is < 7 days old and one of
   the first 5 opens has notional >= 50,000 USD. ``first_seen`` (stored on
   ``wallets.first_seen``) is the earliest fill HL can give us: unknown (None, tag
@@ -33,7 +38,12 @@ with ``szDecimals``, ruling P24). Notional = leg size x fill price.
   no older fill exists (the coverage only spans the backfill window).
 
 Tags are idempotent: :func:`persist_tags` replaces the wallet's rows for every rule it
-evaluated, so a rule that no longer fires removes its stale tag.
+evaluated, so a rule that no longer fires removes its stale tag. A rule whose inputs were
+incomplete (a listing / candle fetch error, a failed pre-coverage check) is NOT
+evaluated: its existing rows (and a known ``first_seen``) are kept, with a WARNING.
+
+Fills with a zero hash (``0x`` + all zeros: not a linkable transaction) are never
+evidence; a rule left without its required evidence does not fire.
 """
 
 from __future__ import annotations
@@ -81,6 +91,7 @@ FRESH_MAX_AGE_DAYS = 7
 FRESH_FIRST_OPENS = 5
 FRESH_MIN_NOTIONAL = 50_000
 
+LISTING_RESOLUTION = "1d"
 KV_LISTING = "hl:listing:{}"
 KV_CANDLES = "hl:candles:{}:{}:{}:{}"  # coin, interval, lo, hi (ms)
 LISTING_EMPTY_RETRY_MS = 7 * DAY_MS  # a coin with no candles is re-asked after a week
@@ -105,6 +116,16 @@ def _to_ms(x: datetime | int) -> int:
     if isinstance(x, datetime):
         return int(x.timestamp() * 1000)
     return int(x)
+
+
+def is_zero_hash(h: Any) -> bool:
+    """``0x`` followed by only zeros (HL's placeholder for fills without a tx)."""
+    return isinstance(h, str) and h[:2].lower() == "0x" and set(h[2:]) <= {"0"}
+
+
+def has_evidence_hash(lg: Leg) -> bool:
+    h = lg.fill.get("hash")
+    return isinstance(h, str) and bool(h) and not is_zero_hash(h)
 
 
 def open_legs(addr: str, fills: Iterable[Mapping], sz_decimals: SzDecimals = None) -> list[Leg]:
@@ -162,17 +183,23 @@ def tag_pre_listing(
             continue
         lst_ms = _to_ms(lst)
         dt = lg.time_ms - lst_ms
-        if not 0 <= dt <= window_ms or notional(lg) < floor:
+        if not 0 <= dt <= window_ms or notional(lg) < floor or not has_evidence_hash(lg):
             continue
         ev.append(evidence_row(
-            lg, listing_ms=lst_ms, hours_after_listing=dt / HOUR_MS,
+            lg, listing_ms=lst_ms, listing_resolution=LISTING_RESOLUTION,
+            hours_after_listing=dt / HOUR_MS,
             usual_notional_usd=float(usual), ratio_to_usual=float(notional(lg) / usual)))
     return [Tag(address, "pre_listing", ev)] if ev else []
 
 
 def select_pre_move_opens(legs: Sequence[Leg], max_opens: int = PRE_MOVE_MAX_OPENS) -> list[Leg]:
-    """The ``max_opens`` largest opens by notional (ties: earlier first)."""
-    return sorted(legs, key=lambda lg: (-notional(lg), lg.time_ms, int(lg.fill["tid"])))[
+    """Opens with notional >= the median open notional of ``legs`` (the coverage;
+    ruling P38), then the ``max_opens`` largest of those (ties: earlier first)."""
+    med = median_open_notional(legs)
+    if med is None:
+        return []
+    big = [lg for lg in legs if notional(lg) >= med]
+    return sorted(big, key=lambda lg: (-notional(lg), lg.time_ms, int(lg.fill["tid"])))[
         :max_opens]
 
 
@@ -193,17 +220,23 @@ def tag_pre_move(
     min_occurrences: int = PRE_MOVE_MIN_OCCURRENCES, *, address: str,
     sz_decimals: SzDecimals = None, max_opens: int = PRE_MOVE_MAX_OPENS,
 ) -> list[Tag]:
-    """Among the ``max_opens`` largest opens, those whose best favourable candle close
-    within ``[open, open + window)`` (by candle close time ``T``) moved >= ``move_pct``
-    from the open fill price; a tag when there are >= ``min_occurrences``.
-    ``prices``: ``{coin: [candle]}`` with HL's ``T`` (close ms) and ``c`` (close)."""
-    legs = select_pre_move_opens(open_legs(address, fills, sz_decimals), max_opens)
+    """Among the opens at or above the median open notional (the ``max_opens`` largest
+    of them), those whose best favourable candle close within ``[open, open + window)``
+    (by candle close time ``T``) moved >= ``move_pct`` from the open fill price; a tag
+    when they form >= ``min_occurrences`` distinct events (ruling P40: a qualifying open
+    of the same coin less than ``window`` after the previous qualifying one joins its
+    event). Opens whose fill has no usable hash are not evidence and do not count.
+    ``prices``: ``{coin: [candle]}`` with HL's ``T`` (close ms) and ``c`` (close).
+    Every candle must carry its interval ``i``."""
+    all_legs = open_legs(address, fills, sz_decimals)
+    med = median_open_notional(all_legs)
+    legs = select_pre_move_opens(all_legs, max_opens)
     idx = _index_candles(prices)
     window_ms = int(window_min * MIN_MS)
     need = Decimal(str(move_pct))
     hits = []
     for lg in legs:
-        if lg.coin not in idx or lg.price <= 0:
+        if lg.coin not in idx or lg.price <= 0 or not has_evidence_hash(lg):
             continue
         ts, cs = idx[lg.coin]
         lo = bisect.bisect_left(ts, lg.time_ms)
@@ -222,10 +255,24 @@ def tag_pre_move(
         hits.append(evidence_row(
             lg, move_pct=float(pct), best_close=str(c["c"]), best_close_time=int(c["T"]),
             minutes_after_open=(int(c["T"]) - lg.time_ms) / MIN_MS,
-            interval=c.get("i"), window_min=window_min))
-    if len(hits) < min_occurrences:
-        return []
+            interval=c.get("i"), window_min=window_min,
+            median_open_notional_usd=float(med)))
     hits.sort(key=lambda e: (e["time"], e["tid"]))
+    events = 0
+    last: dict[str, tuple[int, int]] = {}  # coin -> (previous qualifying open ms, event)
+    for e in hits:
+        prev = last.get(e["coin"])
+        if prev is not None and e["time"] < prev[0] + window_ms:
+            ev_i = prev[1]
+        else:
+            events += 1
+            ev_i = events
+        last[e["coin"]] = (e["time"], ev_i)
+        e["detail"]["event_index"] = ev_i
+    if events < min_occurrences:
+        return []
+    for e in hits:
+        e["detail"]["distinct_events"] = events
     return [Tag(address, "pre_move", hits)]
 
 
@@ -247,7 +294,7 @@ def tag_fresh_whale(
     floor = Decimal(str(min_notional))
     ev = [evidence_row(lg, open_index=i, first_seen_ms=fs_ms, account_age_days=age / DAY_MS)
           for i, lg in enumerate(open_legs(address, fills, sz_decimals)[:first_opens], 1)
-          if notional(lg) >= floor]
+          if notional(lg) >= floor and has_evidence_hash(lg)]
     return [Tag(address, "fresh_whale", ev)] if ev else []
 
 
@@ -264,6 +311,13 @@ def _check_evidence(tag: Tag) -> None:
         if row["tid"] is None or not row["hash"] or not row["coin"] or row["time"] is None:
             raise ValueError(f"tag {tag.tag} of {tag.address}: evidence row with an empty "
                              f"tid/hash/coin/time: {row!r}")
+        if is_zero_hash(row["hash"]):
+            raise ValueError(f"tag {tag.tag} of {tag.address}: evidence row with a zero "
+                             f"hash: {row!r}")
+        if tag.tag == "pre_move" and (not isinstance(row["detail"], Mapping)
+                                      or not row["detail"].get("interval")):
+            raise ValueError(f"tag pre_move of {tag.address}: evidence row without its "
+                             f"candle interval: {row!r}")
 
 
 def persist_tags(session: Session, address: str, tags: Sequence[Tag],
@@ -306,7 +360,8 @@ def listing_from_candles(rows: Sequence[Mapping]) -> int | None:
 
 
 async def listing_ms(session: Session, client: HLClient, coin: str, now_ms: int) -> int | None:
-    """Listing time of ``coin`` (kv ``hl:listing:{coin}``, permanent once known)."""
+    """Listing time of ``coin`` (kv ``hl:listing:{coin}``, permanent once known).
+    HL errors propagate (nothing cached): the caller treats pre_listing as incomplete."""
     key = KV_LISTING.format(coin)
     c = kv_get_json(session, key)
     if isinstance(c, dict):
@@ -315,14 +370,7 @@ async def listing_ms(session: Session, client: HLClient, coin: str, now_ms: int)
         f = c.get("fetched_at")
         if isinstance(f, int) and 0 <= now_ms - f < LISTING_EMPTY_RETRY_MS:
             return None
-    try:
-        rows = await client.candle_snapshot(coin, "1d", 0, now_ms)
-    except HLRateLimited:
-        raise
-    except HLError as e:
-        log.warning("tag: listing of %s unavailable (%s); pre_listing skips it", coin,
-                    type(e).__name__)
-        return None
+    rows = await client.candle_snapshot(coin, LISTING_RESOLUTION, 0, now_ms)
     t = listing_from_candles(rows)
     kv_set_json(session, key, {"listing_ms": t, "fetched_at": now_ms})
     session.commit()
@@ -356,6 +404,7 @@ class CandleLoad:
     fetched: int = 0  # opens whose candles were fetched
     requests: int = 0
     unmeasured: int = 0
+    errors: int = 0  # opens whose candle request failed (HL error other than 429)
 
 
 async def load_pre_move_candles(
@@ -407,12 +456,14 @@ async def load_pre_move_candles(
             log.warning("tag: %s %s candles unavailable (%s); %d opens unmeasured", coin,
                         name, type(e).__name__, len(g))
             out.unmeasured += len(g)
+            out.errors += len(g)
             continue
         out.requests += 1
         for _, _, _, lo, hi, key in g:
             sl = [[int(r["T"]), str(r["c"])] for r in rows
                   if int(r["t"]) >= lo and int(r["T"]) < hi]
-            kv_set_json(session, key, sl)
+            if sl:  # never cache an empty slice: it may just be a gap in HL's answer
+                kv_set_json(session, key, sl)
             out.prices.setdefault(coin, []).extend(_expand(name, sl))
             out.fetched += 1
         session.commit()
@@ -425,7 +476,8 @@ async def resolve_first_seen(
     max_age_days: float = FRESH_MAX_AGE_DAYS,
 ) -> int | None:
     """Earliest fill time (ms) HL can give us; None when unknown (capped / partial
-    history, no coverage, no fill, or the pre-coverage check failed)."""
+    history, no coverage, no fill). A failed pre-coverage check raises the HLError:
+    the caller keeps the known ``first_seen`` and skips fresh_whale."""
     if cov is None or history_partial or bool(cov.get("capped")):
         return None
     times = [int(f["time"]) for f in fills]
@@ -434,14 +486,8 @@ async def resolve_first_seen(
     oldest = min(times)
     if now_ms - oldest >= max_age_days * DAY_MS or int(cov["start"]) <= 0:
         return oldest
-    try:  # young by the coverage: does HL know an older fill (before the backfill window)?
-        earlier = await client.user_fills_range(addr, 0, int(cov["start"]) - 1)
-    except HLRateLimited:
-        raise
-    except HLError as e:
-        log.warning("tag %s: pre-coverage fills check failed (%s); first_seen unknown",
-                    addr, type(e).__name__)
-        return None
+    # young by the coverage: does HL know an older fill (before the backfill window)?
+    earlier = await client.user_fills_range(addr, 0, int(cov["start"]) - 1)
     if earlier:
         oldest = min(oldest, min(int(f["time"]) for f in earlier))
     return oldest
@@ -458,7 +504,9 @@ async def tag_wallet(
     """Run the three rules on ``addr``'s stored fills inside its coverage, store
     ``wallets.first_seen`` and persist the tags (replacing / removing old ones).
     Returns ``{tag: Tag}`` of the rules that fired. HLRateLimited propagates (nothing
-    persisted for this wallet; fetched listings / candles stay cached)."""
+    persisted for this wallet; fetched listings / candles stay cached). A rule whose
+    inputs were incomplete (other HL errors) is skipped: its stored rows are kept, a
+    WARNING names it."""
     addr = addr.lower()
     now = now or datetime.now(timezone.utc)
     now_ms = _to_ms(now)
@@ -469,13 +517,34 @@ async def tag_wallet(
     partial = bool(((w.stats_json or {}).get("backfill") or {}).get("history_partial"))
     legs = open_legs(addr, fills, sz_decimals)
 
-    first_seen = await resolve_first_seen(session, client, addr, fills, cov, partial, now_ms)
+    skipped: dict[str, str] = {}  # rule -> why its inputs are incomplete
+
+    fs_known = True
+    try:
+        first_seen = await resolve_first_seen(session, client, addr, fills, cov, partial,
+                                              now_ms)
+    except HLRateLimited:
+        raise
+    except HLError as e:
+        fs_known, first_seen = False, None
+        skipped["fresh_whale"] = f"pre-coverage fills check failed ({type(e).__name__})"
 
     listings: dict[str, int] = {}
+    bad_listings: list[str] = []
     for coin in sorted({lg.coin for lg in legs}):
-        t = await listing_ms(session, client, coin, now_ms)
+        try:
+            t = await listing_ms(session, client, coin, now_ms)
+        except HLRateLimited:
+            raise
+        except HLError as e:
+            log.warning("tag %s: listing of %s unavailable (%s)", addr, coin,
+                        type(e).__name__)
+            bad_listings.append(coin)
+            continue
         if t is not None:
             listings[coin] = t
+    if bad_listings:
+        skipped["pre_listing"] = f"listing fetch failed for {', '.join(bad_listings)}"
 
     sel = select_pre_move_opens(legs, PRE_MOVE_MAX_OPENS)
     load = await load_pre_move_candles(session, client, sel, now_ms)
@@ -483,20 +552,27 @@ async def tag_wallet(
         log.info("tag %s: pre_move measured %d of %d opens (%d unmeasured: older than HL's "
                  "candle horizon or window not over)", addr, len(sel) - load.unmeasured,
                  len(sel), load.unmeasured)
+    if load.errors:
+        skipped["pre_move"] = f"candle fetch failed for {load.errors} opens"
 
+    kinds = tuple(k for k in TAG_KINDS if k not in skipped)
+    for k, why in skipped.items():
+        log.warning("tag %s: %s skipped, existing tag kept: %s", addr, k, why)
     tags = (tag_pre_listing(fills, listings, None, address=addr, sz_decimals=sz_decimals)
             + tag_pre_move(fills, load.prices, address=addr, sz_decimals=sz_decimals)
             + tag_fresh_whale(first_seen, fills, address=addr, now=now,
                               sz_decimals=sz_decimals))
+    tags = [t for t in tags if t.tag in kinds]
     w = session.get(Wallet, addr)
-    w.first_seen = _ms_dt(first_seen)
-    persist_tags(session, addr, tags)
+    if fs_known:
+        w.first_seen = _ms_dt(first_seen)
+    persist_tags(session, addr, tags, kinds=kinds)
     session.commit()
     return {t.tag: t for t in tags}
 
 
 __all__ = [
-    "TAG_KINDS", "Tag", "candle_interval", "listing_from_candles", "listing_ms",
+    "TAG_KINDS", "Tag", "candle_interval", "is_zero_hash", "listing_from_candles", "listing_ms",
     "load_pre_move_candles", "median_open_notional", "open_legs", "persist_tags",
     "resolve_first_seen", "select_pre_move_opens", "tag_fresh_whale", "tag_pre_listing",
     "tag_pre_move", "tag_wallet",
