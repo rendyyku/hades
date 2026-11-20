@@ -62,25 +62,30 @@ hades webhook-sync                  # push the watchlist to the Helius webhook o
 
 ```bash
 cd web
-npm run dev                          # http://localhost:3000
-npm run build && npm run start       # production
+npm run dev                          # http://127.0.0.1:3000 (binds to 127.0.0.1 only)
+npm run build && npm run start       # production, also 127.0.0.1 only
 ```
 
-`scripts/dev.sh` starts the engine and the web dev server together and stops both on Ctrl-C. `ENGINE_PORT` and `WEB_PORT` override 8000 and 3000. If you change `ENGINE_PORT`, point `HADES_API_URL` at it.
+`scripts/dev.sh` starts the engine and the web dev server together (both on 127.0.0.1) and stops both on Ctrl-C. It needs bash ≥ 4.3 (`wait -n`): Linux bash and Windows git-bash work; the bash 3.2 that ships with macOS does not. `ENGINE_PORT` and `WEB_PORT` override 8000 and 3000. If you change `ENGINE_PORT`, point `HADES_API_URL` at it. dev.sh sets `HADES_PUBLIC_ORIGIN` to `http://localhost:$WEB_PORT,http://127.0.0.1:$WEB_PORT` unless you set it.
+
+`HADES_PUBLIC_ORIGIN` (in `web/.env.local`) is a comma-separated list of exact origins, default `http://localhost:3000,http://127.0.0.1:3000`. Watchlist writes need an `Origin` in the list and a `Host` among its hosts; `/api/alerts` and `/api/stream` need the `Host`. Anything else gets 403. Set it if you use another port or hostname.
 
 ## Realtime alerts (Helius webhook)
 
 1. Expose the engine with `ngrok http 8000`.
 2. Set `PUBLIC_WEBHOOK_URL` in `.env` to the ngrok base URL, e.g. `https://abcd.ngrok.app` (a URL that already ends in `/webhook/helius` also works). Then restart `hades serve`.
 3. Add a wallet to the watchlist, either on `/watchlist` or with `POST /api/watchlist`. Every watchlist change syncs the webhook, and the response header `X-Webhook-Sync` reports `ok`, `skipped` or `error`.
-4. `hades webhook-sync` syncs by hand. It prints the status and the webhook id, never a key.
+4. `hades rescore` re-syncs after scoring when `PUBLIC_WEBHOOK_URL` is set (scores decide the top-score part of the address set).
+5. `hades webhook-sync` syncs by hand. It prints the status and the webhook id, never a key.
+
+The webhook follows the watchlist plus the top `WEBHOOK_TOP_SCORE_MAX` (default 25) non-bot wallets with score ≥ 70, best score first (ties by address).
 
 The sync is safe to repeat:
 - **Create.** It first lists the existing webhooks and reuses one with the same URL. The create POST is never retried, and the new id is stored in the `kv` table (`HELIUS_WEBHOOK_ID` overrides it).
 - **Update.** A stale id (404) is looked up again by URL.
-- **Empty watchlist.** The webhook is deleted.
+- **Empty address set** (no watched wallets and no wallet scoring ≥ 70). The webhook is deleted.
 
-Alerts fire for swaps by watched wallets or by wallets that score ≥ 70. Duplicate deliveries are ignored.
+Alerts fire for swaps by watched wallets or by wallets that score ≥ 70; only the subscribed addresses above are delivered by Helius. Duplicate deliveries are ignored, and bodies over 5 MB are refused with 413.
 
 ## Cost guards
 
@@ -95,7 +100,8 @@ Helius bills per request. These settings cap what one run can spend:
 | `HELIUS_API_KEY` | – | required for seed/discover/backfill/tag and the webhook sync |
 | `HELIUS_WEBHOOK_SECRET` | – | Helius echoes it as `Authorization`; the receiver rejects anything else |
 | `HELIUS_WEBHOOK_ID` | empty | pins a webhook id (otherwise the id from kv, else a lookup by URL) |
-| fixed: funder trace | 3 pages | `first_incoming_sol` per tagged wallet, cached in the DB |
+| `WEBHOOK_TOP_SCORE_MAX` | 25 | top-score wallets (non-bot, score ≥ 70) added to the webhook's address set |
+| fixed: funder trace | 3 pages | `first_incoming_sol` per tagged wallet, cached in the DB; a wallet with ≥ 3000 signatures gets no funder (its first tx was not reached) |
 | fixed: hub probe | 3 pages | an address with ≥ 3000 signatures is labelled `hub` |
 
 A wallet is not backfilled again within 6 hours. For a cheap smoke run use `EARLY_BUYERS_N=15 HELIUS_MAX_PAGES_PER_ADDRESS=2 SIG_SCAN_MAX_PAGES=10`.
@@ -123,18 +129,25 @@ A wallet is not backfilled again within 6 hours. For a cheap smoke run use `EARL
   - `deployer_link`: funding traces to the deployer within 2 hops.
   - `repeat_early`: a top-50 buyer in ≥ 3 runners.
 - **Hubs.** Exchange-like addresses (≥ 3000 signatures) are labelled `hub`. They never count as a shared funder, and funding traces stop at them.
+- **Buys for tagging.** One definition everywhere (insider tags, early buyers, forensics): `side = buy` with a positive SOL amount. Rent-only receipts and non-SOL-quoted rows never count.
+- **Truncated history.** When a mint or pool signature scan hits `SIG_SCAN_MAX_PAGES` with every page full, the oldest tx seen is not the launch. The token gets `history_truncated = true`, `deployer` and `pool_created_slot` stay empty, `sniper` and `deployer_link` are skipped, and `bundle` / `repeat_early` run on the earliest observed buyers. The token page says so.
+- **Funders.** A funder is the sender of the oldest plain SOL transfer into the wallet: txs with token transfers or a swap (swap proceeds, WSOL unwraps) are skipped, and when Helius lists instructions the System Program must be one of them. The parsed tx has no account owners, so this approximates "not from a program-owned pool".
 
 ## Security
 
 - Keys live only in `.env` and `web/.env.local`, both gitignored. Request URLs are redacted in logs, and errors are logged by type, so the Helius key and the webhook secret are never printed.
 - `HADES_API_KEY` stays on the server. The browser only talks to Next.js server routes, which add `X-Hades-Key`. `/api/*` answers 401 without the key, or 503 if no key is configured.
-- Watchlist writes through the web proxy require a same-origin `Origin` header (CSRF guard).
-- The engine binds to 127.0.0.1 by default. ngrok exposes the whole engine, but `/api/*` stays key-protected and `/webhook/helius` checks `Authorization`.
+- **Localhost only.** The engine (`hades serve`) and the web app (`npm run dev` / `npm run start`, `scripts/dev.sh`) bind to 127.0.0.1. The web app has no login: anyone who can reach it can read everything and edit the watchlist. Do not expose it (port forward, `-H 0.0.0.0`, a tunnel) without a reverse proxy that adds authentication.
+- Watchlist writes through the web proxy need an allow-listed `Origin` and `Host` (`HADES_PUBLIC_ORIGIN`, CSRF guard). The alerts and stream proxies need an allow-listed `Host`, which blocks DNS rebinding.
+- ngrok exposes the whole engine, but `/api/*` stays key-protected and `/webhook/helius` checks `Authorization`.
 - No private keys, no signing, no trading.
 
 ## Known limitations (Phase 1)
 
 - **Capped history.** Backfill reads at most `HELIUS_MAX_PAGES_PER_ADDRESS` pages. Older history is not seen (a warning is logged), so wallets with long histories have partial PnL.
+- **Rugged bags.** An open position with no trusted price (rugged, delisted, below the liquidity floor) adds 0 to unrealized PnL, so it does not lower the score. Its cost basis is shown as "Unpriced open cost" on the wallet page (`unpriced_cost_sol`); the score formula ignores it in Phase 1.
+- **Windows.** Wallet stats and the score use the last 30 days; positions and the PnL curve on the wallet page are all-time. The page labels each.
+- **Truncated tokens.** Old or very busy tokens can have `history_truncated`: no deployer, launch slot or sniper tags. DexScreener `pairCreatedAt` is not used as a fallback anchor.
 - **Unattributed legs.** Multi-leg transactions with several token legs get `sol_amount = null`. Sells dropped this way can leave phantom open positions; the $10k price floor limits the damage.
 - **PnL edge cases.**
   - A position reopened below 1 % of its old peak can still read as closed.
