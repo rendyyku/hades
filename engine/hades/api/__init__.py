@@ -1,0 +1,1 @@
+"""HADES read API (FastAPI)."""

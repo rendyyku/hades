@@ -1,0 +1,184 @@
+@import "tailwindcss";
+
+/* HADES design tokens (Global Constraints). Components use the Tailwind names, never raw hex. */
+:root {
+  --bg: #111122;
+  --surface: rgba(255, 255, 255, 0.05);
+  --border: rgba(255, 255, 255, 0.1);
+  --fg: #f2f2f2;
+  --muted: #9a9ab5;
+  --primary: #3d3dff;
+  --ember: #ff5a1f;
+  --gain: #22c55e;
+  --loss: #ef4444;
+}
+
+/*
+ * next/font exposes the families as --font-oswald / --font-mona / --font-fira
+ * (see app/layout.tsx); they are mapped to Tailwind's display/sans/mono here.
+ * Distinct names avoid a self-referencing custom property.
+ */
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-border: var(--border);
+  --color-fg: var(--fg);
+  --color-muted: var(--muted);
+  --color-primary: var(--primary);
+  --color-ember: var(--ember);
+  --color-gain: var(--gain);
+  --color-loss: var(--loss);
+
+  --font-display: var(--font-oswald), "Oswald", "Arial Narrow", sans-serif;
+  --font-sans: var(--font-mona), "Mona Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-fira), "Fira Code", ui-monospace, monospace;
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+    /* Keep focus targets clear of the sticky nav: two rows below 640px, h-14 from sm. */
+    scroll-padding-top: 7rem;
+  }
+
+  @media (min-width: 640px) {
+    html {
+      scroll-padding-top: 4rem;
+    }
+  }
+
+  body {
+    @apply bg-bg text-fg font-sans antialiased;
+  }
+
+  ::selection {
+    background: var(--primary);
+    color: var(--fg);
+  }
+
+  /*
+   * Two-tone focus ring (WCAG 1.4.11): --primary alone is 2.94:1 on --bg, so the
+   * outer ring is --fg (16.6:1 on --bg) and --primary fills the 2px offset gap.
+   * The outline paints above box-shadow, so --fg must be the outline itself.
+   */
+  :focus-visible {
+    outline: 2px solid var(--fg);
+    outline-offset: 2px;
+    box-shadow: 0 0 0 2px var(--primary);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Cerberus: new alert rows slide in (used via motion-safe: only). */
+@keyframes hades-slide-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* ---- Task 12b: hero art + threads overlay -------------------------------- */
+
+/*
+ * Fade the art's square edge into --bg (alpha mask; colour is irrelevant).
+ * The radial ellipse (75% radius) dissolves the corners while keeping all four
+ * fists (≤ 0.62 of the radius from center) fully opaque; the two linear ramps,
+ * intersected with it, guarantee the straight edges reach 0 alpha.
+ */
+.hades-hero-art {
+  -webkit-mask-image:
+    radial-gradient(75% 75% at 50% 50%, black 62%, transparent 98%),
+    linear-gradient(to right, transparent, black 7%, black 93%, transparent),
+    linear-gradient(to bottom, transparent, black 7%, black 93%, transparent);
+  -webkit-mask-composite: source-in;
+  mask-image:
+    radial-gradient(75% 75% at 50% 50%, black 62%, transparent 98%),
+    linear-gradient(to right, transparent, black 7%, black 93%, transparent),
+    linear-gradient(to bottom, transparent, black 7%, black 93%, transparent);
+  mask-composite: intersect;
+}
+
+.hades-thread-base {
+  stroke: var(--ember);
+  stroke-width: 1.2;
+  stroke-opacity: 0.12;
+  transition: stroke-opacity 200ms ease-out;
+}
+
+.hades-fist.is-near .hades-thread-base {
+  stroke-opacity: 0.35;
+}
+
+/* A short dash (pathLength=100) travels from the fist outward. */
+.hades-pulse {
+  stroke: var(--ember);
+  stroke-width: 1.6;
+  stroke-opacity: 0.85;
+  stroke-linecap: round;
+  stroke-dasharray: 8 100;
+  stroke-dashoffset: 8;
+  animation-name: hades-thread-pulse;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+}
+
+.hades-threads.is-paused .hades-pulse {
+  animation-play-state: paused;
+}
+
+@keyframes hades-thread-pulse {
+  from {
+    stroke-dashoffset: 8;
+  }
+  to {
+    stroke-dashoffset: -100;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hades-pulse {
+    display: none;
+  }
+  .hades-thread-base {
+    transition: none;
+  }
+}
+
+/* ---- Task 12b: Styx map ---------------------------------------------------- */
+
+/* Dotted starfield, tokens only. */
+.styx-field {
+  background-color: var(--bg);
+  background-image:
+    radial-gradient(circle at center, var(--border) 1px, transparent 1.5px),
+    radial-gradient(circle at center, var(--surface) 1px, transparent 1.5px);
+  background-size:
+    28px 28px,
+    11px 11px;
+  background-position:
+    0 0,
+    5px 7px;
+}
+
+.styx-node .styx-ring {
+  opacity: 0;
+}
+
+.styx-node:focus-visible .styx-ring {
+  opacity: 1;
+}

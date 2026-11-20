@@ -1,0 +1,409 @@
+"""Async Helius client: Enhanced Transactions API + RPC, rate-limited with retries.
+
+The API key is only ever placed in request query params; it is never logged,
+included in exception messages, or shown in repr().
+"""
+
+import asyncio
+import logging
+import re
+import time
+from collections.abc import Awaitable, Callable
+from typing import Any
+
+import httpx
+
+log = logging.getLogger(__name__)
+
+DEFAULT_API_BASE = "https://api.helius.xyz"
+DEFAULT_RPC_URL = "https://mainnet.helius-rpc.com/"
+PAGE_LIMIT = 100
+SIG_PAGE_LIMIT = 1000
+PARSE_CHUNK = 100
+
+SYSTEM_PROGRAM = "11111111111111111111111111111111"
+
+SleepFn = Callable[[float], Awaitable[Any]]
+
+_KEY_RE = re.compile(r"(api-key=)[^&\s\"']+")
+
+
+class _RedactApiKey(logging.Filter):
+    """httpx logs full request URLs at INFO; strip the api-key value."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        if "api-key=" in msg:
+            record.msg = _KEY_RE.sub(r"\1***", msg)
+            record.args = ()
+        return True
+
+
+_REDACTOR = _RedactApiKey()
+
+
+def _install_redactor() -> None:
+    for name in ("httpx", "httpcore"):
+        lg = logging.getLogger(name)
+        if _REDACTOR not in lg.filters:
+            lg.addFilter(_REDACTOR)
+
+
+class SigList(list):
+    """list[str] of signatures plus ``truncated``: the page cap was hit and every
+    page was full (no page shorter than SIG_PAGE_LIMIT), so the oldest entry may
+    not be the address's true first signature."""
+
+    def __init__(self, items=(), truncated: bool = False) -> None:
+        super().__init__(items)
+        self.truncated = truncated
+
+
+def sigs_truncated(sigs: list, max_pages: int) -> bool:
+    """Truncation signal of a signatures_oldest() result.
+
+    Uses ``SigList.truncated`` when present; for a plain list (test fakes, old
+    callers) falls back to ``len(sigs) >= max_pages * SIG_PAGE_LIMIT``.
+    """
+    flag = getattr(sigs, "truncated", None)
+    if flag is not None:
+        return bool(flag)
+    return len(sigs) >= max_pages * SIG_PAGE_LIMIT
+
+
+def _is_plain_sol_funding(tx: dict) -> bool:
+    """Can a native transfer in ``tx`` be a funding transfer?
+
+    The parsed tx carries no account owners, so "sender is not a program-owned
+    pool" is approximated by excluding txs that move tokens or swap: a tx with
+    any tokenTransfers, a swap event or type SWAP is not funding (swap proceeds
+    come from the pool vault with a token leg). When Helius includes
+    ``instructions``, the System Program must be among the (inner) program ids,
+    which rules out pure token-program lamport refunds (WSOL unwrap / close).
+    """
+    if tx.get("tokenTransfers") or (tx.get("events") or {}).get("swap") or tx.get("type") == "SWAP":
+        return False
+    instructions = tx.get("instructions")
+    if instructions is None:
+        return True
+    programs = set()
+    for ix in instructions:
+        programs.add(ix.get("programId"))
+        programs.update(inner.get("programId") for inner in ix.get("innerInstructions") or [])
+    return SYSTEM_PROGRAM in programs
+
+
+class HeliusError(Exception):
+    """Helius request failed (persistent 5xx, unexpected 4xx, RPC error, network).
+
+    For paginated calls, `partial` holds the items fetched before the failure
+    and `cursor` the `before` signature to resume from (None = from newest).
+    """
+
+    def __init__(
+        self, *args: object, partial: list[dict] | None = None, cursor: str | None = None,
+        status: int | None = None,
+    ) -> None:
+        super().__init__(*args)
+        self.partial: list[dict] = partial if partial is not None else []
+        self.cursor: str | None = cursor
+        self.status: int | None = status  # HTTP status of a non-retried 4xx, if any
+
+
+class HeliusRateLimited(HeliusError):
+    """Still HTTP 429 after all retries were used."""
+
+
+class _ContinueSearch(HeliusError):
+    """4xx from the Enhanced API telling us to keep paging from `cursor`."""
+
+
+# e.g. "... To continue search, query the API again with the `before` parameter set to <sig>."
+_CONTINUE_RE = re.compile(r"continue search.*?parameter set to\s+`?([A-Za-z0-9]+)", re.I | re.S)
+
+
+class TokenBucket:
+    """Async token bucket: `rate` tokens/sec, burst capacity `rate`."""
+
+    def __init__(self, rate: float, sleep: SleepFn = asyncio.sleep) -> None:
+        if rate <= 0:
+            raise ValueError("rate must be > 0")
+        self.rate = float(rate)
+        self.capacity = float(rate)
+        self.tokens = float(rate)
+        self.updated = time.monotonic()
+        self._sleep = sleep
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            while True:
+                now = time.monotonic()
+                self.tokens = min(self.capacity, self.tokens + (now - self.updated) * self.rate)
+                self.updated = now
+                if self.tokens >= 1:
+                    self.tokens -= 1
+                    return
+                await self._sleep((1 - self.tokens) / self.rate)
+
+
+class HeliusClient:
+    def __init__(
+        self,
+        api_key: str,
+        rps: float,
+        max_retries: int = 5,
+        *,
+        api_base: str = DEFAULT_API_BASE,
+        rpc_url: str = DEFAULT_RPC_URL,
+        base_delay: float = 0.5,
+        sleep: SleepFn = asyncio.sleep,
+        timeout: float = 30.0,
+        http: httpx.AsyncClient | None = None,
+    ) -> None:
+        _install_redactor()
+        self._api_key = api_key
+        self.max_retries = max_retries
+        self.api_base = api_base.rstrip("/")
+        self.rpc_url = rpc_url
+        self.base_delay = base_delay
+        self._sleep = sleep
+        self._bucket = TokenBucket(rps, sleep)
+        self._http = http or httpx.AsyncClient(timeout=timeout)
+        self._owns_http = http is None
+        self._rpc_id = 0
+
+    def __repr__(self) -> str:
+        return f"HeliusClient(api_base={self.api_base!r}, rpc_url={self.rpc_url!r})"
+
+    async def aclose(self) -> None:
+        if self._owns_http:
+            await self._http.aclose()
+
+    async def __aenter__(self) -> "HeliusClient":
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.aclose()
+
+    # -- transport -----------------------------------------------------------
+
+    async def _request(
+        self, method: str, url: str, *, params: dict[str, Any] | None = None, json: Any = None,
+        max_retries: int | None = None,
+    ) -> Any:
+        """Send with rate limiting; retry 429/5xx/network errors with backoff.
+
+        ``max_retries`` overrides the client default (0 = single attempt, used for
+        non-idempotent calls such as webhook creation). An empty body returns None.
+        """
+        retries = self.max_retries if max_retries is None else max_retries
+        query = {"api-key": self._api_key, **(params or {})}
+        safe_url = httpx.URL(url).copy_with(query=None)  # for logs/errors: no key
+        last_status: int | None = None
+        for attempt in range(retries + 1):
+            if attempt:
+                delay = self.base_delay * 2 ** (attempt - 1)
+                log.warning(
+                    "helius %s %s -> %s, retry %d/%d in %.2fs",
+                    method, safe_url, last_status or "network error", attempt, retries, delay,
+                )
+                await self._sleep(delay)
+            await self._bucket.acquire()
+            try:
+                resp = await self._http.request(method, url, params=query, json=json)
+            except httpx.TransportError as e:
+                last_status = None
+                last_exc_name = type(e).__name__
+                if attempt == retries:
+                    raise HeliusError(f"{method} {safe_url}: {last_exc_name}") from None
+                continue
+            status = resp.status_code
+            if status == 429 or status >= 500:
+                last_status = status
+                continue
+            if status >= 400:
+                m = _CONTINUE_RE.search(resp.text)
+                if m:
+                    raise _ContinueSearch(f"{method} {safe_url} -> HTTP {status} (continue)", cursor=m.group(1))
+                raise HeliusError(f"{method} {safe_url} -> HTTP {status}", status=status)
+            if not resp.content:
+                return None
+            return resp.json()
+        if last_status == 429:
+            raise HeliusRateLimited(
+                f"{method} {safe_url}: still HTTP 429 after {retries} retries", status=429
+            )
+        raise HeliusError(f"{method} {safe_url}: HTTP {last_status} after {retries} retries", status=last_status)
+
+    async def _rpc(self, method: str, params: list[Any]) -> Any:
+        self._rpc_id += 1
+        body = {"jsonrpc": "2.0", "id": self._rpc_id, "method": method, "params": params}
+        data = await self._request("POST", self.rpc_url, json=body)
+        if data.get("error"):
+            err = data["error"]
+            msg = err.get("message") if isinstance(err, dict) else err
+            raise HeliusError(f"RPC {method}: {msg}")
+        return data.get("result")
+
+    # -- Enhanced API --------------------------------------------------------
+
+    async def address_transactions(
+        self,
+        address: str,
+        *,
+        tx_type: str | None = "SWAP",
+        before: str | None = None,
+        max_pages: int,
+    ) -> list[dict]:
+        """Parsed txs for an address, newest first, 100 per page, up to max_pages.
+
+        A Helius "continue search with before=<sig>" 4xx is followed (it counts
+        toward max_pages). On any other failure the raised HeliusError carries
+        `partial` (items fetched so far) and `cursor` (resume with before=cursor).
+        """
+        url = f"{self.api_base}/v0/addresses/{address}/transactions"
+        out: list[dict] = []
+        cursor = before
+        for _ in range(max_pages):
+            params: dict[str, Any] = {"limit": PAGE_LIMIT}
+            if tx_type:
+                params["type"] = tx_type
+            if cursor:
+                params["before"] = cursor
+            try:
+                page = await self._request("GET", url, params=params)
+            except _ContinueSearch as e:
+                # Sparse type filter: no match in this search window; keep
+                # paging from the cursor Helius gave us (counts as a page).
+                cursor = e.cursor
+                continue
+            except HeliusError as e:
+                e.partial, e.cursor = out, cursor
+                raise
+            if not page:
+                break
+            out.extend(page)
+            cursor = page[-1].get("signature")
+            if not cursor:
+                break
+        return out
+
+    async def parse_transactions(self, signatures: list[str]) -> list[dict]:
+        """POST /v0/transactions in chunks of 100 signatures."""
+        url = f"{self.api_base}/v0/transactions"
+        out: list[dict] = []
+        for i in range(0, len(signatures), PARSE_CHUNK):
+            chunk = signatures[i : i + PARSE_CHUNK]
+            out.extend(await self._request("POST", url, json={"transactions": chunk}) or [])
+        return out
+
+    # -- RPC -----------------------------------------------------------------
+
+    async def signatures_oldest(self, address: str, max_pages: int) -> SigList:
+        """Signatures for address, paging backward; returned oldest -> newest.
+
+        If every one of the max_pages pages was full the result is marked
+        ``truncated``: it starts at the oldest signature that was reached, not
+        necessarily the address's true first signature.
+        """
+        newest_first: list[str] = []
+        before: str | None = None
+        truncated = max_pages > 0
+        for _ in range(max_pages):
+            opts: dict[str, Any] = {"limit": SIG_PAGE_LIMIT}
+            if before:
+                opts["before"] = before
+            result = await self._rpc("getSignaturesForAddress", [address, opts]) or []
+            newest_first.extend(r["signature"] for r in result)
+            if len(result) < SIG_PAGE_LIMIT:
+                truncated = False
+                break
+            before = result[-1]["signature"]
+        newest_first.reverse()
+        return SigList(newest_first, truncated=truncated)
+
+    async def first_incoming_sol(
+        self, address: str, max_pages: int = 5
+    ) -> tuple[str, str, int] | None:
+        """(funder, signature, slot) of the oldest plain SOL transfer into address.
+
+        Returns None when the signature scan is truncated (busy wallet): the oldest
+        tx reached is not the wallet's first, so any "first funder" would be fake.
+        Only plain System Program transfers count (see :func:`_is_plain_sol_funding`):
+        swap proceeds, WSOL unwraps and other token-program refunds are skipped.
+        """
+        sigs = await self.signatures_oldest(address, max_pages=max_pages)
+        if not sigs or sigs_truncated(sigs, max_pages):
+            return None
+        txs = await self.parse_transactions(sigs[:100])
+        order = {s: i for i, s in enumerate(sigs)}
+        txs.sort(key=lambda t: (t.get("slot") or 0, order.get(t.get("signature", ""), 0)))
+        for tx in txs:
+            if tx.get("transactionError") or not _is_plain_sol_funding(tx):
+                continue
+            for nt in tx.get("nativeTransfers") or []:
+                if nt.get("toUserAccount") == address and (nt.get("amount") or 0) > 0:
+                    return nt.get("fromUserAccount"), tx["signature"], int(tx["slot"])
+        return None
+
+    # -- webhooks ------------------------------------------------------------
+
+    async def list_webhooks(self) -> list[dict]:
+        """GET /v0/webhooks: every webhook on this API key (retried; idempotent)."""
+        data = await self._request("GET", f"{self.api_base}/v0/webhooks")
+        return [w for w in data if isinstance(w, dict)] if isinstance(data, list) else []
+
+    async def find_webhook(self, url: str) -> str | None:
+        """Id of an existing webhook whose webhookURL equals ``url``, else None."""
+        for w in await self.list_webhooks():
+            if w.get("webhookURL") == url and w.get("webhookID"):
+                return str(w["webhookID"])
+        return None
+
+    async def delete_webhook(self, webhook_id: str) -> None:
+        """DELETE /v0/webhooks/{id}. A 404 (already gone) is not an error."""
+        try:
+            await self._request("DELETE", f"{self.api_base}/v0/webhooks/{webhook_id}")
+        except HeliusError as e:
+            if e.status != 404:
+                raise
+
+    async def upsert_webhook(
+        self, addresses: list[str], url: str, secret: str, webhook_id: str | None = None
+    ) -> str:
+        """Create or update the enhanced SWAP webhook for ``url``; return its id.
+
+        Create is de-duplicated: an existing webhook with the same webhookURL is
+        reused (PUT) instead of POSTing a second one, and the POST itself is never
+        retried (a timed-out create may have succeeded; the next sync finds it by
+        URL). A PUT to an id Helius no longer knows (404) falls back to this
+        create path. Helius sends ``secret`` back verbatim in ``Authorization``.
+        """
+        body = {
+            "webhookURL": url,
+            "transactionTypes": ["SWAP"],
+            "accountAddresses": list(addresses),
+            "webhookType": "enhanced",
+            "authHeader": secret,
+        }
+        if webhook_id:
+            try:
+                return await self._put_webhook(webhook_id, body)
+            except HeliusError as e:
+                if e.status != 404:
+                    raise
+                log.warning("helius webhook %s not found (404); re-resolving by URL", webhook_id)
+        existing = await self.find_webhook(url)
+        if existing:
+            return await self._put_webhook(existing, body)
+        data = await self._request("POST", f"{self.api_base}/v0/webhooks", json=body, max_retries=0)
+        new_id = data.get("webhookID") if isinstance(data, dict) else None
+        if new_id:
+            return str(new_id)
+        raise HeliusError("POST /v0/webhooks: response has no webhookID")
+
+    async def _put_webhook(self, webhook_id: str, body: dict) -> str:
+        data = await self._request("PUT", f"{self.api_base}/v0/webhooks/{webhook_id}", json=body)
+        new_id = data.get("webhookID") if isinstance(data, dict) else None
+        return str(new_id) if new_id else webhook_id
