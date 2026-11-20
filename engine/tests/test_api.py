@@ -216,7 +216,7 @@ def test_wallet_detail_positions_and_curve(client):
     assert p1["first_buy_time"].startswith("2026-11-01T00:00:00")
     assert set(p1) == {"mint", "symbol", "bought_tokens", "sold_tokens", "cost_sol",
                        "proceeds_sol", "realized_pnl_sol", "remaining_tokens",
-                       "untracked_sell_tokens", "closed", "first_buy_time", "last_sell_time"}
+                       "untracked_sell_tokens", "unpriced_cost_sol", "closed", "first_buy_time", "last_sell_time"}
 
     curve = d["pnl_curve"]
     assert [c["t"][:19] for c in curve] == ["2026-11-01T00:10:00", "2026-11-01T00:30:00"]

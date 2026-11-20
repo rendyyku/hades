@@ -14,7 +14,7 @@ dependencies = [
     "fastapi",
     "uvicorn[standard]",
     "sse-starlette",
-    "typer",
+    "typer>=0.12",
 ]
 
 [project.scripts]

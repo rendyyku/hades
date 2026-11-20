@@ -21,6 +21,8 @@ PAGE_LIMIT = 100
 SIG_PAGE_LIMIT = 1000
 PARSE_CHUNK = 100
 
+SYSTEM_PROGRAM = "11111111111111111111111111111111"
+
 SleepFn = Callable[[float], Awaitable[Any]]
 
 _KEY_RE = re.compile(r"(api-key=)[^&\s\"']+")
@@ -45,6 +47,50 @@ def _install_redactor() -> None:
         lg = logging.getLogger(name)
         if _REDACTOR not in lg.filters:
             lg.addFilter(_REDACTOR)
+
+
+class SigList(list):
+    """list[str] of signatures plus ``truncated``: the page cap was hit and every
+    page was full (no page shorter than SIG_PAGE_LIMIT), so the oldest entry may
+    not be the address's true first signature."""
+
+    def __init__(self, items=(), truncated: bool = False) -> None:
+        super().__init__(items)
+        self.truncated = truncated
+
+
+def sigs_truncated(sigs: list, max_pages: int) -> bool:
+    """Truncation signal of a signatures_oldest() result.
+
+    Uses ``SigList.truncated`` when present; for a plain list (test fakes, old
+    callers) falls back to ``len(sigs) >= max_pages * SIG_PAGE_LIMIT``.
+    """
+    flag = getattr(sigs, "truncated", None)
+    if flag is not None:
+        return bool(flag)
+    return len(sigs) >= max_pages * SIG_PAGE_LIMIT
+
+
+def _is_plain_sol_funding(tx: dict) -> bool:
+    """Can a native transfer in ``tx`` be a funding transfer?
+
+    The parsed tx carries no account owners, so "sender is not a program-owned
+    pool" is approximated by excluding txs that move tokens or swap: a tx with
+    any tokenTransfers, a swap event or type SWAP is not funding (swap proceeds
+    come from the pool vault with a token leg). When Helius includes
+    ``instructions``, the System Program must be among the (inner) program ids,
+    which rules out pure token-program lamport refunds (WSOL unwrap / close).
+    """
+    if tx.get("tokenTransfers") or (tx.get("events") or {}).get("swap") or tx.get("type") == "SWAP":
+        return False
+    instructions = tx.get("instructions")
+    if instructions is None:
+        return True
+    programs = set()
+    for ix in instructions:
+        programs.add(ix.get("programId"))
+        programs.update(inner.get("programId") for inner in ix.get("innerInstructions") or [])
+    return SYSTEM_PROGRAM in programs
 
 
 class HeliusError(Exception):
@@ -254,15 +300,16 @@ class HeliusClient:
 
     # -- RPC -----------------------------------------------------------------
 
-    async def signatures_oldest(self, address: str, max_pages: int) -> list[str]:
+    async def signatures_oldest(self, address: str, max_pages: int) -> SigList:
         """Signatures for address, paging backward; returned oldest -> newest.
 
-        If the address has more than max_pages*1000 signatures the result is
-        truncated: it starts at the oldest signature that was reached, not the
-        address's true first signature.
+        If every one of the max_pages pages was full the result is marked
+        ``truncated``: it starts at the oldest signature that was reached, not
+        necessarily the address's true first signature.
         """
         newest_first: list[str] = []
         before: str | None = None
+        truncated = max_pages > 0
         for _ in range(max_pages):
             opts: dict[str, Any] = {"limit": SIG_PAGE_LIMIT}
             if before:
@@ -270,23 +317,30 @@ class HeliusClient:
             result = await self._rpc("getSignaturesForAddress", [address, opts]) or []
             newest_first.extend(r["signature"] for r in result)
             if len(result) < SIG_PAGE_LIMIT:
+                truncated = False
                 break
             before = result[-1]["signature"]
         newest_first.reverse()
-        return newest_first
+        return SigList(newest_first, truncated=truncated)
 
     async def first_incoming_sol(
         self, address: str, max_pages: int = 5
     ) -> tuple[str, str, int] | None:
-        """(funder, signature, slot) of the oldest native SOL transfer into address."""
+        """(funder, signature, slot) of the oldest plain SOL transfer into address.
+
+        Returns None when the signature scan is truncated (busy wallet): the oldest
+        tx reached is not the wallet's first, so any "first funder" would be fake.
+        Only plain System Program transfers count (see :func:`_is_plain_sol_funding`):
+        swap proceeds, WSOL unwraps and other token-program refunds are skipped.
+        """
         sigs = await self.signatures_oldest(address, max_pages=max_pages)
-        if not sigs:
+        if not sigs or sigs_truncated(sigs, max_pages):
             return None
         txs = await self.parse_transactions(sigs[:100])
         order = {s: i for i, s in enumerate(sigs)}
         txs.sort(key=lambda t: (t.get("slot") or 0, order.get(t.get("signature", ""), 0)))
         for tx in txs:
-            if tx.get("transactionError"):
+            if tx.get("transactionError") or not _is_plain_sol_funding(tx):
                 continue
             for nt in tx.get("nativeTransfers") or []:
                 if nt.get("toUserAccount") == address and (nt.get("amount") or 0) > 0:

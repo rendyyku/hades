@@ -13,8 +13,10 @@ from sqlalchemy import (
     Integer,
     String,
     TypeDecorator,
+    and_,
     create_engine,
     event,
+    false,
     inspect,
     text,
 )
@@ -71,6 +73,12 @@ class Token(Base):
     first_seen_at: Mapped[datetime | None] = mapped_column(TZDateTime, default=utcnow)
     peak_mcap_usd: Mapped[float | None] = mapped_column(Float)
     is_runner: Mapped[bool] = mapped_column(Boolean, default=False)
+    # True when the mint or pool signature scan hit its page cap: the oldest tx seen
+    # may not be the first, so deployer / pool_created_* are stored as NULL and the
+    # early buyers are the earliest *observed*, not the launch buyers.
+    history_truncated: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False, server_default=false()
+    )
 
 
 class Swap(Base):
@@ -86,6 +94,21 @@ class Swap(Base):
     sol_amount: Mapped[float | None] = mapped_column(Float)  # None = not SOL-quoted
     source: Mapped[str] = mapped_column(String)  # 'backfill' | 'webhook'
     dex: Mapped[str | None] = mapped_column(String)
+
+
+def real_buy_filter():
+    """SQL predicate for a "real" buy: side='buy' with a positive SOL amount.
+
+    The single definition of a buy for insider tagging and forensics: rent-only
+    receipts / non-SOL-quoted rows (``sol_amount IS NULL``) and zero-SOL rows are
+    never buys. :func:`is_real_buy` is the in-memory twin.
+    """
+    return and_(Swap.side == "buy", Swap.sol_amount.is_not(None), Swap.sol_amount > 0)
+
+
+def is_real_buy(s: Any) -> bool:
+    """Python twin of :func:`real_buy_filter` for ORM ``Swap`` / ``ParsedSwap`` objects."""
+    return s.side == "buy" and s.sol_amount is not None and s.sol_amount > 0
 
 
 class Wallet(Base):
@@ -115,6 +138,8 @@ class WalletStats(Base):
     win_rate: Mapped[float | None] = mapped_column(Float)
     median_hold_sec: Mapped[float | None] = mapped_column(Float)
     trades_per_day: Mapped[float | None] = mapped_column(Float)
+    # cost basis of open positions (in the window) with no trusted price at rescore
+    unpriced_cost_sol: Mapped[float | None] = mapped_column(Float, default=0.0)
     score: Mapped[float | None] = mapped_column(Float)
     computed_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
 
@@ -191,6 +216,9 @@ def make_engine(url: str) -> Engine:
 _ADDED_COLUMNS = (
     ("wallets", "funding_signature", "VARCHAR"),
     ("wallets", "funding_slot", "INTEGER"),
+    # FALSE (not 0) so the same DDL is valid on SQLite >= 3.23 and Postgres.
+    ("tokens", "history_truncated", "BOOLEAN NOT NULL DEFAULT FALSE"),
+    ("wallet_stats", "unpriced_cost_sol", "FLOAT DEFAULT 0"),
 )
 
 

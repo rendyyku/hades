@@ -27,7 +27,7 @@ from typing import Any, Iterable
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from hades.db import Swap, Token, Wallet, WalletTag
+from hades.db import Swap, Token, Wallet, WalletTag, is_real_buy, real_buy_filter
 
 FUNDER_SCAN_MAX_PAGES = 3
 HUB_SIG_THRESHOLD = 3000
@@ -161,7 +161,7 @@ async def trace_funder(session: Session, helius: Any, address: str, hops: int = 
 
 def _buys(token: Token, swaps: Iterable[Swap]) -> list[Swap]:
     return sorted(
-        (s for s in swaps if s.mint == token.mint and s.side == "buy"),
+        (s for s in swaps if s.mint == token.mint and is_real_buy(s)),
         key=lambda s: (s.slot, s.signature),
     )
 
@@ -291,7 +291,7 @@ def tag_repeat_early(session: Session) -> list[Tag]:
     for mint in runners:
         rows = session.execute(
             select(Swap.wallet, Swap.signature, Swap.slot)
-            .where(Swap.mint == mint, Swap.side == "buy")
+            .where(Swap.mint == mint, real_buy_filter())
             .order_by(Swap.slot, Swap.signature)
         ).all()
         seen: set[str] = set()
@@ -375,15 +375,20 @@ async def tag_token(session: Session, helius: Any, token: Token) -> list[Tag]:
 
     Stored per-token tags no longer detected are deleted (R20a); a refused new
     tag leaves its old row in place. Returns only the persisted tags.
+
+    A token with ``history_truncated`` (or a NULL anchor) gets no ``sniper`` /
+    ``deployer_link`` tags: its launch slot / deployer are unknown. ``bundle``
+    still runs, over the earliest *observed* buyers.
     """
     swaps = session.scalars(
         select(Swap)
-        .where(Swap.mint == token.mint, Swap.side == "buy")
+        .where(Swap.mint == token.mint, real_buy_filter())
         .order_by(Swap.slot, Swap.signature)
     ).all()
     buyers = list(dict.fromkeys(s.wallet for s in swaps))
+    anchored = not token.history_truncated
 
-    tags = detect_snipers(token, swaps)
+    tags = detect_snipers(token, swaps) if anchored else []
 
     funders: dict[str, str] = {}
     funding: dict[str, tuple[str, int]] = {}
@@ -399,7 +404,8 @@ async def tag_token(session: Session, helius: Any, token: Token) -> list[Tag]:
                 hubs.add(n)
 
     tags += detect_bundles(token, swaps, funders, hubs, funding)
-    tags += await detect_deployer_link(session, helius, token, buyers, hubs, swaps=swaps)
+    if anchored:
+        tags += await detect_deployer_link(session, helius, token, buyers, hubs, swaps=swaps)
 
     # R20a: drop stored per-token tags the new run no longer produces. A key whose
     # new version is refused keeps its old (valid) row: no evidence is lost.

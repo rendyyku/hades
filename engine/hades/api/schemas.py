@@ -50,6 +50,7 @@ class WalletStatsOut(BaseModel):
     win_rate: float | None
     median_hold_sec: float | None
     trades_per_day: float | None
+    unpriced_cost_sol: float | None = None
     score: float | None
     computed_at: datetime | None
 
@@ -64,6 +65,9 @@ class PositionRow(BaseModel):
     realized_pnl_sol: float
     remaining_tokens: float
     untracked_sell_tokens: float
+    # open cost basis: the read API never prices positions, so every open
+    # position's remaining cost is unpriced here (0 when closed)
+    unpriced_cost_sol: float = 0.0
     closed: bool
     first_buy_time: datetime | None
     last_sell_time: datetime | None
@@ -88,6 +92,10 @@ class PnlPoint(BaseModel):
 
 
 class WalletDetail(BaseModel):
+    # stats window (days); positions and the PnL curve are all-time
+    window_days: int
+    is_bot: bool = False
+    min_tokens_closed: int
     stats: WalletStatsOut | None
     positions: list[PositionRow]
     tags: list[TagRow]
@@ -111,6 +119,9 @@ class TokenOut(BaseModel):
     is_runner: bool | None
     # Wallet.first_funder of the deployer (Task 12b, Styx map).
     deployer_funder: str | None = None
+    # signature scan hit its page cap: deployer / pool_created_* unknown (NULL),
+    # early buyers are the earliest observed, not the launch buyers
+    history_truncated: bool = False
 
 
 class EarlyBuyer(BaseModel):

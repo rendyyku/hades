@@ -43,6 +43,9 @@ class WalletStatsData:
     consistency: float
     score: float | None
     computed_at: datetime
+    # cost basis of open positions with no trusted price (rugged / delisted bags):
+    # reported, NOT folded into the score (see README Known limitations)
+    unpriced_cost_sol: float = 0.0
 
 
 def _consistency(positions: Iterable[Any], now: datetime) -> float:
@@ -77,6 +80,10 @@ def wallet_stats(
 
     realized = sum(p.realized_pnl_sol for p in pos_list)
     unrealized = sum(unrealized_pnl(p, prices.get(p.mint)) for p in pos_list)
+    unpriced_cost = sum(
+        p.remaining_cost_sol for p in pos_list
+        if not p.closed and p.remaining_tokens > 0 and prices.get(p.mint) is None
+    )
     wins = sum(1 for p in closed if p.realized_pnl_sol > 0)
     win_rate = wins / len(closed) if closed else 0.0
 
@@ -110,6 +117,7 @@ def wallet_stats(
         consistency=_consistency(pos_list, now),
         score=None,
         computed_at=now,
+        unpriced_cost_sol=unpriced_cost,
     )
 
 
@@ -162,6 +170,7 @@ def persist_stats(session: Session, stats: Iterable[WalletStatsData]) -> None:
         row.win_rate = st.win_rate
         row.median_hold_sec = st.median_hold_sec
         row.trades_per_day = st.trades_per_day
+        row.unpriced_cost_sol = st.unpriced_cost_sol
         row.score = st.score
         row.computed_at = st.computed_at
 

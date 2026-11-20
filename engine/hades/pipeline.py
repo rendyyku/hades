@@ -15,13 +15,13 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from hades.config import Settings, get_settings
-from hades.db import Swap, Token, Wallet
+from hades.db import Swap, Token, Wallet, is_real_buy
 from hades.ingest.parse import ParsedSwap, parse_swaps
 from hades.insider import replace_repeat_early
 from hades.pnl import compute_positions
 from hades.scoring import persist_stats, score_wallets, wallet_stats
 from hades.sources.dexscreener import _num, base_address, best_pair, is_runner, sol_price_native
-from hades.sources.helius import PAGE_LIMIT, PARSE_CHUNK, SIG_PAGE_LIMIT, HeliusError
+from hades.sources.helius import PAGE_LIMIT, PARSE_CHUNK, HeliusError, sigs_truncated
 
 log = logging.getLogger(__name__)
 
@@ -72,14 +72,26 @@ def _parse_all(txs: Iterable[dict]) -> list[ParsedSwap]:
     return out
 
 
-async def _oldest_tx(helius: Any, address: str, max_pages: int) -> dict | None:
+class EarlyBuyers(list):
+    """list[str] of buyer wallets plus ``truncated`` (the pool scan hit its page cap,
+    so these are the earliest *observed* buyers, not the launch buyers)."""
+
+    def __init__(self, items=(), truncated: bool = False) -> None:
+        super().__init__(items)
+        self.truncated = truncated
+
+
+async def _oldest_tx(helius: Any, address: str, max_pages: int) -> tuple[dict | None, bool]:
+    """(oldest tx seen, truncated). A truncated scan's oldest tx is NOT an anchor."""
     sigs = await helius.signatures_oldest(address, max_pages)
     if not sigs:
-        return None
-    if len(sigs) >= max_pages * SIG_PAGE_LIMIT:
-        log.warning("signature scan of %s truncated at %d pages; oldest tx may not be the first", address, max_pages)
+        return None, False
+    truncated = sigs_truncated(sigs, max_pages)
+    if truncated:
+        log.warning("signature scan of %s truncated at %d pages; its oldest tx is not an anchor",
+                    address, max_pages)
     txs = await helius.parse_transactions([sigs[0]])
-    return txs[0] if txs else None
+    return (txs[0] if txs else None), truncated
 
 
 # -- seed ----------------------------------------------------------------------
@@ -88,7 +100,12 @@ async def _oldest_tx(helius: Any, address: str, max_pages: int) -> dict | None:
 async def seed_token(
     session: Session, helius: Any, dex: Any, mint: str, settings: Settings, now: datetime | None = None
 ) -> Token:
-    """Upsert a Token from DexScreener's best pair + its oldest mint/pool txs."""
+    """Upsert a Token from DexScreener's best pair + its oldest mint/pool txs.
+
+    A truncated scan (page cap hit, every page full) never writes a fake anchor:
+    a truncated mint scan stores ``deployer=NULL``, a truncated pool scan stores
+    ``pool_created_slot/at=NULL``, and either sets ``history_truncated``.
+    """
     now = _now(now)
     pairs = [p for p in await dex.token_pairs([mint]) if base_address(p) == mint]
     if not pairs:
@@ -110,16 +127,23 @@ async def seed_token(
         tok.peak_mcap_usd = fdv
 
     max_pages = settings.SIG_SCAN_MAX_PAGES
-    create_tx = await _oldest_tx(helius, mint, max_pages)
-    if create_tx and create_tx.get("feePayer"):
+    create_tx, mint_truncated = await _oldest_tx(helius, mint, max_pages)
+    if mint_truncated:
+        tok.deployer = None
+    elif create_tx and create_tx.get("feePayer"):
         tok.deployer = create_tx["feePayer"]
+    pool_truncated = False
     if pool:
-        pool_tx = await _oldest_tx(helius, pool, max_pages)
-        if pool_tx:
+        pool_tx, pool_truncated = await _oldest_tx(helius, pool, max_pages)
+        if pool_truncated:
+            tok.pool_created_slot = None
+            tok.pool_created_at = None
+        elif pool_tx:
             if pool_tx.get("slot") is not None:
                 tok.pool_created_slot = int(pool_tx["slot"])
             if pool_tx.get("timestamp") is not None:
                 tok.pool_created_at = datetime.fromtimestamp(int(pool_tx["timestamp"]), timezone.utc)
+    tok.history_truncated = mint_truncated or pool_truncated
 
     session.commit()
     return tok
@@ -130,7 +154,7 @@ async def seed_token(
 
 async def early_buyers(
     session: Session, helius: Any, token: Token, n: int, *, sig_max_pages: int | None = None
-) -> list[str]:
+) -> EarlyBuyers:
     """First n unique buy wallets of token's pool, ordered by (slot, signature).
 
     Parses the pool's signatures oldest-first in chunks of 100 and stops once
@@ -139,13 +163,22 @@ async def early_buyers(
     the pool are not saved, since their histories would be partial.
 
     Multi-leg buys (one tx buying several tokens) have sol_amount=None and so
-    never make a wallet an early buyer (deferred minor 7).
+    never make a wallet an early buyer (deferred minor 7). A buy is
+    :func:`hades.db.is_real_buy` (positive SOL amount).
+
+    The result's ``truncated`` is True when the pool scan hit its page cap; the
+    token is then flagged ``history_truncated`` (anchors are left to seed_token).
     """
     if not token.pool_address:
         raise ValueError(f"token {token.mint} has no pool_address; seed it first")
     if sig_max_pages is None:
         sig_max_pages = get_settings().SIG_SCAN_MAX_PAGES
     sigs = await helius.signatures_oldest(token.pool_address, sig_max_pages)
+    truncated = bool(sigs) and sigs_truncated(sigs, sig_max_pages)
+    if truncated:
+        log.warning("pool scan of %s truncated at %d pages; buyers are the earliest observed, "
+                    "not the launch buyers", token.pool_address, sig_max_pages)
+        token.history_truncated = True
 
     buyers: list[str] = []
     seen: set[str] = set()
@@ -158,7 +191,7 @@ async def early_buyers(
         swaps.sort(key=lambda s: (s.slot, s.signature))
         pool_swaps.extend(swaps)
         for s in swaps:
-            if s.side == "buy" and s.wallet not in seen and len(buyers) < n:
+            if is_real_buy(s) and s.wallet not in seen and len(buyers) < n:
                 seen.add(s.wallet)
                 buyers.append(s.wallet)
 
@@ -168,7 +201,7 @@ async def early_buyers(
     for w in buyers:
         _ensure_wallet(session, w)
     session.commit()
-    return buyers
+    return EarlyBuyers(buyers, truncated=truncated)
 
 
 # -- backfill ------------------------------------------------------------------

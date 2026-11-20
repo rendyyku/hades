@@ -11,6 +11,7 @@ and watchlist -> Helius webhook sync (the only outbound network call).
 from __future__ import annotations
 
 import asyncio
+import json
 import secrets
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
@@ -26,6 +27,7 @@ from hades.api import schemas as S
 from hades.config import Settings, get_settings
 from hades.db import (
     Alert,
+    real_buy_filter,
     Swap,
     Token,
     Wallet,
@@ -36,11 +38,14 @@ from hades.db import (
     make_engine,
 )
 from hades.pnl import compute_positions
+from hades.pipeline import WINDOW_DAYS
+from hades.scoring import MIN_TOKENS_CLOSED
 from hades.realtime import AlertBus, alert_events, ingest_webhook, sync_webhook
 
 EARLY_BUYERS_LIMIT = 100
 PING_INTERVAL_SEC = 15
 MAX_WEBHOOK_TXS = 1000
+MAX_WEBHOOK_BYTES = 5 * 1024 * 1024
 SYNC_HEADER = "X-Webhook-Sync"
 FUNDING_HOPS = 3
 SORT_COLUMNS = {
@@ -198,7 +203,9 @@ def wallet_detail(address: str, session: Session = Depends(get_session)) -> S.Wa
             mint=p.mint, symbol=symbols.get(p.mint), bought_tokens=p.bought_tokens,
             sold_tokens=p.sold_tokens, cost_sol=p.cost_sol, proceeds_sol=p.proceeds_sol,
             realized_pnl_sol=p.realized_pnl_sol, remaining_tokens=p.remaining_tokens,
-            untracked_sell_tokens=p.untracked_sell_tokens, closed=p.closed,
+            untracked_sell_tokens=p.untracked_sell_tokens,
+            unpriced_cost_sol=p.remaining_cost_sol if not p.closed and p.remaining_tokens > 0 else 0.0,
+            closed=p.closed,
             first_buy_time=p.first_buy_time, last_sell_time=p.last_sell_time,
         )
         for p in ordered
@@ -218,6 +225,9 @@ def wallet_detail(address: str, session: Session = Depends(get_session)) -> S.Wa
         )
     ]
     return S.WalletDetail(
+        window_days=(stats.window_days if stats and stats.window_days else WINDOW_DAYS),
+        is_bot=bool(wallet.is_bot) if wallet else False,
+        min_tokens_closed=MIN_TOKENS_CLOSED,
         stats=S.WalletStatsOut.model_validate(stats) if stats else None,
         positions=pos_rows,
         tags=tags,
@@ -234,7 +244,7 @@ def token_forensics(mint: str, session: Session = Depends(get_session)) -> S.Tok
 
     buyers: dict[str, Swap] = {}
     buys = session.scalars(
-        select(Swap).where(Swap.mint == mint, Swap.side == "buy").order_by(Swap.slot, Swap.signature)
+        select(Swap).where(Swap.mint == mint, real_buy_filter()).order_by(Swap.slot, Swap.signature)
     )
     for s in buys:
         if s.wallet not in buyers:
@@ -383,8 +393,18 @@ async def helius_webhook(
         authorization.encode("utf-8"), secret.encode("utf-8")
     ):
         raise HTTPException(status_code=401, detail="invalid webhook secret")
+    # Size cap before parsing: a declared Content-Length over the cap is refused
+    # without reading; a chunked body is read up to the cap and then refused.
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > MAX_WEBHOOK_BYTES:
+        raise HTTPException(status_code=413, detail="payload too large")
+    raw = bytearray()
+    async for chunk in request.stream():
+        raw += chunk
+        if len(raw) > MAX_WEBHOOK_BYTES:
+            raise HTTPException(status_code=413, detail="payload too large")
     try:
-        body = await request.json()
+        body = json.loads(raw)
     except ValueError:
         raise HTTPException(status_code=400, detail="invalid json") from None
     if isinstance(body, dict):

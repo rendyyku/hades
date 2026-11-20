@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     EARLY_BUYERS_N: int = 100
     SIG_SCAN_MAX_PAGES: int = 30
     RATE_LIMIT_RPS: int = 8
+    # live webhook also follows the top-N non-bot wallets with score >= ALERT_MIN_SCORE
+    WEBHOOK_TOP_SCORE_MAX: int = 25
 
 
 @lru_cache

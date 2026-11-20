@@ -20,7 +20,9 @@ from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
 from hades.api import schemas as S
-from hades.db import Alert, Kv, Swap, Token, WalletStats, Watchlist
+from sqlalchemy import func
+
+from hades.db import Alert, Kv, Swap, Token, Wallet, WalletStats, Watchlist
 from hades.ingest.parse import parse_swaps
 from hades.sources.helius import HeliusClient
 
@@ -163,9 +165,25 @@ def ingest_webhook(engine, txs: list[Any]) -> tuple[int, list[dict]]:
 
 # -- watchlist -> Helius webhook sync -----------------------------------------------
 
+def top_score_addresses(session: Session, limit: int) -> list[str]:
+    """Non-bot wallets with score >= ALERT_MIN_SCORE, best first (ties by address), max ``limit``."""
+    if limit <= 0:
+        return []
+    return list(session.scalars(
+        select(WalletStats.address)
+        .outerjoin(Wallet, Wallet.address == WalletStats.address)
+        .where(WalletStats.score >= ALERT_MIN_SCORE, func.coalesce(Wallet.is_bot, False).is_(False))
+        .order_by(WalletStats.score.desc(), WalletStats.address)
+        .limit(limit)
+    ))
+
+
 def _sync_inputs(engine, settings) -> tuple[list[str], str | None]:
+    """Webhook address set = watchlist ∪ top-score wallets (capped), sorted."""
     with Session(engine) as session:
-        addresses = list(session.scalars(select(Watchlist.address).order_by(Watchlist.address)))
+        watch = set(session.scalars(select(Watchlist.address)))
+        top = top_score_addresses(session, settings.WEBHOOK_TOP_SCORE_MAX)
+        addresses = sorted(watch | set(top))
         webhook_id = settings.HELIUS_WEBHOOK_ID or None
         if not webhook_id:
             kv = session.get(Kv, KV_WEBHOOK_ID)
@@ -193,10 +211,12 @@ def effective_webhook_id(engine, settings) -> str | None:
 
 
 async def sync_webhook(app) -> str:
-    """Push the watchlist to the Helius webhook. Returns 'ok' | 'skipped' | 'error'.
+    """Push the live address set to the Helius webhook. Returns 'ok' | 'skipped' | 'error'.
 
-    Non-empty watchlist -> upsert (create is de-duplicated by URL, never retried).
-    Empty watchlist -> DELETE the webhook (known id, else one found by URL) and
+    Address set = watchlist + the top WEBHOOK_TOP_SCORE_MAX non-bot wallets with
+    score >= ALERT_MIN_SCORE (the same wallets that raise alerts).
+    Non-empty set -> upsert (create is de-duplicated by URL, never retried).
+    Empty set -> DELETE the webhook (known id, else one found by URL) and
     clear the stored id. Never raises: the watchlist change is already committed.
     """
     settings = app.state.settings

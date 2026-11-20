@@ -18,7 +18,11 @@ from hades.insider import TOKEN_TAGS, Tag, tag_token
 from hades.sources.dexscreener import DexScreener
 from hades.sources.helius import HeliusClient, HeliusError
 
-app = typer.Typer(help="HADES smart-money engine", no_args_is_help=True, add_completion=False)
+# pretty_exceptions_show_locals=False: a traceback must never print locals (settings carry keys).
+app = typer.Typer(
+    help="HADES smart-money engine", no_args_is_help=True, add_completion=False,
+    pretty_exceptions_show_locals=False,
+)
 log = logging.getLogger("hades.cli")
 
 
@@ -116,7 +120,8 @@ def seed(mint: str) -> None:
     tok = asyncio.run(run())
     typer.echo(
         f"seeded {tok.symbol} {tok.mint}: pool={tok.pool_address} deployer={tok.deployer} "
-        f"pool_created_slot={tok.pool_created_slot} runner={tok.is_runner} fdv={tok.peak_mcap_usd}"
+        f"pool_created_slot={tok.pool_created_slot} runner={tok.is_runner} fdv={tok.peak_mcap_usd} "
+        f"history_truncated={tok.history_truncated}"
     )
 
 
@@ -164,7 +169,9 @@ def backfill(
                         session, helius, tok, settings.EARLY_BUYERS_N, sig_max_pages=settings.SIG_SCAN_MAX_PAGES
                     )
                     n_buyers = len(addresses)
-                    typer.echo(f"early buyers: {n_buyers}")
+                    note = " (history truncated: earliest observed, not launch buyers)" \
+                        if getattr(addresses, "truncated", False) else ""
+                    typer.echo(f"early buyers: {n_buyers}{note}")
                 saved = failed = 0
                 for addr in addresses:
                     try:
@@ -240,28 +247,37 @@ def rescore() -> None:
             typer.echo(f"  {score:6.2f}  {addr}  pnl={pnl:+.3f} SOL  closed={closed}")
     else:
         typer.echo("no wallet eligible for a score yet (needs >= 5 closed tokens, non-bot)")
+    if settings.PUBLIC_WEBHOOK_URL:  # scores changed: refresh the live address set
+        status, _ = _sync_once(settings)
+        typer.echo(f"webhook sync: {status}")
 
 
-@app.command("webhook-sync")
-def webhook_sync() -> None:
-    """Push the current watchlist to the Helius webhook once (create/update/delete)."""
+def _sync_once(settings: Settings) -> tuple[str, str | None]:
+    """Run realtime.sync_webhook once outside the API process; (status, webhook id)."""
     from types import SimpleNamespace
 
-    from hades.realtime import effective_webhook_id, sync_webhook
+    from hades import realtime
 
-    settings = get_settings()
     engine = make_engine(settings.DATABASE_URL)
     init_db(engine)
 
     async def run() -> str:
         state = SimpleNamespace(settings=settings, engine=engine, sync_lock=asyncio.Lock())
-        return await sync_webhook(SimpleNamespace(state=state))
+        return await realtime.sync_webhook(SimpleNamespace(state=state))
 
     try:
         status = asyncio.run(run())
-        wid = effective_webhook_id(engine, settings)
+        wid = realtime.effective_webhook_id(engine, settings)
     finally:
         engine.dispose()
+    return status, wid
+
+
+@app.command("webhook-sync")
+def webhook_sync() -> None:
+    """Push the live address set (watchlist + top scores) to the Helius webhook once."""
+    settings = get_settings()
+    status, wid = _sync_once(settings)
     typer.echo(f"webhook sync: {status}  webhook id: {wid or '-'}")
     if status == "skipped":
         typer.echo("PUBLIC_WEBHOOK_URL is not set; nothing to sync", err=True)
