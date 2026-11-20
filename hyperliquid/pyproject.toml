@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hades-hl"
+version = "0.1.0"
+description = "HADES Hyperliquid head - wallet discovery, scoring and paper copy for Hyperliquid perps"
+requires-python = ">=3.12"
+dependencies = [
+    "hades-core",
+    "fastapi",
+    "uvicorn[standard]",
+    "sqlalchemy>=2",
+    "httpx",
+    "websockets",
+    "typer>=0.12",
+    "pydantic-settings>=2",
+]
+
+[project.scripts]
+hades-hl = "hades_hl.cli:app"
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "respx",
+]
+
+[tool.uv.sources]
+hades-core = { path = "../core", editable = true }
+
+[tool.setuptools.packages.find]
+include = ["hades_hl*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
