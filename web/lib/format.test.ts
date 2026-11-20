@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatPct, formatScore, formatSol, relTime, shortAddr } from "./format";
+import { formatDuration, formatPct, formatScore, formatSol, relTime, shortAddr } from "./format";
 
 const MINUS = "\u2212";
 
@@ -80,5 +80,25 @@ describe("relTime", () => {
   it("returns an em dash for null or invalid input", () => {
     expect(relTime(null, now)).toBe("—");
     expect(relTime("not-a-date", now)).toBe("—");
+  });
+});
+
+describe("formatDuration", () => {
+  it("formats seconds, minutes, hours and days", () => {
+    expect(formatDuration(45)).toBe("45s");
+    expect(formatDuration(0)).toBe("0s");
+    expect(formatDuration(125)).toBe("2m 5s");
+    expect(formatDuration(3600)).toBe("1h 0m");
+    expect(formatDuration(5430)).toBe("1h 30m");
+    expect(formatDuration(90000)).toBe("1d 1h");
+  });
+  it("rounds fractional seconds", () => {
+    expect(formatDuration(44.6)).toBe("45s");
+  });
+  it("returns an em dash for null, NaN or negative input", () => {
+    expect(formatDuration(null)).toBe("—");
+    expect(formatDuration(undefined)).toBe("—");
+    expect(formatDuration(Number.NaN)).toBe("—");
+    expect(formatDuration(-5)).toBe("—");
   });
 });

@@ -1,42 +1,37 @@
-import { Minus, TrendingDown, TrendingUp } from "lucide-react";
+import type { ReactNode } from "react";
 import type { WalletRow } from "@/lib/api";
-import { formatPct, formatScore, formatSol } from "@/lib/format";
+import { formatPct, formatScore } from "@/lib/format";
 import { Address } from "./Address";
-
-function Pnl({ value }: { value: number | null }) {
-  if (value === null || value === 0) {
-    return (
-      <span className="inline-flex items-center justify-end gap-1.5 text-muted">
-        <Minus aria-hidden="true" className="size-3.5" />
-        {formatSol(value)}
-      </span>
-    );
-  }
-  const up = value > 0;
-  const Icon = up ? TrendingUp : TrendingDown;
-  return (
-    <span className={`inline-flex items-center justify-end gap-1.5 ${up ? "text-gain" : "text-loss"}`}>
-      <Icon aria-hidden="true" className="size-3.5" />
-      {formatSol(value)}
-    </span>
-  );
-}
+import { Pnl } from "./Pnl";
+import { TagBadge } from "./TagBadge";
 
 const TH = "px-3 py-3 text-left text-xs font-normal uppercase tracking-[0.14em] text-muted";
 const TD = "px-3 py-3 align-middle";
 
-export function WalletTable({ rows }: { rows: WalletRow[] }) {
+type Props = {
+  rows: WalletRow[];
+  /** Added to the 1-based row index (pagination). */
+  rankOffset?: number;
+  caption?: string;
+  empty?: ReactNode;
+};
+
+export function WalletTable({ rows, rankOffset = 0, caption = "Top wallets by score", empty }: Props) {
   if (rows.length === 0) {
     return (
-      <p className="rounded-lg border border-border bg-surface p-5 text-sm text-muted">
-        No scored wallets yet. Run a backfill and <code className="font-mono">hades rescore</code>.
-      </p>
+      <div className="rounded-lg border border-border bg-surface p-5 text-sm text-muted">
+        {empty ?? (
+          <p>
+            No scored wallets yet. Run a backfill and <code className="font-mono">hades rescore</code>.
+          </p>
+        )}
+      </div>
     );
   }
   return (
     <div className="overflow-x-auto rounded-lg border border-border">
       <table className="w-full min-w-[760px] border-collapse text-sm">
-        <caption className="sr-only">Top wallets by score</caption>
+        <caption className="sr-only">{caption}</caption>
         <thead className="border-b border-border">
           <tr>
             <th scope="col" className={`${TH} w-12`}>#</th>
@@ -54,9 +49,9 @@ export function WalletTable({ rows }: { rows: WalletRow[] }) {
               key={r.address}
               className="border-b border-border transition-colors duration-200 last:border-b-0 hover:bg-white/[0.03]"
             >
-              <td className={`${TD} font-mono tabular-nums text-muted`}>{i + 1}</td>
+              <td className={`${TD} font-mono tabular-nums text-muted`}>{rankOffset + i + 1}</td>
               <td className={TD}>
-                <Address value={r.address} />
+                <Address value={r.address} href={`/wallet/${r.address}`} />
               </td>
               <td className={`${TD} text-right font-mono tabular-nums text-fg`}>{formatScore(r.score)}</td>
               <td className={`${TD} text-right font-mono tabular-nums`}>
@@ -68,11 +63,8 @@ export function WalletTable({ rows }: { rows: WalletRow[] }) {
                 <ul className="flex flex-wrap gap-1.5">
                   {r.tags.length === 0 ? <li className="text-muted">—</li> : null}
                   {r.tags.map((t) => (
-                    <li
-                      key={t}
-                      className="rounded border border-ember/40 px-1.5 py-0.5 font-mono text-[11px] uppercase tracking-wide text-ember"
-                    >
-                      {t}
+                    <li key={t}>
+                      <TagBadge tag={t} />
                     </li>
                   ))}
                 </ul>

@@ -58,3 +58,13 @@ export function relTime(iso: string | null | undefined, now: Date = new Date()):
   if (hr < 24) return `${hr}h ago`;
   return `${Math.floor(hr / 24)}d ago`;
 }
+
+/** Compact duration from seconds: `45s`, `2m 5s`, `1h 0m`, `1d 1h`. */
+export function formatDuration(sec: number | null | undefined): string {
+  if (!isNum(sec) || sec < 0) return DASH;
+  const s = Math.round(sec);
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+  return `${Math.floor(s / 86400)}d ${Math.floor((s % 86400) / 3600)}h`;
+}
