@@ -6,6 +6,7 @@ import { ErrorCard } from "@/components/ErrorCard";
 import { TxLink } from "@/components/FundingChain";
 import { Section } from "@/components/Section";
 import { StatCard } from "@/components/StatCard";
+import { StyxMap } from "@/components/StyxMap";
 import { TagBadge } from "@/components/TagBadge";
 import { apiGet, type TokenForensics } from "@/lib/api";
 import { formatSol, relTime, shortAddr } from "@/lib/format";
@@ -199,11 +200,16 @@ export default async function TokenPage({ params }: { params: Params }) {
             )}
           </Section>
 
-          {/* Task 12b: Styx funding map renders into #styx-map. */}
           <Section index="#4" title="Styx map">
-            <div id="styx-map" className="rounded-lg border border-dashed border-border bg-surface p-5 text-sm text-muted">
-              Coming soon
-            </div>
+            {res.data.early_buyers.length === 0 ? (
+              <p className="rounded-lg border border-border bg-surface p-5 text-sm text-muted">
+                No early buyers to map.
+              </p>
+            ) : (
+              <div id="styx-map">
+                <StyxMap data={res.data} />
+              </div>
+            )}
           </Section>
         </>
       )}

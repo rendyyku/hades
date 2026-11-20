@@ -109,6 +109,8 @@ class TokenOut(BaseModel):
     first_seen_at: datetime | None
     peak_mcap_usd: float | None
     is_runner: bool | None
+    # Wallet.first_funder of the deployer (Task 12b, Styx map).
+    deployer_funder: str | None = None
 
 
 class EarlyBuyer(BaseModel):
@@ -117,6 +119,8 @@ class EarlyBuyer(BaseModel):
     signature: str
     sol_amount: float | None
     tags: list[str]
+    funder: str | None = None  # Wallet.first_funder
+    funder_is_hub: bool = False  # funder's Wallet.label == "hub"
 
 
 class Bundle(BaseModel):

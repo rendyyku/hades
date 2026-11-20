@@ -18,7 +18,7 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from sqlalchemy import and_, exists, func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 from sse_starlette.sse import EventSourceResponse
 from starlette.concurrency import run_in_threadpool
 
@@ -252,9 +252,25 @@ def token_forensics(mint: str, session: Session = Depends(get_session)) -> S.Tok
         )
         for addr, tag in rows:
             tag_map[addr].add(tag)
+    # Funders in one batched query: buyer -> first_funder, plus the funder's own
+    # label (hub?) via an aliased outer join. The deployer rides along so the
+    # token's deployer_funder needs no extra round trip.
+    funder_map: dict[str, tuple[str | None, bool]] = {}
+    lookup = list(buyers) + ([token.deployer] if token.deployer else [])
+    if lookup:
+        fw = aliased(Wallet)
+        rows = session.execute(
+            select(Wallet.address, Wallet.first_funder, fw.label)
+            .outerjoin(fw, fw.address == Wallet.first_funder)
+            .where(Wallet.address.in_(lookup))
+        )
+        for addr, funder, flabel in rows:
+            funder_map[addr] = (funder, bool(funder) and flabel == "hub")
     early = [
         S.EarlyBuyer(address=a, slot=s.slot, signature=s.signature, sol_amount=s.sol_amount,
-                     tags=sorted(tag_map[a]))
+                     tags=sorted(tag_map[a]),
+                     funder=funder_map.get(a, (None, False))[0],
+                     funder_is_hub=funder_map.get(a, (None, False))[1])
         for a, s in buyers.items()
     ]
 
@@ -269,7 +285,12 @@ def token_forensics(mint: str, session: Session = Depends(get_session)) -> S.Tok
             b.wallets.append(t.address)
 
     return S.TokenForensics(
-        token=S.TokenOut.model_validate(token), early_buyers=early, bundles=list(clusters.values())
+        token=S.TokenOut.model_validate(token).model_copy(
+            update={"deployer_funder": funder_map.get(token.deployer, (None, False))[0]
+                    if token.deployer else None}
+        ),
+        early_buyers=early,
+        bundles=list(clusters.values()),
     )
 
 

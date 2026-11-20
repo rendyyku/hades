@@ -253,7 +253,8 @@ def test_token_forensics_shape(client):
     eb = d["early_buyers"]
     assert [b["address"] for b in eb] == [W_A, W_B, W_C]  # (slot, signature), unique
     assert eb[0] == {"address": W_A, "slot": 101, "signature": "s1", "sol_amount": 1.0,
-                     "tags": ["bundle", "repeat_early", "sniper"]}
+                     "tags": ["bundle", "repeat_early", "sniper"],
+                     "funder": FUNDER1, "funder_is_hub": False}
     assert eb[2]["tags"] == []  # W_C's tag is for MINT2
     assert d["bundles"] == [{"cluster": "c1", "funder": FUNDER1, "wallets": [W_A, W_B]}]
 
@@ -335,3 +336,81 @@ def test_alerts_unknown_mint_symbol_null(client):
         s.commit()
     rows = client.get("/api/alerts?limit=1", headers=H).json()
     assert rows[0]["signature"] == "a9" and rows[0]["symbol"] is None
+
+
+# -- token forensics: funders (Task 12b) ------------------------------------------
+
+HUB = "K" * 32 + "k1"
+DEP_FUNDER = "L" * 32 + "l2"
+
+
+def _count_queries(engine):
+    from sqlalchemy import event
+
+    stmts: list[str] = []
+
+    def _on(conn, cursor, statement, params, context, executemany):
+        stmts.append(statement)
+
+    event.listen(engine, "before_cursor_execute", _on)
+    return stmts, lambda: event.remove(engine, "before_cursor_execute", _on)
+
+
+def test_token_buyer_funder_present_and_null(client):
+    d = client.get("/api/tokens/" + MINT, headers=H).json()
+    eb = {b["address"]: b for b in d["early_buyers"]}
+    assert eb[W_A]["funder"] == FUNDER1
+    assert eb[W_A]["funder_is_hub"] is False
+    assert eb[W_B]["funder"] is None  # wallet row, no first_funder
+    assert eb[W_B]["funder_is_hub"] is False
+    assert d["token"]["deployer_funder"] is None  # FUNDER4 has no wallet row
+
+
+def test_token_buyer_hub_funder_and_deployer_funder(client):
+    engine = client.app.state.engine
+    with Session(engine) as s:
+        s.add(Wallet(address=HUB, label="hub"))
+        s.add(Wallet(address=FUNDER4, first_funder=DEP_FUNDER))
+        s.get(Wallet, W_B).first_funder = HUB
+        s.commit()
+    d = client.get("/api/tokens/" + MINT, headers=H).json()
+    eb = {b["address"]: b for b in d["early_buyers"]}
+    assert eb[W_B]["funder"] == HUB
+    assert eb[W_B]["funder_is_hub"] is True
+    assert eb[W_A]["funder_is_hub"] is False
+    assert d["token"]["deployer_funder"] == DEP_FUNDER
+
+
+def test_token_buyer_without_wallet_row_has_null_funder(client):
+    engine = client.app.state.engine
+    W_X = "X" * 32 + "x1"
+    with Session(engine) as s:
+        s.add(_swap("sx", W_X, MINT, 105, 3, "buy", 10, 0.2))
+        s.commit()
+    d = client.get("/api/tokens/" + MINT, headers=H).json()
+    b = next(b for b in d["early_buyers"] if b["address"] == W_X)
+    assert b["funder"] is None and b["funder_is_hub"] is False
+
+
+def test_token_funders_no_n_plus_one(client):
+    engine = client.app.state.engine
+    with Session(engine) as s:
+        for i in range(20):
+            addr = f"{i:02d}".replace("0", "Z") + "W" * 32
+            s.add(Wallet(address=addr, first_funder=FUNDER1))
+            s.add(_swap(f"n{i}", addr, MINT, 200 + i, 5, "buy", 1, 0.1))
+        s.commit()
+    stmts, stop = _count_queries(engine)
+    try:
+        small = client.get("/api/tokens/" + MINT2, headers=H)
+        n_small = len(stmts)
+        stmts.clear()
+        big = client.get("/api/tokens/" + MINT, headers=H)
+        n_big = len(stmts)
+    finally:
+        stop()
+    assert small.status_code == big.status_code == 200
+    assert len(big.json()["early_buyers"]) == 23
+    # Query count is independent of the number of buyers (no per-buyer lookups).
+    assert n_big <= n_small
+    assert n_big <= 8

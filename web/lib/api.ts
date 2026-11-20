@@ -125,6 +125,8 @@ export interface TokenOut {
   first_seen_at: string | null;
   peak_mcap_usd: number | null;
   is_runner: boolean | null;
+  /** Wallet.first_funder of the deployer. */
+  deployer_funder: string | null;
 }
 
 export interface EarlyBuyer {
@@ -133,6 +135,10 @@ export interface EarlyBuyer {
   signature: string;
   sol_amount: number | null;
   tags: string[];
+  /** Wallet.first_funder of the buyer. */
+  funder: string | null;
+  /** True when the funder is labeled 'hub'. */
+  funder_is_hub: boolean;
 }
 
 export interface Bundle {

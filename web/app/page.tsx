@@ -1,10 +1,12 @@
-import { ArrowRight } from "lucide-react";
+import { Activity, ArrowRight } from "lucide-react";
+import Image from "next/image";
 import Link from "next/link";
 import { AlertTable } from "@/components/AlertTable";
 import { BadgeView } from "@/components/BadgeView";
 import { ErrorCard } from "@/components/ErrorCard";
 import { Section } from "@/components/Section";
 import { StatCard } from "@/components/StatCard";
+import { ThreadsOverlay } from "@/components/ThreadsOverlay";
 import { WalletTable } from "@/components/WalletTable";
 import { apiGet, type AlertRow, type Overview } from "@/lib/api";
 import { relTime } from "@/lib/format";
@@ -24,16 +26,43 @@ export default async function OverviewPage() {
 
   return (
     <div className="flex flex-col gap-16 sm:gap-20">
-      <header className="pt-14 sm:pt-20">
-        <p className="mb-4 font-mono text-xs uppercase tracking-[0.2em] text-muted">
-          Solana memecoin smart-money &amp; insider intelligence
-        </p>
-        <h1 className="font-display font-light uppercase leading-[0.85] tracking-tight text-fg text-[clamp(64px,12vw,160px)]">
-          HADES
-        </h1>
-        <p className="mt-6 max-w-xl text-lg text-fg sm:text-2xl">
-          Smart money always leaves a trail<span className="text-ember">.</span>
-        </p>
+      <header className="grid grid-cols-1 items-center gap-10 pt-14 sm:pt-20 lg:grid-cols-2 lg:gap-12">
+        <div>
+          <p className="mb-4 font-mono text-xs uppercase tracking-[0.2em] text-muted">
+            Solana memecoin smart-money &amp; insider intelligence
+          </p>
+          <h1 className="font-display font-light uppercase leading-[0.85] tracking-tight text-fg text-[clamp(64px,12vw,160px)]">
+            HADES
+          </h1>
+          <p className="mt-6 max-w-xl text-lg text-fg sm:text-2xl">
+            Smart money always leaves a trail<span className="text-ember">.</span>
+          </p>
+          <div className="mt-10 flex flex-wrap gap-4">
+            <Link
+              href="/wallets"
+              className="inline-flex min-h-11 cursor-pointer items-center gap-2 rounded bg-primary px-5 text-sm font-medium text-fg transition-colors duration-200 hover:bg-primary/85"
+            >
+              Open Judgement <ArrowRight aria-hidden="true" className="size-4" />
+            </Link>
+            <Link
+              href="/live"
+              className="inline-flex min-h-11 cursor-pointer items-center gap-2 rounded border border-muted px-5 text-sm font-medium text-fg transition-colors duration-200 hover:border-fg hover:bg-surface"
+            >
+              <Activity aria-hidden="true" className="size-4 text-ember" /> Cerberus live
+            </Link>
+          </div>
+        </div>
+        <div className="hades-hero-art relative mx-auto aspect-square w-full max-w-[560px]">
+          <Image
+            src="/art/hades-hero.webp"
+            alt="Engraving of Hades, Lord of the Many Threads, pulling taut threads in four fists"
+            fill
+            priority
+            sizes="(min-width:1024px) 560px, 92vw"
+            className="hades-hero object-cover"
+          />
+          <ThreadsOverlay />
+        </div>
       </header>
 
       {!res.ok ? (
