@@ -2,10 +2,47 @@
 
 HADES is a private, self-hosted tool for studying Solana memecoin trading. It finds tokens that "ran" (from DexScreener boosts), reads their early on-chain buyers through Helius, rebuilds each buyer's swap history and average-cost PnL in SOL, and scores wallets with a transparent formula. It also tags insider patterns: snipers, bundles, deployer-linked funding and repeat early buyers. A Next.js dashboard shows the leaderboard, wallet and token forensics, a funding-flow map, a watchlist and live alerts fed by a Helius webhook. It is read-only: HADES never holds private keys and never signs or sends transactions. Scores describe past behaviour and predict nothing.
 
-Modules: Judgement (leaderboard) · Styx (funding trace) · Cerberus (watchlist and live alerts) · Tartarus (insider/bundle).
+Phase 2a adds a second head for **Hyperliquid perps** (`hyperliquid/`, CLI `hades-hl`) and a shared pure library (`core/`, `hades-core`). The HL head discovers wallets from the Hyperliquid leaderboard, backfills their fills and funding, scores them, tags insider patterns, and paper-copies the wallets it follows in real time. Each follow climbs a ladder (PAPER → NOTIF → COPY) only through a consistency gate. It is paper only: no keys, no signing, no orders.
+
+Modules: Judgement (leaderboard) · Styx (funding trace) · Cerberus (watchlist and live alerts, fan-in over every head) · Tartarus (insider/bundle) · Paper Arena (paper copies, gate and ladder).
 Design: `docs/superpowers/specs/2026-11-19-hades-design.md` · Plan: `docs/superpowers/plans/2026-11-19-hades-phase1.md`.
 
-## Architecture
+## Three heads
+
+[Architecture diagram (Archify, interactive HTML)](docs/architecture/hades-phase2a.html) · source: `docs/architecture/hades-phase2a.architecture.json`.
+
+| Part | Path | Runs as | Port |
+|---|---|---|---|
+| `hades-core` | `core/` | library (pure): trade events, head API contract, paper simulator, gate, ladder | – |
+| Hyperliquid head | `hyperliquid/` | `hades-hl serve`: the head API **and** the background runtime in one process | 8010 |
+| Solana head (Phase 1 engine) | `engine/` | `hades serve` | 8000 |
+| Web | `web/` | Next.js | 3000 |
+
+```
+                      Hyperliquid public API / WS (read-only: info, userFills, prices, leaderboard)
+                                   ▲                                 ▲
+   ┌───────────── hyperliquid/ (hades-hl) ─────────────┐             │
+   │ CLI: init-db · discover · backfill · rescore ·    │─────────────┘
+   │      tag · follow-sync · follow-add/remove        │
+   │ serve (one process):                              │
+   │   runtime: WS fill watcher, price recorder,       │──── hades-core (core/):
+   │     paper runs every 60 s, reconcile, ladder,     │     simulate · gate · ladder ·
+   │     alerts, daily backfill/rescore/follow sync    │     head contract models
+   │   FastAPI /api/* (X-Hades-Key) + /api/stream SSE  │
+   │ SQLite hades_hl.db                                │
+   └──────────────────────────┬────────────────────────┘
+                              │ server-side fetch / SSE with HL_API_KEY
+   ┌──────────────────────────▼──────────────────────────────────────────┐
+   │ web/ (Next.js): /hyperliquid · /arena · /live (Cerberus fan-in) ... │
+   │   per-head server-side proxies (lib/heads.ts, lib/headProxy.ts)     │
+   └──────────────────────────▲──────────────────────────────────────────┘
+                              │ server-side fetch / SSE with HADES_API_KEY
+                      engine/ (Solana head, below)
+```
+
+Everything binds 127.0.0.1. Each head has its own key (`HADES_API_KEY`, `HL_API_KEY`); the browser only talks to Next.js server routes.
+
+## Solana head architecture (Phase 1)
 
 ```
  DexScreener (boosts, pairs, prices)        Helius (Enhanced API, RPC, webhooks)
@@ -36,11 +73,14 @@ Requires Python 3.12 (via [uv](https://docs.astral.sh/uv/)) and Node 22 or newer
 uv venv --python 3.12 engine/.venv
 source engine/.venv/bin/activate        # Windows git-bash: source engine/.venv/Scripts/activate
 uv pip install -e "engine[dev]"
+(cd hyperliquid && uv sync --extra dev)  # hyperliquid/.venv with hades-hl and hades-core (editable path dependency)
 (cd web && npm ci)
 
-cp .env.example .env                    # engine: HELIUS_API_KEY, HADES_API_KEY, HELIUS_WEBHOOK_SECRET, ...
-cp web/.env.example web/.env.local      # web: HADES_API_URL and the same HADES_API_KEY
+cp .env.example .env                    # engine: HELIUS_API_KEY, HADES_API_KEY, ...; HL head: HL_API_KEY, HL_DATABASE_URL, ...
+cp web/.env.example web/.env.local      # web: HADES_API_URL/HADES_API_KEY and HL_API_URL/HL_API_KEY (same keys)
 ```
+
+`hades-hl` reads `HL_*` settings from the environment or `.env` in the current directory or its parent. `HL_API_KEY` is the HL head's `X-Hades-Key`; without it the HL API answers 503.
 
 The engine reads `.env` from the current directory or its parent, so `hades` works from the repo root and from `engine/`. Make `HADES_API_KEY` and `HELIUS_WEBHOOK_SECRET` long random strings, e.g. `python -c "import secrets;print(secrets.token_urlsafe(32))"`.
 
@@ -58,6 +98,37 @@ hades serve --port 8000             # API on 127.0.0.1:8000
 hades webhook-sync                  # push the watchlist to the Helius webhook once
 ```
 
+## Hyperliquid head
+
+```bash
+hades-hl init-db                      # create/migrate hades_hl.db (HL_DATABASE_URL; idempotent)
+hades-hl discover --limit 200         # leaderboard candidates (cached 24 h), vaults excluded, one-request activity probe each
+hades-hl backfill --all --days 30     # fills (newest first, coverage tracked) + funding; or --address 0x...
+hades-hl rescore                      # stats + scores from the stored fills
+hades-hl tag --all                    # insider tags with evidence: pre_listing, pre_move, fresh_whale (or --address)
+hades-hl follow-sync                  # auto-follow the top HL_AUTO_FOLLOW_N (10) non-bot wallets by score
+hades-hl follow-add 0x... [0x...]     # manual follows (cap HL_MAX_FOLLOWS = 25); follow-remove, follows
+hades-hl paper-run --all              # one paper run, prints the summaries
+hades-hl serve --port 8010            # API on 127.0.0.1:8010 + runtime (WS fills, prices, paper every 60 s, daily rescore)
+hades-hl watch --seconds 60           # debug: fill watcher + price recorder, prints fills and median delay
+```
+
+`serve --no-api` runs only the runtime; `serve --seconds N` stops after N seconds. Details of discovery, backfill coverage and the runtime: `hyperliquid/README.md`.
+
+### Paper rules
+
+- **Copy price.** We copy at our own recorded mid (moved against us by half-spread and slippage), never at the leader's fill price.
+- **Missed.** A leader fill with no live price recorded within 30 s of its observation is a missed copy.
+- **Start.** Paper copying starts at `follow_started_at`. A position the leader opened before that is ignored until it ends; there is no history fill-in.
+- **Sizing.** Bankroll 10,000 USD. Each copy commits 5% of the current paper equity as margin, at the leader's leverage capped at 10x. Every position is isolated: its loss is capped at its margin, and it is liquidated when that is reached.
+- **Funding** is charged as a holding cost on open copies.
+
+### Gate and ladder
+
+- **Default gate:** ≥ 28 days since `follow_started_at`, ≥ 30 closed paper trades, net PnL > 0, max drawdown < 20%, and the top trade ≤ 50% of net.
+- **Ladder:** `PAPER → NOTIF` when the full gate passes. `COPY` is entered only by explicit owner action (and still sends no orders). `NOTIF`/`COPY` drop back to `PAPER` when the rolling window has net ≤ 0 or a drawdown ≥ 20%.
+- The arena also shows the gap: leader PnL minus paper PnL over the same window.
+
 ## Running the web app
 
 ```bash
@@ -66,7 +137,7 @@ npm run dev                          # http://127.0.0.1:3000 (binds to 127.0.0.1
 npm run build && npm run start       # production, also 127.0.0.1 only
 ```
 
-`scripts/dev.sh` starts the engine and the web dev server together (both on 127.0.0.1) and stops both on Ctrl-C. It needs bash ≥ 4.3 (`wait -n`): Linux bash and Windows git-bash work; the bash 3.2 that ships with macOS does not. `ENGINE_PORT` and `WEB_PORT` override 8000 and 3000. If you change `ENGINE_PORT`, point `HADES_API_URL` at it. dev.sh sets `HADES_PUBLIC_ORIGIN` to `http://localhost:$WEB_PORT,http://127.0.0.1:$WEB_PORT` unless you set it.
+`scripts/dev.sh` starts the Solana engine (8000), the Hyperliquid head (`hades-hl serve`, API and runtime, 8010) and the web dev server (3000) together, all on 127.0.0.1, and stops all three on Ctrl-C or when one exits. It needs bash ≥ 4.3 (`wait -n`): Linux bash and Windows git-bash work; the bash 3.2 that ships with macOS does not. `ENGINE_PORT`, `HL_PORT` and `WEB_PORT` override 8000, 8010 and 3000. If you change `ENGINE_PORT` or `HL_PORT`, point `HADES_API_URL` or `HL_API_URL` at it. dev.sh sets `HADES_PUBLIC_ORIGIN` to `http://localhost:$WEB_PORT,http://127.0.0.1:$WEB_PORT` unless you set it.
 
 `HADES_PUBLIC_ORIGIN` (in `web/.env.local`) is a comma-separated list of exact origins, default `http://localhost:3000,http://127.0.0.1:3000`. Watchlist writes need an `Origin` in the list and a `Host` among its hosts; `/api/alerts` and `/api/stream` need the `Host`. Anything else gets 403. Set it if you use another port or hostname.
 
@@ -137,12 +208,35 @@ A wallet is not backfilled again within 6 hours. For a cheap smoke run use `EARL
 
 - Keys live only in `.env` and `web/.env.local`, both gitignored. Request URLs are redacted in logs, and errors are logged by type, so the Helius key and the webhook secret are never printed.
 - `HADES_API_KEY` stays on the server. The browser only talks to Next.js server routes, which add `X-Hades-Key`. `/api/*` answers 401 without the key, or 503 if no key is configured.
-- **Localhost only.** The engine (`hades serve`) and the web app (`npm run dev` / `npm run start`, `scripts/dev.sh`) bind to 127.0.0.1. The web app has no login: anyone who can reach it can read everything and edit the watchlist. Do not expose it (port forward, `-H 0.0.0.0`, a tunnel) without a reverse proxy that adds authentication.
+- **Localhost only.** The engine (`hades serve`), the HL head (`hades-hl serve`) and the web app (`npm run dev` / `npm run start`, `scripts/dev.sh`) bind to 127.0.0.1. The web app has no login: anyone who can reach it can read everything and edit the watchlist. Do not expose it (port forward, `-H 0.0.0.0`, a tunnel) without a reverse proxy that adds authentication.
 - Watchlist writes through the web proxy need an allow-listed `Origin` and `Host` (`HADES_PUBLIC_ORIGIN`, CSRF guard). The alerts and stream proxies need an allow-listed `Host`, which blocks DNS rebinding.
 - ngrok exposes the whole engine, but `/api/*` stays key-protected and `/webhook/helius` checks `Authorization`.
-- No private keys, no signing, no trading.
+- No private keys, no signing, no trading. The HL head uses only Hyperliquid's public read-only info API and WebSocket (plus the public leaderboard and vault JSON the HL app loads).
 
-## Known limitations (Phase 1)
+## Tests
+
+```bash
+(cd core && uv run pytest -q)
+(cd hyperliquid && uv run pytest -q)
+(cd engine && pytest -q)                # in engine/.venv
+(cd web && npm run lint && npx vitest run && npm run build)
+```
+
+CI (`.github/workflows/ci.yml`) runs the same four jobs: `engine`, `core`, `hyperliquid` (plain pip: `pip install -e core -e "hyperliquid[dev]"`, since `[tool.uv.sources]` is uv-only) and `web`.
+
+## Known limitations (Hyperliquid head, Phase 2a)
+
+- **No execution.** No keys, no signing, no orders: paper only. `COPY` on the ladder is a label.
+- **10k-fill history cap.** HL returns at most the newest 10,000 fills of a wallet, so hyperactive wallets have partial history (`history_partial`). A partial wallet is scored only if its covered span is ≥ 7 days.
+- **Approximate liquidation.** No maintenance margin and no fees in the liquidation test: a copy is liquidated when its loss reaches its isolated margin. Committed margin is not bounded across positions (several copies can together commit more than equity).
+- **Liquidation timing.** Liquidation is evaluated only at hourly persisted marks and at events, so intra-hour wicks can be missed. The live "now" point on the equity curve is display-only.
+- **Funding** is charged as an accrued cost and is not capped by the margin.
+- **Scaling-in traders** produce few opens, so the insider `pre_move` tag rarely fires for them.
+- **Outages.** After a watcher outage, recovered fills older than 10 min are counted as missed.
+- **Discovery bias.** The HL top-PnL leaderboard is dominated by bots. Discovery prefilters (account value, volume/equity, month PnL, vaults) and probes recent activity with the bot rule, so it can miss high-turnover human traders.
+- **Unofficial feeds.** The leaderboard and vault list are the JSON the HL web app loads, not documented API.
+
+## Known limitations (Solana head, Phase 1)
 
 - **Capped history.** Backfill reads at most `HELIUS_MAX_PAGES_PER_ADDRESS` pages. Older history is not seen (a warning is logged), so wallets with long histories have partial PnL.
 - **Rugged bags.** An open position with no trusted price (rugged, delisted, below the liquidity floor) adds 0 to unrealized PnL, so it does not lower the score. Its cost basis is shown as "Unpriced open cost" on the wallet page (`unpriced_cost_sol`); the score formula ignores it in Phase 1.

@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# Start the HADES engine (API) and the web dev server together; Ctrl-C stops both.
-#   ENGINE_PORT (default 8000)  WEB_PORT (default 3000)
-# Both bind to 127.0.0.1 only. Needs bash >= 4.3 (`wait -n`): Linux bash and Windows
+# Start the HADES heads and the web dev server together; Ctrl-C stops all three:
+# the Solana engine (hades serve), the Hyperliquid head (hades-hl serve: API + runtime)
+# and the web app.
+#   ENGINE_PORT (default 8000)  HL_PORT (default 8010)  WEB_PORT (default 3000)
+# All bind to 127.0.0.1 only. Needs bash >= 4.3 (`wait -n`): Linux bash and Windows
 # git-bash work; macOS ships bash 3.2, so install a newer bash first. Run from anywhere.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENGINE_PORT="${ENGINE_PORT:-8000}"
+HL_PORT="${HL_PORT:-8010}"
 WEB_PORT="${WEB_PORT:-3000}"
 # The web server routes accept only these origins/hosts (see web/.env.example).
 export HADES_PUBLIC_ORIGIN="${HADES_PUBLIC_ORIGIN:-http://localhost:$WEB_PORT,http://127.0.0.1:$WEB_PORT}"
@@ -22,10 +25,21 @@ else
   exit 1
 fi
 
+if [ -x "$ROOT/hyperliquid/.venv/Scripts/hades-hl.exe" ]; then
+  HADES_HL="$ROOT/hyperliquid/.venv/Scripts/hades-hl.exe"   # Windows venv
+elif [ -x "$ROOT/hyperliquid/.venv/bin/hades-hl" ]; then
+  HADES_HL="$ROOT/hyperliquid/.venv/bin/hades-hl"
+elif command -v hades-hl >/dev/null 2>&1; then
+  HADES_HL="$(command -v hades-hl)"
+else
+  echo "hades-hl CLI not found: (cd hyperliquid && uv sync --extra dev)" >&2
+  exit 1
+fi
+
 pids=()
 cleanup() {
   trap - INT TERM EXIT
-  echo "stopping engine and web..."
+  echo "stopping engine, hyperliquid head and web..."
   for pid in "${pids[@]}"; do
     if command -v taskkill >/dev/null 2>&1; then
       # git-bash: native children (python, node) survive a bash kill; kill the Windows tree
@@ -43,9 +57,11 @@ trap cleanup INT TERM EXIT
 set -m  # each background job gets its own process group
 (cd "$ROOT" && exec "$HADES" serve --host 127.0.0.1 --port "$ENGINE_PORT") &
 pids+=("$!")
+(cd "$ROOT" && exec "$HADES_HL" serve --host 127.0.0.1 --port "$HL_PORT") &
+pids+=("$!")
 (cd "$ROOT/web" && exec npm run dev -- -p "$WEB_PORT") &
 pids+=("$!")
 set +m
 
-echo "engine: http://127.0.0.1:$ENGINE_PORT   web: http://127.0.0.1:$WEB_PORT   (Ctrl-C to stop)"
-wait -n || true  # first one to exit (or Ctrl-C) stops both via the EXIT trap
+echo "engine: http://127.0.0.1:$ENGINE_PORT   hyperliquid: http://127.0.0.1:$HL_PORT   web: http://127.0.0.1:$WEB_PORT   (Ctrl-C to stop)"
+wait -n || true  # first one to exit (or Ctrl-C) stops all via the EXIT trap

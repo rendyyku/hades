@@ -9,10 +9,11 @@ hades-hl init-db
 hades-hl discover --limit 200
 hades-hl backfill --all --days 30      # or --address 0x...
 hades-hl rescore
+hades-hl tag --all                    # insider tags (pre_listing, pre_move, fresh_whale); or --address
 hades-hl follow-sync                  # auto-follow the top 10 non-bot wallets
 hades-hl follow-add 0x... [0x...]     # manual follows (cap 25); follow-remove, follows
 hades-hl paper-run --all              # one paper run, prints the summaries
-hades-hl serve --no-api               # background runtime (Task 10 adds the API)
+hades-hl serve                        # API on 127.0.0.1:8010 + background runtime (--no-api: runtime only)
 ```
 
 `HL_DATABASE_URL` selects the SQLite database (default `sqlite:///hades_hl.db`).
