@@ -2,8 +2,17 @@ import { describe, expect, it, vi } from "vitest";
 
 vi.mock("server-only", () => ({}));
 
-import { filterFeed, mergeFeed, parseFeedEvent, parseHeadStatus, toFeedItems, type FeedItem } from "./live";
-import { createSseParser, mergeHeadStreams } from "./streamMerge";
+import {
+  applyHeadStatus,
+  fetchHeadBackfill,
+  filterFeed,
+  mergeFeed,
+  parseFeedEvent,
+  parseHeadStatus,
+  toFeedItems,
+  type FeedItem,
+} from "./live";
+import { createSseParser, mergeHeadStreams, STREAM_CONNECT_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS } from "./streamMerge";
 
 const SOL_KEY = "sol-secret-stream-key-do-not-leak";
 const HL_KEY = "hl-secret-stream-key-do-not-leak";
@@ -98,6 +107,113 @@ describe("mergeHeadStreams", () => {
     const res = await mergeHeadStreams(req, { env: { ...ENV, HADES_PUBLIC_ORIGIN: undefined }, fetchImpl: f as unknown as typeof fetch });
     expect(res.status).toBe(403);
     expect(f).not.toHaveBeenCalled();
+    // The accept half: the default origin itself is allowed and reaches the heads.
+    const ok = vi.fn(async () => new Response(upstream().body, { status: 200 }));
+    const def = request("localhost:3000");
+    const res2 = await mergeHeadStreams(def.req, { env: { ...ENV, HADES_PUBLIC_ORIGIN: undefined }, fetchImpl: ok as unknown as typeof fetch });
+    expect(res2.status).toBe(200);
+    expect(ok).toHaveBeenCalledTimes(2);
+    def.abort();
+  });
+
+  it("sends the SSE headers (incl. x-accel-buffering: no) and no key in ANY response header", async () => {
+    const f = vi.fn(
+      async () => new Response(upstream().body, { status: 200, headers: { "x-hades-key": SOL_KEY, "x-upstream": HL_KEY, "set-cookie": "a=b" } }),
+    );
+    const { req, abort } = request();
+    const res = await mergeHeadStreams(req, { env: ENV, fetchImpl: f as unknown as typeof fetch });
+    expect(res.headers.get("x-accel-buffering")).toBe("no");
+    expect(res.headers.get("content-type")).toBe("text/event-stream");
+    const all = [...res.headers.entries()];
+    expect(all.map(([k]) => k).sort()).toEqual(["cache-control", "content-type", "x-accel-buffering"]);
+    for (const [k, v] of all) {
+      for (const key of [SOL_KEY, HL_KEY]) {
+        expect(k).not.toContain(key);
+        expect(v).not.toContain(key);
+      }
+    }
+    abort();
+  });
+
+  it("has a 5 s connect timeout and a 45 s idle window by default (3x the HL 15 s heartbeat)", () => {
+    expect(STREAM_CONNECT_TIMEOUT_MS).toBe(5_000);
+    expect(STREAM_IDLE_TIMEOUT_MS).toBe(45_000);
+  });
+
+  it("streams the other head when one head accepts the connection but never answers", async () => {
+    const hl = upstream();
+    let solCalls = 0;
+    const f = vi.fn((url: string) => {
+      if (url.startsWith("http://sol.test")) {
+        solCalls += 1;
+        return new Promise<Response>(() => {}); // never resolves, ignores the abort signal
+      }
+      return Promise.resolve(new Response(hl.body, { status: 200 }));
+    });
+    const { req, abort } = request();
+    const res = await Promise.race([
+      mergeHeadStreams(req, { env: ENV, fetchImpl: f as unknown as typeof fetch, connectTimeoutMs: 30, retryMinMs: 20 }),
+      new Promise<never>((_, no) => setTimeout(() => no(new Error("the merged stream is blocked by the stalled head")), 1000)),
+    ]);
+    expect(res.status).toBe(200);
+    // The connect timeout covers the header phase only: the long-lived body outlives it.
+    await new Promise((r) => setTimeout(r, 60));
+    hl.push(frame("alert", HL_ALERT));
+    const text = await readUntil(res, (t) => t.includes('"market_id"') && t.includes('{"head":"solana","up":false}'));
+    // The stalled head is retried on its normal schedule.
+    await vi.waitFor(() => expect(solCalls).toBeGreaterThanOrEqual(2));
+    abort();
+    const evs = events(text);
+    expect(evs.filter((e) => e.event === "alert").map((e) => JSON.parse(e.data).head)).toEqual(["hyperliquid"]);
+    expect(evs.filter((e) => e.event === "head").map((e) => JSON.parse(e.data))).toEqual(
+      expect.arrayContaining([{ head: "solana", up: false }, { head: "hyperliquid", up: true }]),
+    );
+  });
+
+  it("aborts a stalled connect attempt's upstream fetch", async () => {
+    const signals: AbortSignal[] = [];
+    const hl = upstream();
+    const f = vi.fn((url: string, init: RequestInit) => {
+      if (url.startsWith("http://sol.test")) {
+        signals.push(init.signal!);
+        return new Promise<Response>(() => {});
+      }
+      return Promise.resolve(new Response(hl.body, { status: 200 }));
+    });
+    const { req, abort } = request();
+    await mergeHeadStreams(req, { env: ENV, fetchImpl: f as unknown as typeof fetch, connectTimeoutMs: 20, retryMinMs: 60_000 });
+    expect(signals[0].aborted).toBe(true);
+    abort();
+  });
+
+  it("treats a head silent beyond the idle window as down and reconnects it", async () => {
+    const sol1 = upstream();
+    const sol2 = upstream();
+    const hl = upstream();
+    const signals: AbortSignal[] = [];
+    let solCalls = 0;
+    const f = vi.fn(async (url: string, init: RequestInit) => {
+      if (url.startsWith("http://sol.test")) {
+        signals.push(init.signal!);
+        solCalls += 1;
+        return new Response(solCalls === 1 ? sol1.body : sol2.body, { status: 200 });
+      }
+      return new Response(hl.body, { status: 200 });
+    });
+    const { req, abort } = request();
+    const res = await mergeHeadStreams(req, { env: ENV, fetchImpl: f as unknown as typeof fetch, idleTimeoutMs: 80, retryMinMs: 5 });
+    // hl keeps talking (inside its idle window); sol1 says one thing and then goes silent.
+    sol1.push(frame("ping", { t: "s1" }));
+    const keepAlive = setInterval(() => hl.push(frame("ping", { t: "h" })), 20);
+    await vi.waitFor(() => expect(solCalls).toBe(2), { timeout: 1500 });
+    sol2.push(frame("alert", SOL_ALERT));
+    const text = await readUntil(res, (t) => t.includes('"mint"'));
+    clearInterval(keepAlive);
+    abort();
+    expect(signals[0].aborted).toBe(true); // the silent upstream is released
+    const heads = events(text).filter((e) => e.event === "head").map((e) => JSON.parse(e.data));
+    expect(heads).toEqual(expect.arrayContaining([{ head: "solana", up: false }, { head: "solana", up: true }]));
+    expect(heads).not.toContainEqual({ head: "hyperliquid", up: false });
   });
 
   it("fetches every head's stream with its own key, URL and an abortable signal", async () => {
@@ -286,5 +402,33 @@ describe("client feed merge", () => {
   it("parses head status events", () => {
     expect(parseHeadStatus('{"head":"solana","up":false}')).toEqual({ head: "solana", up: false });
     expect(parseHeadStatus('{"head":"nope","up":true}')).toBeNull();
+  });
+
+  it("backfills a head only when its stream comes back up after being down", () => {
+    let st = applyHeadStatus({}, { head: "hyperliquid", up: true });
+    expect(st).toEqual({ next: { hyperliquid: true }, backfill: null }); // first up: the server render covers it
+    st = applyHeadStatus(st.next, { head: "hyperliquid", up: false });
+    expect(st).toEqual({ next: { hyperliquid: false }, backfill: null });
+    st = applyHeadStatus(st.next, { head: "solana", up: true });
+    expect(st.backfill).toBeNull();
+    st = applyHeadStatus(st.next, { head: "hyperliquid", up: true });
+    expect(st).toEqual({ next: { hyperliquid: true, solana: true }, backfill: "hyperliquid" });
+    expect(applyHeadStatus(st.next, { head: "hyperliquid", up: true }).backfill).toBeNull();
+  });
+
+  it("fetches one head's backfill through the same-origin proxy and dedupes by head+id", async () => {
+    const f = vi.fn(async () => new Response(JSON.stringify([HL_ALERT, { ...HL_ALERT, id: 8 }]), { status: 200 }));
+    const rows = await fetchHeadBackfill("hyperliquid", f as unknown as typeof fetch);
+    expect(f).toHaveBeenCalledWith("/api/heads/hyperliquid/alerts?limit=50", { cache: "no-store" });
+    expect(rows.map((r) => r.key)).toEqual(["hyperliquid:7", "hyperliquid:8"]);
+    const live = parseFeedEvent(JSON.stringify(HL_ALERT))!;
+    expect(mergeFeed([live], rows).map((r) => r.key).sort()).toEqual(["hyperliquid:7", "hyperliquid:8"]);
+    // Failures are swallowed: the live stream continues.
+    expect(await fetchHeadBackfill("solana", vi.fn(async () => new Response("x", { status: 502 })) as unknown as typeof fetch)).toEqual([]);
+    expect(
+      await fetchHeadBackfill("solana", vi.fn(async () => {
+        throw new TypeError("offline");
+      }) as unknown as typeof fetch),
+    ).toEqual([]);
   });
 });

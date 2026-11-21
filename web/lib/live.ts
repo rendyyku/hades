@@ -164,3 +164,27 @@ export function parseHeadStatus(data: string): { head: HeadId; up: boolean } | n
     return null;
   }
 }
+
+export type HeadUp = Partial<Record<HeadId, boolean>>;
+
+/**
+ * Apply a fan-in `head` status event. `backfill` names the head whose stream came back
+ * up after being down: what it emitted meanwhile is fetched (the first up is covered by
+ * the server render; a browser-level reconnect resets the map and backfills every head).
+ */
+export function applyHeadStatus(prev: HeadUp, s: { head: HeadId; up: boolean }): { next: HeadUp; backfill: HeadId | null } {
+  return { next: { ...prev, [s.head]: s.up }, backfill: s.up && prev[s.head] === false ? s.head : null };
+}
+
+export const BACKFILL_LIMIT = 50;
+
+/** One head's recent alerts via the same-origin proxy (keys stay server-side); [] on any failure. */
+export async function fetchHeadBackfill(head: HeadId, fetchImpl: typeof fetch = fetch, limit: number = BACKFILL_LIMIT): Promise<FeedItem[]> {
+  try {
+    const res = await fetchImpl(`/api/heads/${head}/alerts?limit=${limit}`, { cache: "no-store" });
+    if (!res.ok) return [];
+    return toFeedItems(head, await res.json());
+  } catch {
+    return [];
+  }
+}

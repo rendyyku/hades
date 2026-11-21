@@ -46,7 +46,7 @@ describe("headFetchCore", () => {
       (_u: string, init: RequestInit) =>
         new Promise<Response>((_r, reject) => init.signal!.addEventListener("abort", () => reject(init.signal!.reason))),
     );
-    const res = await headFetchCore("hyperliquid", "/api/wallets", undefined, { env, fetchImpl: f, timeoutMs: 20 });
+    const res = await headFetchCore("hyperliquid", "/api/wallets", undefined, { env, fetchImpl: f as unknown as typeof fetch, timeoutMs: 20 });
     expect(res).toEqual({ ok: false, offline: true });
   });
 

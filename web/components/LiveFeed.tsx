@@ -5,15 +5,17 @@ import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { HEADS, type HeadId } from "@/lib/heads";
 import {
+  applyHeadStatus,
+  fetchHeadBackfill,
   filterFeed,
   mergeFeed,
   parseFeedEvent,
   parseHeadStatus,
   pausedNewLabel,
   shouldBackfill,
-  toFeedItems,
   type FeedFilter,
   type FeedItem,
+  type HeadUp,
 } from "@/lib/live";
 import { FeedTable } from "./FeedTable";
 import { LiveBadge } from "./LiveBadge";
@@ -22,7 +24,6 @@ const TICK_MS = 5_000;
 const ANNOUNCE_DEBOUNCE_MS = 1_500;
 const RETRY_MIN_MS = 2_000;
 const RETRY_MAX_MS = 30_000;
-const BACKFILL_LIMIT = 50;
 
 const BTN =
   "inline-flex min-h-11 cursor-pointer items-center gap-2 rounded-lg border px-4 text-sm transition-colors duration-200";
@@ -53,7 +54,7 @@ export function LiveFeed({ initial }: { initial: FeedItem[] }) {
   const [paused, setPaused] = useState(false);
   const [filter, setFilter] = useState<FeedFilter>("all");
   const [connected, setConnected] = useState(false);
-  const [headUp, setHeadUp] = useState<Partial<Record<HeadId, boolean>>>({});
+  const [headUp, setHeadUp] = useState<HeadUp>({});
   const [lastEventAt, setLastEventAt] = useState<number | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const [announcement, setAnnouncement] = useState("");
@@ -88,6 +89,8 @@ export function LiveFeed({ initial }: { initial: FeedItem[] }) {
     let backoff = RETRY_MIN_MS;
     let disposed = false;
     let opens = 0;
+    // Mirror of headUp for the event handlers (no stale closure, no side effects in setState).
+    let ups: HeadUp = {};
 
     const add = (rows: FeedItem[]) => {
       if (disposed || rows.length === 0) return;
@@ -95,20 +98,11 @@ export function LiveFeed({ initial }: { initial: FeedItem[] }) {
       else setAlerts((a) => mergeFeed(a, rows));
     };
 
-    // After a reconnect, fetch what each head emitted while disconnected (same-origin
-    // proxies; keys stay on the server). Failures are ignored: the live stream continues.
-    const backfill = () =>
-      Promise.all(
-        HEADS.map(async (h) => {
-          try {
-            const res = await fetch(`/api/heads/${h.id}/alerts?limit=${BACKFILL_LIMIT}`, { cache: "no-store" });
-            if (!res.ok || disposed) return;
-            add(toFeedItems(h.id, await res.json()));
-          } catch {
-            /* ignore */
-          }
-        }),
-      );
+    // Fetch what a head emitted while its stream was down (same-origin proxy; keys stay on
+    // the server). Failures yield nothing: the live stream continues. Dedupe is by head+id.
+    const backfillHead = async (head: HeadId) => add(await fetchHeadBackfill(head));
+    // After a browser-level reconnect, every head.
+    const backfill = () => Promise.all(HEADS.map((h) => backfillHead(h.id)));
 
     const connect = () => {
       es = new EventSource("/api/stream");
@@ -121,7 +115,8 @@ export function LiveFeed({ initial }: { initial: FeedItem[] }) {
       };
       es.onerror = () => {
         setConnected(false);
-        setHeadUp({});
+        ups = {};
+        setHeadUp(ups);
         // The browser retries on its own unless the connection is CLOSED (e.g. the
         // fan-in answered 502 JSON: no head reachable); then reconnect with backoff.
         if (es && es.readyState === EventSource.CLOSED && !disposed) {
@@ -133,7 +128,12 @@ export function LiveFeed({ initial }: { initial: FeedItem[] }) {
       es.addEventListener("ping", () => setLastEventAt(Date.now()));
       es.addEventListener("head", (ev) => {
         const s = parseHeadStatus((ev as MessageEvent<string>).data);
-        if (s) setHeadUp((h) => ({ ...h, [s.head]: s.up }));
+        if (!s) return;
+        const { next, backfill: head } = applyHeadStatus(ups, s);
+        ups = next;
+        setHeadUp(next);
+        // This head's upstream came back inside the fan-in: fill the gap it left.
+        if (head) void backfillHead(head);
       });
       es.addEventListener("alert", (ev) => {
         setLastEventAt(Date.now());

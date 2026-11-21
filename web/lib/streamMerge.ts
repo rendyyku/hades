@@ -8,6 +8,8 @@ import "server-only";
 // - Every relayed event is a JSON object tagged with `head` (the head it was read from).
 // - One head's stream failing never closes the others: it is reported as a `head`
 //   status event and retried with backoff while the browser stays connected.
+// - A head that never answers (connect timeout, 5 s) or goes silent mid-stream (idle
+//   watchdog, 45 s = 3x heartbeat) is treated as down and retried; others stream on.
 // - 502 JSON only when no head is reachable at connect time (EventSource then backs off).
 
 import { headTarget } from "./headProxy";
@@ -62,8 +64,16 @@ export interface StreamDeps {
   /** First reconnect delay of a failed head (doubles up to retryMaxMs). */
   retryMinMs?: number;
   retryMaxMs?: number;
+  /** Max wait for a head's response headers (the connect step only, not the body). */
+  connectTimeoutMs?: number;
+  /** A head silent (no bytes, not even a ping) this long mid-stream is treated as down. */
+  idleTimeoutMs?: number;
 }
 
+/** Connect step only: a head that never answers is down, the others stream on. */
+export const STREAM_CONNECT_TIMEOUT_MS = 5_000;
+/** 3x the heads' 15 s heartbeat (HL HEARTBEAT_S, Solana ping). */
+export const STREAM_IDLE_TIMEOUT_MS = 45_000;
 const RETRY_MIN_MS = 2_000;
 const RETRY_MAX_MS = 30_000;
 const EVENT_NAME = /^[a-z_]{1,32}$/;
@@ -100,31 +110,62 @@ function tag(head: HeadId, ev: SseEvent, keys: string[]): string | null {
   return frame(ev.event, { ...(v as Record<string, unknown>), head });
 }
 
-async function openHead(head: HeadId, deps: StreamDeps, signal: AbortSignal): Promise<ReadableStream<Uint8Array> | null> {
+interface Upstream {
+  body: ReadableStream<Uint8Array>;
+  /** Abort this attempt's upstream fetch (idle watchdog) and drop the link to `signal`. */
+  release: () => void;
+}
+
+async function openHead(head: HeadId, deps: StreamDeps, signal: AbortSignal): Promise<Upstream | null> {
+  if (signal.aborted) return null;
   const { base, key } = headTarget(head, deps.env);
   const doFetch = deps.fetchImpl ?? fetch;
-  let res: Response;
+  // Per-attempt controller: aborted by the browser disconnect, the connect timeout or
+  // the idle watchdog; the long-lived body itself has no timeout.
+  const attempt = new AbortController();
+  const onAbort = () => attempt.abort();
+  signal.addEventListener("abort", onAbort, { once: true });
+  const release = () => {
+    signal.removeEventListener("abort", onAbort);
+    attempt.abort();
+  };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), deps.connectTimeoutMs ?? STREAM_CONNECT_TIMEOUT_MS);
+  });
+  let res: Response | null;
   try {
-    res = await doFetch(`${base}/api/stream`, {
+    const pending = doFetch(`${base}/api/stream`, {
       headers: { "X-Hades-Key": key, Accept: "text/event-stream" },
       cache: "no-store",
-      // No timeout: the stream is long-lived; a browser disconnect aborts it.
-      signal,
+      signal: attempt.signal,
     });
+    // Raced, so even a fetch that ignores its signal cannot hold the merged stream.
+    res = await Promise.race([pending, timedOut]);
+    if (res === null) {
+      // Timed out: a late response (if the fetch ignored the abort) is released unread.
+      pending.then(
+        (late) => late.body?.cancel().catch(() => {}),
+        () => {},
+      );
+    }
   } catch {
     // The original error is dropped on purpose (it may carry URLs or headers).
-    return null;
+    res = null;
+  } finally {
+    clearTimeout(timer);
   }
-  if (!res.ok || !res.body) {
+  if (!res || !res.ok || !res.body) {
     // Release the body; its content (e.g. an auth error) is never relayed.
     try {
-      await res.body?.cancel();
+      await res?.body?.cancel();
     } catch {
       /* ignore */
     }
+    release();
     return null;
   }
-  return res.body;
+  return { body: res.body, release };
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
@@ -140,16 +181,23 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-/** Relay one head until its stream ends or errors (resolves either way, never throws). */
-async function pump(head: HeadId, body: ReadableStream<Uint8Array>, send: (s: string) => void, keys: string[]) {
-  const reader = body.getReader();
+const IDLE = Symbol("idle");
+
+/** Relay one head until its stream ends, errors or goes idle (resolves, never throws). */
+async function pump(head: HeadId, up: Upstream, send: (s: string) => void, keys: string[], idleMs: number) {
+  const reader = up.body.getReader();
   const dec = new TextDecoder();
   const parser = createSseParser();
   try {
     for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      for (const ev of parser.feed(dec.decode(value, { stream: true }))) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const idle = new Promise<typeof IDLE>((resolve) => {
+        timer = setTimeout(() => resolve(IDLE), idleMs);
+      });
+      const r = await Promise.race([reader.read(), idle]).finally(() => clearTimeout(timer));
+      // Silent past its heartbeat window: treat the head as down and reconnect it.
+      if (r === IDLE || r.done) break;
+      for (const ev of parser.feed(dec.decode(r.value, { stream: true }))) {
         const out = tag(head, ev, keys);
         if (out) send(out);
       }
@@ -157,11 +205,10 @@ async function pump(head: HeadId, body: ReadableStream<Uint8Array>, send: (s: st
   } catch {
     /* this head's stream errored: only this head is affected */
   } finally {
-    try {
-      await reader.cancel();
-    } catch {
+    up.release();
+    reader.cancel().catch(() => {
       /* ignore */
-    }
+    });
   }
 }
 
@@ -185,6 +232,7 @@ export async function mergeHeadStreams(req: Request, deps: StreamDeps): Promise<
 
   const min = deps.retryMinMs ?? RETRY_MIN_MS;
   const max = deps.retryMaxMs ?? RETRY_MAX_MS;
+  const idle = deps.idleTimeoutMs ?? STREAM_IDLE_TIMEOUT_MS;
   const enc = new TextEncoder();
   let closed = false;
 
@@ -198,14 +246,14 @@ export async function mergeHeadStreams(req: Request, deps: StreamDeps): Promise<
           /* the browser went away */
         }
       };
-      const runHead = async (head: HeadId, initial: ReadableStream<Uint8Array> | null) => {
+      const runHead = async (head: HeadId, initial: Upstream | null) => {
         let body = initial;
         let backoff = min;
         while (!signal.aborted) {
           if (body) {
             send(frame("head", { head, up: true }));
             backoff = min;
-            await pump(head, body, send, keys);
+            await pump(head, body, send, keys, idle);
           }
           if (signal.aborted) return;
           send(frame("head", { head, up: false }));
