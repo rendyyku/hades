@@ -20,6 +20,8 @@ export interface Head {
   address: RegExp;
   /** Serves POST/DELETE /api/follows/{address} (paper following). */
   follows: boolean;
+  /** Serves GET /api/wallets/{address}/positions (live open positions). */
+  positions: boolean;
 }
 
 export const HEADS: readonly Head[] = [
@@ -33,6 +35,7 @@ export const HEADS: readonly Head[] = [
     href: "/wallets",
     address: /^[1-9A-HJ-NP-Za-km-z]{32,44}$/,
     follows: false,
+    positions: false,
   },
   {
     id: "hyperliquid",
@@ -44,6 +47,7 @@ export const HEADS: readonly Head[] = [
     href: "/hyperliquid",
     address: /^0x[0-9a-fA-F]{40}$/,
     follows: true,
+    positions: true,
   },
 ] as const;
 

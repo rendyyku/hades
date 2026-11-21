@@ -52,6 +52,15 @@ def make_server(settings: Settings, host: str, port: int) -> Any:
                                          log_level="warning"))
 
 
+def attach_client(server: Any, client: Any) -> None:
+    """Give the head API the runtime's HL client, so both spend one rate weight
+    budget (the open-positions route calls ``clearinghouseState``)."""
+    app_ = getattr(getattr(server, "config", None), "app", None)
+    state = getattr(app_, "state", None)
+    if state is not None:
+        state.hl_client = client
+
+
 def _setup_logging() -> None:
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
     logging.getLogger("hades_hl").setLevel(logging.INFO)
@@ -246,6 +255,8 @@ def serve(
         typer.echo(f"serve: api on http://{host}:{port}")
 
     async def main(client: HLClient) -> rt.HLRuntime:
+        if server is not None:
+            attach_client(server, client)
         r = rt.HLRuntime(engine, client, ws_url=settings.WS_URL,
                          weight_per_min=settings.RATE_WEIGHT_PER_MIN,
                          max_follows=settings.MAX_FOLLOWS,

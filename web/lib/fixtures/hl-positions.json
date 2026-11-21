@@ -1,0 +1,57 @@
+{
+  "address": "0x721ed8f91d1477eb203ccc0b6e768133b032806d",
+  "account_value": "5437.414923",
+  "total_unrealized_pnl": "-1.420472",
+  "positions": [
+    {
+      "coin": "BTC",
+      "side": "short",
+      "size": "0.10572",
+      "entry_px": "60387.8",
+      "mark_px": "60429",
+      "position_value": "6388.55388",
+      "unrealized_pnl": "-4.353127",
+      "roe_pct": "-1.3637187100",
+      "leverage": {
+        "type": "isolated",
+        "value": "20"
+      },
+      "liquidation_px": "62630.05495065",
+      "margin_used": "315.461147"
+    },
+    {
+      "coin": "ETH",
+      "side": "long",
+      "size": "1.5",
+      "entry_px": "1683.93",
+      "mark_px": "1685.9",
+      "position_value": "2528.85",
+      "unrealized_pnl": "2.944695",
+      "roe_pct": "2.3315957200",
+      "leverage": {
+        "type": "cross",
+        "value": "20"
+      },
+      "liquidation_px": null,
+      "margin_used": "126.4425"
+    },
+    {
+      "coin": "XRP",
+      "side": "long",
+      "size": "56.0",
+      "entry_px": "0.934985",
+      "mark_px": "0.93477",
+      "position_value": "52.34712",
+      "unrealized_pnl": "-0.01204",
+      "roe_pct": "-0.2299502100",
+      "leverage": {
+        "type": "isolated",
+        "value": "10"
+      },
+      "liquidation_px": "0.8629803297",
+      "margin_used": "5.228394"
+    }
+  ],
+  "as_of": "2026-11-21T20:40:41.294000Z",
+  "scope": "main perp dex"
+}

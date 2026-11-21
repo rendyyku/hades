@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import { FollowButton } from "@/components/FollowButton";
 import { HeadOffline } from "@/components/HeadOffline";
 import { HlAddress } from "@/components/HlAddress";
+import { OpenPositions } from "@/components/OpenPositions";
 import { PaperFollowCard } from "@/components/PaperFollowCard";
 import { PnlChart } from "@/components/PnlChart";
 import { Section } from "@/components/Section";
@@ -13,6 +14,7 @@ import type { PaperDetail } from "@/lib/arena";
 import { formatDuration, formatPct, formatScore, formatUsd, formatWinrate, relTime, shortAddr } from "@/lib/format";
 import { headFetch } from "@/lib/headProxy";
 import { getHead } from "@/lib/heads";
+import { readPositions } from "@/lib/hlPositions";
 import { hlCurve, hlTxUrl, num, readFollow, readHlTags, type HlTag, type HlWalletRow } from "@/lib/hlView";
 
 export const dynamic = "force-dynamic";
@@ -88,8 +90,13 @@ export default async function HlWalletPage({ params }: { params: Params }) {
   const { address } = await params;
   if (!getHead("hyperliquid").address.test(address)) notFound();
 
-  const res = await headFetch<HlWalletRow>("hyperliquid", `/api/wallets/${address}`);
+  // The wallet row and its live positions (the first paint of the polled section) together.
+  const [res, posRes] = await Promise.all([
+    headFetch<HlWalletRow>("hyperliquid", `/api/wallets/${address}`),
+    headFetch<unknown>("hyperliquid", `/api/wallets/${address}/positions`),
+  ]);
   if (!res.ok && !res.offline && res.status === 404) notFound();
+  const positions = posRes.ok ? readPositions(posRes.data) : null;
 
   const w = res.ok ? res.data : null;
   const extra = w?.extra ?? {};
@@ -133,7 +140,11 @@ export default async function HlWalletPage({ params }: { params: Params }) {
         <HeadOffline head="hyperliquid" status={!res.ok && !res.offline ? res.status : undefined} />
       ) : (
         <>
-          <Section index="#1" title={`Stats · ${windowLabel(windowDays)}`}>
+          <Section index="#1" title="Open positions">
+            <OpenPositions address={address} initial={positions} />
+          </Section>
+
+          <Section index="#2" title={`Stats · ${windowLabel(windowDays)}`}>
             {extra.history_partial === true ? (
               <p className="mb-4 text-sm text-muted">History is partial: older fills were not available.</p>
             ) : null}
@@ -154,17 +165,17 @@ export default async function HlWalletPage({ params }: { params: Params }) {
             </dl>
           </Section>
 
-          <Section index="#2" title={`PnL curve · ${windowLabel(windowDays)}`}>
+          <Section index="#3" title={`PnL curve · ${windowLabel(windowDays)}`}>
             <PnlChart curve={hlCurve(extra.pnl_curve)} unit="usd" />
           </Section>
 
           {follow ? (
-            <Section index="#3" title="Our paper copy">
+            <Section index="#4" title="Our paper copy">
               <PaperFollowCard address={address} follow={follow} paper={paper} />
             </Section>
           ) : null}
 
-          <Section index={follow ? "#4" : "#3"} title="Tartarus · Tags">
+          <Section index={follow ? "#5" : "#4"} title="Tartarus · Tags">
             {tags.length === 0 ? (
               <p className="rounded-lg border border-border bg-surface p-5 text-sm text-muted">
                 No insider tags for this wallet.

@@ -56,6 +56,13 @@ CLI and the running head use two different databases.
   (under 2000 fills = the whole history, or an oldest fill >= 30 days back); a full
   2000-fill sample spanning less is undecided and passes. Probing stops at `--limit`
   accepted or 10 x `--limit` probe requests.
+- **Open positions (`GET /api/wallets/{address}/positions`).** Live from
+  `clearinghouseState` (main perp dex) through the same client and rate weight budget
+  as the runtime, cached 5 s per address; concurrent requests share one upstream call
+  and a failure is remembered for the same 5 s. 400 on a malformed address, 404 for a
+  wallet not in the database, 502 `hyperliquid upstream unavailable` when the call
+  fails, times out (8 s) or answers an unexpected body; the upstream body is never
+  forwarded. `scripts/record_positions_fixture.py 0x...` re-records the test fixture.
 - **Paper runtime (`serve`).** Daily (in the background): incremental backfill of the
   follows and the top 50 candidates, rescore, auto-follow sync, then hourly marks and
   pruning of raw prices older than 2 days. Every 60 s: a paper run for follows with new

@@ -116,6 +116,8 @@ hades-hl serve --port 8010            # API on 127.0.0.1:8010 + runtime (WS fill
 hades-hl watch --seconds 60           # debug: fill watcher + price recorder, prints fills and median delay
 ```
 
+**Open positions.** The Hyperliquid wallet page opens with the wallet's live open positions (total unrealized PnL, account value, then per position: side, size, entry, mark, value, unrealized PnL, ROE, leverage and margin mode, liquidation price, margin). The head serves them at `GET /api/wallets/{address}/positions` from Hyperliquid's public `clearinghouseState`, cached 5 s per address; the page polls every 5 s through the web proxy and shows `LIVE`, or `STALE` with the last data when a poll fails.
+
 `serve --no-api` runs only the runtime; `serve --seconds N` stops after N seconds. Details of discovery, backfill coverage and the runtime: `hyperliquid/README.md`.
 
 ### Paper rules
@@ -144,7 +146,7 @@ npm run build && npm run start       # production, also 127.0.0.1 only
 
 `scripts/dev.sh` starts the Solana engine (8000), the Hyperliquid head (`hades-hl serve`, API and runtime, 8010) and the web dev server (3000) together, all on 127.0.0.1, and stops all three on Ctrl-C or when one exits. It needs bash ≥ 4.3 (`wait -n`): Linux bash and Windows git-bash work; the bash 3.2 that ships with macOS does not. `ENGINE_PORT`, `HL_PORT` and `WEB_PORT` override 8000, 8010 and 3000. If you change `ENGINE_PORT` or `HL_PORT`, point `HADES_API_URL` or `HL_API_URL` at it. dev.sh sets `HADES_PUBLIC_ORIGIN` to `http://localhost:$WEB_PORT,http://127.0.0.1:$WEB_PORT` unless you set it.
 
-`HADES_PUBLIC_ORIGIN` (in `web/.env.local`) is a comma-separated list of exact origins, default `http://localhost:3000,http://127.0.0.1:3000`. Watchlist writes and follow / unfollow (`/api/heads/[head]/follows`) need an `Origin` in the list and a `Host` among its hosts; `/api/alerts`, `/api/heads/[head]/alerts` and `/api/stream` need the `Host`. Anything else gets 403. Set it if you use another port or hostname.
+`HADES_PUBLIC_ORIGIN` (in `web/.env.local`) is a comma-separated list of exact origins, default `http://localhost:3000,http://127.0.0.1:3000`. Watchlist writes and follow / unfollow (`/api/heads/[head]/follows`) need an `Origin` in the list and a `Host` among its hosts; `/api/alerts`, `/api/heads/[head]/alerts`, `/api/heads/[head]/wallets/[address]/positions` and `/api/stream` need the `Host`. Anything else gets 403. Set it if you use another port or hostname.
 
 ## Realtime alerts (Helius webhook)
 
@@ -214,7 +216,7 @@ A wallet is not backfilled again within 6 hours. For a cheap smoke run use `EARL
 - Keys live only in `.env` and `web/.env.local`, both gitignored. Request URLs are redacted in logs, and errors are logged by type, so the Helius key and the webhook secret are never printed.
 - `HADES_API_KEY` stays on the server. The browser only talks to Next.js server routes, which add `X-Hades-Key`. `/api/*` answers 401 without the key, or 503 if no key is configured.
 - **Localhost only.** The engine (`hades serve`), the HL head (`hades-hl serve`) and the web app (`npm run dev` / `npm run start`, `scripts/dev.sh`) bind to 127.0.0.1. The web app has no login: anyone who can reach it can read everything, edit the watchlist and follow or unfollow wallets (an unfollow asks for confirmation: it restarts that wallet's forward test). Do not expose it (port forward, `-H 0.0.0.0`, a tunnel) without a reverse proxy that adds authentication.
-- Watchlist writes and follow / unfollow through the web proxies need an allow-listed `Origin` and `Host` (`HADES_PUBLIC_ORIGIN`, CSRF guard). The alerts and stream proxies need an allow-listed `Host`, which blocks DNS rebinding.
+- Watchlist writes and follow / unfollow through the web proxies need an allow-listed `Origin` and `Host` (`HADES_PUBLIC_ORIGIN`, CSRF guard). The alerts, open-positions and stream proxies need an allow-listed `Host`, which blocks DNS rebinding.
 - ngrok exposes the whole engine, but `/api/*` stays key-protected and `/webhook/helius` checks `Authorization`.
 - No private keys, no signing, no trading. The HL head uses only Hyperliquid's public read-only info API and WebSocket (plus the public leaderboard and vault JSON the HL app loads).
 
@@ -242,6 +244,7 @@ CI (`.github/workflows/ci.yml`) runs the same four jobs: `engine`, `core`, `hype
 - **Live copy path: one short smoke only.** A 25-minute run (2026-11-21 UTC) following 8 very active wallets took 4,809 real fills through the whole path: 4,576 events (56 opens, 54 closes, the rest increases and reduces; 38 on HIP-3 coins), 4,487 priced and settled (none missed), 28 closed paper trades, and 83 trades in which two followed wallets were the two counterparties. There has been no multi-day soak, and no wallet has reached the gate on real data.
 - **Split fills over-size the copy (found by that smoke; not fixed).** A copy is sized on the leader's FIRST fill of a position (5% of paper equity), and every later fill scales it by that fill ÷ the leader's size so far. An order that fills in pieces, starting with a small one, therefore multiplies the copy. Observed: a first fill of 0.0002 BTC of a 0.67 BTC order became a 27.8 BTC copy (about $1.7M notional) on the 10,000 USD bankroll, and that follow's paper equity fell 40% in six minutes from fees and slippage. Until sizing is bounded per position, the paper result of a wallet whose orders fill in pieces is not trustworthy.
 - **Measured delay needs a synced clock.** The delay is our clock minus Hyperliquid's fill time. On a machine whose clock runs behind it comes out negative (the smoke box was about 0.9 s behind: median −714 ms), and the paper page then shows a dash.
+- **Open positions.** The wallet page lists positions on the main perp dex only; positions on HIP-3 dexes (`dex:COIN`) are not listed, and the page says so. It is polled (5 s), not streamed: the 10 user WebSocket subscriptions per IP are reserved for the follows. Each wallet page left open costs one `clearinghouseState` (weight 2) per 5 s of the 1200/min budget; a hidden tab does not poll. Mark is derived (`positionValue / size`): Hyperliquid reports no mark per position.
 - **Reconcile scope.** A missed close is repaired from the leader's `clearinghouseState`: the main perp dex, and a HIP-3 dex only for a copy open on that dex. An answer that is failed, empty, malformed or partial closes nothing.
 - **Discovery bias.** The HL top-PnL leaderboard is dominated by bots. Discovery prefilters (account value, volume/equity, month PnL, vaults) and probes recent activity with the bot rule and a minimum of 30 closed positions in 30 days, so it can miss high-turnover human traders and ones who trade rarely.
 - **Unofficial feeds.** The leaderboard and vault list are the JSON the HL web app loads, not documented API.

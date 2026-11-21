@@ -166,3 +166,37 @@ export async function handleHeadAlerts(req: Request, headParam: string, deps: He
   if (!Array.isArray(res.data)) return json(502, { error: "invalid head response" });
   return json(200, res.data);
 }
+
+// -- live open positions (GET /api/heads/[head]/wallets/[address]/positions) ---------------
+
+/**
+ * Read-only, Host-guarded proxy to a head's live open positions of one wallet (polled
+ * every 5 s by the wallet page). The Host allow-list runs before any upstream fetch
+ * (P6), the address is validated against the head's format, the key is added here,
+ * and an upstream error body is never relayed (P60 shapes: offline vs HTTP status).
+ */
+export async function handleHeadPositions(
+  req: Request,
+  headParam: string,
+  addressParam: string,
+  deps: HeadDeps,
+): Promise<Response> {
+  if (req.method.toUpperCase() !== "GET") return json(405, { error: "method not allowed" }, { allow: "GET" });
+  if (!hostAllowed(req, parseAllowList(deps.env.HADES_PUBLIC_ORIGIN))) return json(403, { error: "forbidden" });
+  if (!isHeadId(headParam) || !getHead(headParam).positions) return json(404, { error: "unknown head" });
+  const head = getHead(headParam);
+  if (typeof addressParam !== "string" || !head.address.test(addressParam)) return json(400, { error: "invalid address" });
+
+  const res = await headFetchCore<unknown>(head.id, `/api/wallets/${addressParam}/positions`, undefined, deps);
+  if (!res.ok) {
+    if (res.offline) return json(502, { error: "head offline", offline: true });
+    if (res.status === 400) return json(400, { error: "invalid address" });
+    if (res.status === 404) return json(404, { error: "not found" });
+    return json(502, { error: `head HTTP ${res.status}`, offline: false });
+  }
+  const d = res.data as { positions?: unknown } | null;
+  if (!d || typeof d !== "object" || Array.isArray(d) || !Array.isArray(d.positions)) {
+    return json(502, { error: "invalid head response", offline: false });
+  }
+  return json(200, d);
+}

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("server-only", () => ({}));
 
-import { handleHeadAlerts, handleHeadFollow, headFetch, headFetchCore, HEAD_TIMEOUT_MS } from "./headProxy";
+import { handleHeadAlerts, handleHeadFollow, handleHeadPositions, headFetch, headFetchCore, HEAD_TIMEOUT_MS } from "./headProxy";
 
 const KEY = "hl-secret-key-xyz";
 const ADDR = "0x" + "ab".repeat(20);
@@ -221,5 +221,73 @@ describe("handleHeadAlerts (Cerberus reconnect backfill)", () => {
       expect(res.status).toBe(502);
       expect(await res.text()).not.toContain(KEY);
     }
+  });
+});
+
+describe("handleHeadPositions (live open positions, polled by the wallet page)", () => {
+  const PUB = { ...env, HADES_PUBLIC_ORIGIN: "http://localhost:3000" };
+  const BODY = { address: ADDR, account_value: "10", total_unrealized_pnl: "1", positions: [], as_of: "2026-11-22T04:00:00Z" };
+  const get = (host = "localhost:3000", method = "GET") =>
+    new Request(`http://${host}/api/heads/hyperliquid/wallets/${ADDR}/positions`, { method, headers: { host } });
+
+  it("checks the Host allow-list before any upstream fetch (P6)", async () => {
+    const f = vi.fn();
+    const res = await handleHeadPositions(get("evil.example:3000"), "hyperliquid", ADDR, { env: PUB, fetchImpl: f });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: "forbidden" });
+    expect(f).not.toHaveBeenCalled();
+  });
+
+  it("is GET only, for a head that serves positions, with a validated address", async () => {
+    const f = vi.fn();
+    const deps = { env: PUB, fetchImpl: f };
+    expect((await handleHeadPositions(get("localhost:3000", "POST"), "hyperliquid", ADDR, deps)).status).toBe(405);
+    expect((await handleHeadPositions(get(), "polymarket", ADDR, deps)).status).toBe(404);
+    expect((await handleHeadPositions(get(), "solana", ADDR, deps)).status).toBe(404);
+    for (const bad of ["0x12", "../../follows", `${ADDR}/x`, `${ADDR}?a=1`, ""]) {
+      expect((await handleHeadPositions(get(), "hyperliquid", bad, deps)).status).toBe(400);
+    }
+    expect(f).not.toHaveBeenCalled();
+  });
+
+  it("relays the head's answer, fetched with the key server-side, and is never cached", async () => {
+    const f = vi.fn().mockResolvedValue(jsonRes(200, BODY));
+    const res = await handleHeadPositions(get(), "hyperliquid", ADDR, { env: PUB, fetchImpl: f });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(await res.json()).toEqual(BODY);
+    const [url, init] = f.mock.calls[0];
+    expect(url).toBe(`http://hl.test/api/wallets/${ADDR}/positions`);
+    expect(init.method).toBe("GET");
+    expect(new Headers(init.headers).get("X-Hades-Key")).toBe(KEY);
+  });
+
+  it("never leaks the key or an upstream body: offline, HTTP error, key echo, wrong shape", async () => {
+    const impls = [
+      vi.fn().mockRejectedValue(new Error(`boom ${KEY}`)),
+      vi.fn().mockResolvedValue(jsonRes(502, { detail: `upstream ${KEY}` })),
+      vi.fn().mockResolvedValue(jsonRes(500, { detail: KEY })),
+      vi.fn().mockResolvedValue(jsonRes(200, { ...BODY, echo: KEY })),
+      vi.fn().mockResolvedValue(jsonRes(200, [BODY])),
+      vi.fn().mockResolvedValue(jsonRes(200, { address: ADDR })),
+    ];
+    for (const f of impls) {
+      const res = await handleHeadPositions(get(), "hyperliquid", ADDR, { env: PUB, fetchImpl: f });
+      expect(res.status).toBe(502);
+      const text = await res.text();
+      expect(text).not.toContain(KEY);
+      expect(text).not.toContain("upstream");
+      expect([...res.headers.values()].join(" ")).not.toContain(KEY);
+    }
+  });
+
+  it("tells a head that is down from one that answered an error (P60)", async () => {
+    const down = await handleHeadPositions(get(), "hyperliquid", ADDR, { env: PUB, fetchImpl: vi.fn().mockRejectedValue(new Error("x")) });
+    expect(await down.json()).toEqual({ error: "head offline", offline: true });
+    const err = await handleHeadPositions(get(), "hyperliquid", ADDR, { env: PUB, fetchImpl: vi.fn().mockResolvedValue(jsonRes(502, {})) });
+    expect(await err.json()).toEqual({ error: "head HTTP 502", offline: false });
+    const nf = await handleHeadPositions(get(), "hyperliquid", ADDR, { env: PUB, fetchImpl: vi.fn().mockResolvedValue(jsonRes(404, {})) });
+    expect(nf.status).toBe(404);
+    expect(await nf.json()).toEqual({ error: "not found" });
   });
 });

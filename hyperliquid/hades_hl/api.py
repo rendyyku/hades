@@ -11,6 +11,11 @@ disabled. Served on 127.0.0.1:8010 by ``hades-hl serve``.
   liquidations, funding_usd (T5 stats), tags with evidence (T7), ``pnl_curve`` (daily
   cumulative closedPnl - fees + funding of the stored fills over the stats window) and
   the follow, if any.
+- ``GET /api/wallets/{address}/positions``: the wallet's live open positions on the
+  main perp dex (Task 14, P64), from HL ``clearinghouseState`` through the shared
+  client, cached 5 s per address. 400 on a malformed address, 404 for a wallet this
+  head does not know, 502 with a fixed message when the upstream call fails or
+  answers an unexpected body (the upstream body is never forwarded).
 - ``GET /api/follows``, ``POST/DELETE /api/follows/{address}``: manual follow (409 over
   the cap) and manual removal (remembered: never auto-followed again).
 - ``GET /api/paper/{address}``: the paper runtime's snapshot (T9): summary, fills,
@@ -32,6 +37,7 @@ import json
 import secrets
 import statistics
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Literal
@@ -50,12 +56,15 @@ from hades_core.gate import GateResult
 from hades_hl import HEAD, __version__, alerts, pipeline
 from hades_hl import follows as fl
 from hades_hl import paper_runtime as pr
+from hades_hl import positions as pos
+from hades_hl.client import HLClient
 from hades_hl.config import Settings, get_settings
 from hades_hl.db import Alert, Fill, Follow, LadderHistory, PaperEvent, Tag, Wallet, init_db, make_engine
 from hades_hl.normalize import fill_fee, is_spot
 from hades_hl.pnl import funding_usdc
 
 HEARTBEAT_S = 15.0
+UPSTREAM_DETAIL = "hyperliquid upstream unavailable"  # fixed: never the upstream's words
 POLL_S = 1.0
 SPARKLINE_POINTS = 50
 DAY_MS = 86_400_000
@@ -316,6 +325,40 @@ def wallet_detail(address: str, session: Session = Depends(get_session)) -> Wall
     return _wallet_row(w, tags, LIST_EXTRA + DETAIL_EXTRA, extra)
 
 
+def hl_client(app: FastAPI) -> Any:
+    """The HL client of this app: the runtime's (``serve`` shares it, so the API is
+    charged to the same rate weight budget), else one made on first use and closed
+    with the app."""
+    if app.state.hl_client is None:
+        app.state.hl_client = HLClient.from_settings(app.state.settings)
+        app.state.owns_hl_client = True
+    return app.state.hl_client
+
+
+def _wallet_known(engine, addr: str) -> bool:
+    with Session(engine) as s:
+        return s.get(Wallet, addr) is not None
+
+
+@router.get("/wallets/{address}/positions", response_model=pos.WalletPositions)
+async def wallet_positions(address: str, request: Request) -> pos.WalletPositions:
+    """Live open positions (P64): one upstream call per address per 5 s at most."""
+    addr = _address(address)
+    app = request.app
+    if not await run_in_threadpool(_wallet_known, app.state.engine, addr):
+        raise HTTPException(status_code=404, detail="wallet not found")
+
+    async def fetch() -> pos.WalletPositions:
+        state = await asyncio.wait_for(hl_client(app).clearinghouse_state(addr),
+                                       pos.UPSTREAM_TIMEOUT_S)
+        return pos.positions_from_state(addr, state, app.state.clock())
+
+    try:
+        return await app.state.positions.get(addr, fetch)
+    except pos.PositionsUnavailable:
+        raise HTTPException(status_code=502, detail=UPSTREAM_DETAIL) from None
+
+
 @router.get("/follows", response_model=list[FollowRow])
 def list_follows(session: Session = Depends(get_session)) -> list[FollowRow]:
     return [_follow_row(session, f) for f in fl.active_follows(session)]
@@ -400,16 +443,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     engine = make_engine(settings.DATABASE_URL)
     init_db(engine)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        yield
+        if app.state.owns_hl_client and app.state.hl_client is not None:
+            await app.state.hl_client.aclose()
+
     app = FastAPI(title="HADES Hyperliquid", version=__version__, docs_url=None,
-                  redoc_url=None, openapi_url=None)
+                  redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.settings = settings
     app.state.engine = engine
     app.state.heartbeat_s = HEARTBEAT_S
     app.state.poll_s = POLL_S
     app.state.clock = lambda: datetime.now(UTC)
+    app.state.hl_client = None  # set by ``serve`` (the runtime's client); else lazy
+    app.state.owns_hl_client = False
+    app.state.positions = pos.PositionsCache()
     app.include_router(router)
     return app
 
 
-__all__ = ["HEARTBEAT_S", "alert_events", "create_app", "median_delay_ms", "pnl_curve",
-           "require_key"]
+__all__ = ["HEARTBEAT_S", "UPSTREAM_DETAIL", "alert_events", "create_app", "hl_client",
+           "median_delay_ms", "pnl_curve", "require_key"]
