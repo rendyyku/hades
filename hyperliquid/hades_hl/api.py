@@ -122,6 +122,8 @@ class PaperDetail(BaseModel):
     gap_usd: Decimal | None
     leader_realized_usd: Decimal | None
     missed_count: int
+    # missed_count by reason (P65): cap | no_price | stale
+    missed_reasons: dict[str, int] = {}
     median_delay_ms: int | None
     funding_missing_hours: int | None
 
@@ -416,6 +418,7 @@ def paper(address: str, session: Session = Depends(get_session)) -> PaperDetail:
         ladder_cooldown_until=snap.get("ladder_cooldown_until"),
         gap_usd=dec("gap_usd"), leader_realized_usd=dec("leader_realized_usd"),
         missed_count=int(snap.get("missed") or 0),
+        missed_reasons=snap.get("missed_reasons") or {},
         median_delay_ms=median_delay_ms(session, addr, f.started_at),
         funding_missing_hours=snap.get("funding_missing_hours"),
     )

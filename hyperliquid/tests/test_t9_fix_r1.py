@@ -338,7 +338,7 @@ async def test_persist_cursor_db_error_does_not_kill_watcher(engine, monkeypatch
     got = []
     start = datetime.now(UTC) - H
     w = FillWatcher(engine, LiveClient(), {A: start}, start_time=start, fetch_leverage=False,
-                    sz_decimals={}, on_fill=got.append)
+                    sz_decimals={}, on_fill=got.append, aggregate_window_s=0)
 
     def broken(*a, **kw):
         raise RuntimeError("db locked")
@@ -358,7 +358,7 @@ async def test_stale_recovered_fills_are_missed_and_never_priced(engine, session
     now = START + timedelta(days=1)
     c = LiveClient()
     w = FillWatcher(engine, c, {A: START}, start_time=START, now=lambda: now,
-                    fetch_leverage=False, sz_decimals={})
+                    fetch_leverage=False, sz_decimals={}, aggregate_window_s=0)
     old = mk("BTC", "B", "1", "100", "0", ms(now - timedelta(minutes=20)), tid=11)
     new = mk("ETH", "B", "1", "10", "0", ms(now - timedelta(minutes=1)), tid=12)
     c.fills[A] = [old, new]

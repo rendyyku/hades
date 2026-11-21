@@ -122,6 +122,9 @@ class Fill(Base):
     # this wallet was the counterparty / liquidator (normalize.is_own_liquidation)
     liquidated_user: Mapped[str | None] = mapped_column(String)
     builder_fee: Mapped[Decimal | None] = mapped_column(DecimalText)  # ruling P20
+    # HL order id: the fills of one order share it (ruling P65). NULL on rows stored
+    # before P65 (then: same coin + direction in the same millisecond).
+    oid: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     __table_args__ = (
         PrimaryKeyConstraint("address", "tid", name="pk_fills"),
@@ -182,7 +185,11 @@ class PaperEvent(Base):
     """One leader event of one followed wallet, keyed by ``(address, source_ref)``:
     ``source_ref`` is ``hash:tid`` (plus a flip suffix) and HL gives both counterparties
     of a trade the same hash and tid, so it is unique per wallet only (final review
-    I2; like ``fills``). ``seq`` is per address too (P26)."""
+    I2; like ``fills``). ``seq`` is per address too (P26).
+
+    Ruling P65: an event is one leader ORDER on one position. When the order filled in
+    several pieces, ``source_ref`` is the FIRST piece's ref, ``json`` lists them all
+    (``tids``, ``pieces``) and each piece has a :class:`PaperPiece` row."""
 
     __tablename__ = "paper_events"
 
@@ -202,6 +209,23 @@ class PaperEvent(Base):
 
     __table_args__ = (
         PrimaryKeyConstraint("address", "source_ref", name="pk_paper_events"),
+    )
+
+
+class PaperPiece(Base):
+    """Ruling P65: one fill leg merged into a paper event made of several pieces
+    (single-piece events have no rows: their ``source_ref`` is the piece). Keyed by
+    ``(address, piece_ref)`` = the leg's own ``hash:tid`` ref, so a piece that is
+    delivered again (recovery, poll) is recognised and never emitted twice."""
+
+    __tablename__ = "paper_event_pieces"
+
+    address: Mapped[str] = mapped_column(String)
+    piece_ref: Mapped[str] = mapped_column(String)
+    source_ref: Mapped[str] = mapped_column(String)  # the event it was merged into
+
+    __table_args__ = (
+        PrimaryKeyConstraint("address", "piece_ref", name="pk_paper_event_pieces"),
     )
 
 
@@ -264,6 +288,7 @@ def make_engine(url: str) -> Engine:
 _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("fills", "liquidated_user", "VARCHAR"),
     ("fills", "builder_fee", "VARCHAR"),
+    ("fills", "oid", "BIGINT"),
     ("paper_events", "seq", "INTEGER"),
     ("paper_events", "fill_price", "VARCHAR"),
     ("paper_events", "missed", "BOOLEAN"),
@@ -404,7 +429,15 @@ def fill_row(address: str, f: dict) -> dict:
         "liquidation": bool(f.get("liquidation")),
         "liquidated_user": _liquidated_user(f),
         "builder_fee": f.get("builderFee"),
+        "oid": _oid(f),
     }
+
+
+def _oid(f: dict) -> int | None:
+    try:
+        return None if f.get("oid") is None else int(f["oid"])
+    except (TypeError, ValueError):
+        return None
 
 
 def _liquidated_user(f: dict) -> str | None:

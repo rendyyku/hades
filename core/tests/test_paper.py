@@ -568,3 +568,188 @@ def test_display_point_uses_last_price_without_a_mark_and_counts_holding_cost():
 def test_display_point_before_follow_is_ignored():
     res = simulate([], FakeModel({}), CFG, FOLLOW, display_time=T0 - timedelta(hours=1))
     assert res.display_point is None
+
+
+# -- ruling P65: ratio fixed at open, margin caps ---------------------------------------
+
+BTC = Decimal("60000")
+
+
+def flat(refs, px="100"):
+    return FakeModel({r: Decimal(px) for r in refs})
+
+
+def near(value, want) -> bool:
+    return abs(Decimal(value) - Decimal(want)) < Decimal("1e-12")
+
+
+def margins(res: PaperResult) -> Decimal:
+    return sum((p.margin for p in res.open_positions.values()), Decimal(0))
+
+
+def test_p65_open_of_an_aggregated_order_is_5pct_margin_times_leverage():
+    # the smoke scenario after the head merged the pieces 0.0002 + 0.5 + 1.2 BTC
+    events = [ev("o", "open", 1, size="1.7002", leverage="10", price="60000")]
+    res = simulate(events, FakeModel({"o": BTC}), CFG, FOLLOW)
+    (fill,) = res.fills
+    pos = res.open_positions["p1"]
+    assert pos.margin == Decimal("500")
+    assert near(fill.size * fill.price, "5000")  # 5% x 10,000 x 10
+    # r = our qty / the leader's position after the opening order
+    assert pos.ratio == pos.qty / Decimal("1.7002")
+    assert not fill.missed and fill.reason is None
+
+
+def test_p65_pieces_fed_one_by_one_are_bounded_by_the_position_cap():
+    # defence in depth: a head that does NOT merge the pieces (old rows, a slow order)
+    events = [
+        ev("o", "open", 1, size="0.0002", leverage="10"),
+        ev("i1", "increase", 2, size="0.5", leverage="10"),
+        ev("i2", "increase", 3, size="1.2", leverage="10"),
+    ]
+    res = simulate(events, flat(["o", "i1", "i2"], "60000"), CFG, FOLLOW)
+    pos = res.open_positions["p1"]
+    assert pos.margin == Decimal("2000")  # 20% of the 10,000 equity, never more
+    assert near(pos.qty * pos.entry_price, "20000")
+    assert pos.leader_size == Decimal("1.7002")  # the leader is still tracked in full
+    capped = [f for f in res.fills if f.missed]
+    assert [(f.ev_ref, f.reason) for f in capped] == [("i1", "cap"), ("i2", "cap")]
+    copied = [f for f in res.fills if not f.missed]
+    assert [f.ev_ref for f in copied] == ["o", "i1"]
+    assert near(sum(f.size * f.price for f in copied), "20000")
+
+
+def test_p65_increase_beyond_the_position_cap_is_capped_and_missed_with_reason_cap():
+    events = [
+        ev("o", "open", 1, size="1"),       # margin 500, qty 5, r = 5
+        ev("i1", "increase", 2, size="2"),  # +10 -> margin 1500
+        ev("i2", "increase", 3, size="2"),  # wants +10 (margin 2500): only +5 fits
+    ]
+    res = simulate(events, flat(["o", "i1", "i2"]), CFG, FOLLOW)
+    assert [(f.ev_ref, f.size, f.missed, f.reason) for f in res.fills] == [
+        ("o", Decimal("5"), False, None),
+        ("i1", Decimal("10"), False, None),
+        ("i2", Decimal("5"), False, None),
+        ("i2", Decimal("5"), True, "cap"),  # the part beyond the cap: not copied
+    ]
+    pos = res.open_positions["p1"]
+    assert (pos.qty, pos.margin, pos.leader_size) == (Decimal("20"), Decimal("2000"), Decimal("5"))
+    assert pos.ratio == Decimal("5")  # fixed at open
+    assert final_equity(res) == Decimal("10000")  # a missed part costs nothing
+
+
+def test_p65_increase_scales_by_the_ratio_fixed_at_open():
+    events = [
+        ev("o", "open", 1, size="1"),        # qty 5, r = 5
+        ev("m", "increase", 2, size="1"),    # no price: missed, leader 2, ours 5
+        ev("i", "increase", 3, size="1"),    # r x 1 = 5 (not ours x 1/2 = 2.5)
+    ]
+    res = simulate(events, FakeModel({"o": Decimal("100"), "m": None, "i": Decimal("100")}),
+                   CFG, FOLLOW)
+    assert [(f.ev_ref, f.size, f.reason) for f in res.fills] == [
+        ("o", Decimal("5"), None), ("m", Decimal("0"), "no_price"), ("i", Decimal("5"), None)]
+    pos = res.open_positions["p1"]
+    assert (pos.qty, pos.leader_size, pos.margin) == (Decimal("10"), Decimal("3"), Decimal("1000"))
+
+
+def test_p65_total_committed_margin_never_exceeds_equity():
+    cfg = PaperConfig(risk_fraction=Decimal("0.15"))  # 1,500 a position
+    pids = list("abcdefgh")
+    events = [ev(f"o-{p}", "open", i + 1, pid=p) for i, p in enumerate(pids)]
+    events += [
+        ev("i-a", "increase", 20, pid="a", size="1"),  # no room left in total
+        ev("c-h", "close", 21, pid="h"),               # never opened: no-op
+        ev("c-a", "close", 22, pid="a"),               # frees 1,500
+        ev("o-z", "open", 23, pid="z"),
+    ]
+    refs = [e.source_ref for e in events]
+    upto = lambda n: simulate(events[:n], flat(refs), cfg, FOLLOW)  # noqa: E731
+
+    res = upto(9)  # eight opens + the increase
+    assert [res.open_positions[p].margin for p in "abcdefg"] == \
+        [Decimal("1500")] * 6 + [Decimal("1000")]  # the 7th gets what is left
+    assert "h" not in res.open_positions  # the 8th: nothing left
+    assert margins(res) == Decimal("10000") == final_equity(res)
+    assert [(f.ev_ref, f.size, f.reason) for f in res.fills if f.missed] == [
+        ("o-g", Decimal("5"), "cap"),    # 500 of the 1,500 margin not opened
+        ("o-h", Decimal("15"), "cap"),   # not opened at all
+        ("i-a", Decimal("15"), "cap"),   # r = 15: nothing of it fits
+    ]
+    for n in range(1, len(events) + 1):  # the invariant at every step
+        step = upto(n)
+        assert margins(step) <= final_equity(step)
+
+    res = upto(len(events))
+    assert [f.ev_ref for f in res.fills if f.ev_ref in ("c-h", "c-a")] == ["c-a"]
+    assert res.open_positions["z"].margin == Decimal("1500")  # room again after the close
+
+
+def test_p65_reduce_after_a_capped_increase_is_proportional_to_our_position():
+    events = [
+        ev("o", "open", 1, size="1"),
+        ev("i1", "increase", 2, size="2"),
+        ev("i2", "increase", 3, size="2"),     # capped: ours 20, leader 5
+        ev("r1", "reduce", 4, size="2.5"),     # the leader halves -> we halve
+        ev("r2", "reduce", 5, size="10"),      # more than the leader has left -> flat
+        ev("r3", "reduce", 6, size="1"),       # nothing left: no-op, never a short
+    ]
+    res = simulate(events, flat([e.source_ref for e in events]), CFG, FOLLOW)
+    ours = [(f.ev_ref, f.size) for f in res.fills if not f.missed]
+    assert ours[-2:] == [("r1", Decimal("10")), ("r2", Decimal("10"))]
+    assert all(f.size >= 0 for f in res.fills)
+    assert res.open_positions == {} and len(res.closed_trades) == 1
+    half = simulate(events[:4], flat([e.source_ref for e in events]), CFG, FOLLOW)
+    pos = half.open_positions["p1"]
+    assert (pos.qty, pos.margin, pos.leader_size, pos.direction) == (
+        Decimal("10"), Decimal("1000"), Decimal("2.5"), "long")
+
+
+def test_p65_reduce_and_close_are_never_capped_and_no_room_never_goes_negative():
+    # "b" loses 400 while open, so "a" (margin 2,000) is above 20% of the 9,600 equity
+    events = [
+        ev("oa", "open", 1, pid="a", size="1"),
+        ev("ia", "increase", 2, pid="a", size="3"),            # margin 2,000 = the cap
+        ev("ob", "open", 3, pid="b", market="ETH", size="1"),  # margin 500, qty 5
+        ev("rb", "reduce", 4, pid="b", market="ETH", size="0.5"),  # at 20: -200 realized
+        ev("ia2", "increase", 5, pid="a", size="1"),           # no room: all missed
+        ev("ra", "reduce", 6, pid="a", size="2.5"),            # half of 5, not capped
+        ev("ca", "close", 7, pid="a"),
+    ]
+    px = {e.source_ref: Decimal("100") for e in events}
+    px["rb"] = Decimal("20")
+    res = simulate(events, FakeModel(px), CFG, FOLLOW)
+    by = {}
+    for f in res.fills:
+        by.setdefault(f.ev_ref, []).append((f.size, f.missed, f.reason))
+    assert by["ia2"] == [(Decimal("5"), True, "cap")]
+    assert by["ra"] == [(Decimal("10"), False, None)]
+    assert by["ca"] == [(Decimal("10"), False, None)]
+    assert "a" not in res.open_positions
+
+
+def test_p65_config_defaults():
+    assert CFG.max_position_margin_fraction == Decimal("0.20")
+    assert CFG.max_total_margin_fraction == Decimal("1")
+
+
+def test_p65_caps_are_measured_after_the_fill_s_own_fee():
+    # the fee of the capped add lowers the equity: the caps must hold on what is left
+    events = [
+        ev("o", "open", 1, size="1", leverage="10"),
+        ev("i", "increase", 2, size="9", leverage="10"),  # wants 10x the open
+    ]
+    model = FakeModel({"o": Decimal("100"), "i": Decimal("100")}, fee_rate=Decimal("0.001"))
+    res = simulate(events, model, CFG, FOLLOW)
+    pos = res.open_positions["p1"]
+    eq = final_equity(res)
+    assert eq < Decimal("10000")
+    assert pos.margin <= Decimal("0.20") * eq
+    assert Decimal("0.199") * eq < pos.margin  # and it does use the room
+    assert [f.reason for f in res.fills if f.missed] == ["cap"]
+
+    cfg = PaperConfig(risk_fraction=Decimal("0.2"))
+    opens = [ev(f"o{i}", "open", i + 1, pid=f"p{i}", leverage="10") for i in range(6)]
+    res = simulate(opens, FakeModel({e.source_ref: Decimal("100") for e in opens},
+                                    fee_rate=Decimal("0.001")), cfg, FOLLOW)
+    assert margins(res) <= final_equity(res)
+    assert margins(res) > Decimal("0.99") * final_equity(res)

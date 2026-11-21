@@ -364,6 +364,7 @@ def test_model_runs_in_core_simulator(priced):
 def watcher(engine, client=None, follows=None, **kw):
     kw.setdefault("start_time", T0)
     kw.setdefault("fetch_leverage", False)
+    kw.setdefault("aggregate_window_s", 0)  # P65: no wait for further pieces here
     return FillWatcher(engine, client or FakeClient(), follows or {A: T0}, **kw)
 
 
@@ -583,7 +584,7 @@ async def test_recovery_failure_keeps_floor_and_emits_gap_later(engine):
     start = datetime.now(UTC) - timedelta(hours=1)
     c = FailRecovery()
     w = FillWatcher(engine, c, {A: None}, start_time=start, fetch_leverage=False,
-                    sz_decimals={})
+                    sz_decimals={}, aggregate_window_s=0)
     gap = mk("BTC", "B", "1", "100", "0", ms(start) + 60_000, tid=40)
     c.fills[A] = [gap]
     await w._recover([A])  # reconnect recovery fails
@@ -643,7 +644,7 @@ async def test_last_seen_not_advanced_when_ingest_fails(engine):
     """Important 2 (reviewer probe): last_seen moves only after the commit."""
     start = datetime.now(UTC) - timedelta(hours=1)
     c = FakeClient()
-    w = FillWatcher(engine, c, {A: None}, start_time=start, sz_decimals={})
+    w = FillWatcher(engine, c, {A: None}, start_time=start, sz_decimals={}, aggregate_window_s=0)
     f1 = mk("BTC", "B", "1", "100", "0", ms(start) + 60_000, tid=50)
     f2 = mk("BTC", "B", "1", "100", "1", ms(start) + 90_000, tid=51)
 
@@ -829,6 +830,7 @@ def _pending_watcher(engine, **kw):
     start = datetime.now(UTC) - timedelta(hours=1)
     c = FailRecovery()
     got: list[TradeEvent] = []
+    kw.setdefault("aggregate_window_s", 0)  # P65: no wait for further pieces here
     w = FillWatcher(engine, c, {A: None}, start_time=start, fetch_leverage=False,
                     sz_decimals={}, on_fill=got.append, **kw)
     return start, c, w, got

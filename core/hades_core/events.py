@@ -23,12 +23,21 @@ def require_utc(name: str, value: datetime) -> None:
 
 @dataclass(frozen=True)
 class TradeEvent:
-    """One leader fill, as observed by a head.
+    """One leader order on one position, as observed by a head.
 
-    - ``size``: the leader's absolute size delta of *this* fill (not the resulting
-      position size), always >= 0 in meaning; the simulator uses ``abs(size)``.
-    - ``price``: the leader's own fill price. Informational only: the paper copy never
-      fills at it, the ExecutionModel supplies our price.
+    The paper copy is sized on events (ruling P65), so a head MUST merge the fills of
+    one leader order into one event: an order that fills in pieces is still one
+    decision of the leader. A copy sized on the first piece would be scaled up by
+    every later one.
+
+    - ``size``: the leader's absolute size delta of *this* event (not the resulting
+      position size), always >= 0 in meaning; the simulator uses ``abs(size)``. For an
+      ``open`` it is the leader's position size after the opening order.
+    - ``price``: the leader's own fill price (size-weighted over the merged fills).
+      Informational only: the paper copy never fills at it, the ExecutionModel
+      supplies our price.
+    - ``leader_time``: when the leader's order started to fill; ``observed_time``: when
+      the head observed the last fill it merged (our price is keyed to it).
     - ``position_id``: groups every event of one leader position episode (open ..
       close/resolve). When None the simulator keys by ``wallet:market_id:direction``.
     - ``group_id``: optional wider grouping for gate concentration checks (Polymarket:

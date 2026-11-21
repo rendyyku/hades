@@ -37,6 +37,13 @@ CLI and the running head use two different databases.
   gives both counterparties of a trade the same `tid` and hash. `init-db` (and every
   command) migrates an older `tid`-only / `source_ref`-only table in place, in one
   transaction per table; a failure leaves the old table untouched.
+- One leader order is one paper event. `fills.oid` (added in place to an older
+  database; NULL on fills stored before) says which fills are one order; without it
+  the fallback is the same coin and direction in the same millisecond. An event made
+  of several fills keeps the first fill's `hash:tid` as `source_ref`, lists all of
+  them in its JSON (`tids`, `pieces`) and has one `paper_event_pieces` row per fill,
+  so a fill delivered again is never emitted twice. Events stored before this are one
+  per fill and stay so.
 - Backfill fetches fills newest first and records the contiguous covered range in kv
   `hl:cov:<address>`; stats use only that range. Wallets with more than 10,000 fills
   in the window are capped (`history_partial`), keeping the newest 10,000. If the

@@ -643,6 +643,8 @@ def fill_dict(r: Fill) -> dict:
         f["liquidation"] = {"liquidatedUser": r.liquidated_user}
     if r.builder_fee is not None:
         f["builderFee"] = str(r.builder_fee)
+    if r.oid is not None:
+        f["oid"] = r.oid
     return f
 
 

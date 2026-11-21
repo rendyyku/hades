@@ -33,6 +33,20 @@ No hindsight (spec section 7, 12a):
   REST poll of the 11th+ follow, a late WS message): a polled follow restarts from
   its persisted cursor, so its first poll after an outage returns the whole gap.
 
+One order, one event (ruling P65): a leader order fills in pieces, and a copy sized on
+the first piece is wrong by orders of magnitude. The watcher therefore buffers, per
+address, the pieces of the order being filled (same key: :func:`normalize.order_key`,
+i.e. coin, position, growing/shrinking, HL ``oid``; without ``oid`` the same
+millisecond) and emits ONE event (size = sum, leader price = size-weighted average,
+``observed_time`` = when the LAST piece reached us) when a fill of another order
+arrives for that address, or ``AGG_WINDOW_S`` (2 s) after the last piece. Events are
+still emitted in the leader's order with ``seq`` in that order (P21/P26), a P46
+release is still one chain-ordered batch, and stale pieces (P47) are never merged
+with fresh ones. Buffered pieces are stored fills but not yet events, so the
+persisted cursor never moves past them (a crash re-fetches them) and a stopping
+watcher emits them. The copy price rule is unchanged: ``price_at(coin, observed_time +
+1 s)`` of the merged event.
+
 Limits (verified 2026-11-21 against
 https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/rate-limits-and-user-limits):
 "Maximum of 10 unique users across user-specific websocket subscriptions" (per IP), so
@@ -56,7 +70,7 @@ import json
 import logging
 import zlib
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -69,9 +83,10 @@ from hades_core.events import TradeEvent
 from hades_core.paper import OpenPosition
 from hades_hl import pipeline
 from hades_hl.client import INFO_WEIGHT_DEFAULT, WEIGHT_PER_MIN, HLError, info_weight, item_weight
-from hades_hl.db import Fill, Kv, PaperEvent, Price, _insert_ignore, insert_fills, utcnow
-from hades_hl.normalize import fill_legs, is_spot, leverage_by_coin, ms_to_dt
-from hades_hl.normalize import HEAD
+from hades_hl.db import (Fill, Kv, PaperEvent, PaperPiece, Price, _insert_ignore, insert_fills,
+                         utcnow)
+from hades_hl.normalize import (AGG_WINDOW_S, Leg, OrderLegs, fill_legs, is_spot,
+                                leverage_by_coin, order_event, order_key)
 
 log = logging.getLogger(__name__)
 
@@ -366,12 +381,28 @@ async def _stop_task(task: asyncio.Task) -> None:
 OnFill = Callable[[TradeEvent], Any]
 
 
+@dataclass
+class _Order:
+    """P65: the pieces of one leader order seen so far (not yet an event)."""
+
+    key: tuple  # normalize.order_key + the P47 stale flag
+    legs: list[Leg]
+    vias: list[str]
+    observed: datetime  # when the last piece reached us
+    leverage: Decimal | None
+    stale: bool
+
+
 class FillWatcher:
     """Watches followed wallets' fills: WS ``userFills`` for the first
     ``ws_max_user_subs`` follows (by follow start, then address), REST polling for the
     rest. Every new fill is stored; each new leg at or after the wallet's live start
-    becomes a TradeEvent (``seq`` from kv ``hl:seq:{addr}``), is persisted in
-    ``paper_events`` (idempotent on source_ref) and handed to ``on_fill``.
+    is merged with the other pieces of its order (P65: ``aggregate_window_s``, see the
+    module doc) into ONE TradeEvent (``seq`` from kv ``hl:seq:{addr}``), which is
+    persisted in ``paper_events`` (idempotent per piece) and handed to ``on_fill``.
+    ``aggregate_window_s=0`` emits at the end of every ``ingest`` (pieces delivered
+    together are still merged); otherwise ``run`` flushes on a timer, or call
+    :meth:`flush_due`.
 
     ``follows``: ``{address: follow started_at or None}`` (None = the watcher start).
     """
@@ -391,7 +422,8 @@ class FillWatcher:
                  recovery_retry_s: float = RECOVERY_RETRY_S,
                  recovery_retry_max_s: float = RECOVERY_RETRY_MAX_S,
                  extra_weight_per_min: float = 0.0,
-                 recovery_max_age_s: float = RECOVERY_MAX_AGE_S) -> None:
+                 recovery_max_age_s: float = RECOVERY_MAX_AGE_S,
+                 aggregate_window_s: float = AGG_WINDOW_S) -> None:
         self.engine = engine
         self.client = client
         self.ws_url = ws_url
@@ -419,6 +451,10 @@ class FillWatcher:
         self.recovery_retry_s = recovery_retry_s
         self.recovery_retry_max_s = recovery_retry_max_s
         self.recovery_max_age_s = recovery_max_age_s
+        # P65: per address the orders not yet emitted, oldest first; only the last one
+        # can still take pieces, the others are complete and wait for the next flush
+        self.aggregate_window_s = aggregate_window_s
+        self._agg: dict[str, list[_Order]] = {}
         self.stale_missed = 0  # P47: fills too old when observed, emitted as missed
         self._retry_delay: dict[str, float] = {}
         self._retry_due: dict[str, float] = {}  # loop.time() of the next retry
@@ -494,8 +530,11 @@ class FillWatcher:
 
     async def ingest(self, addr: str, fills: Iterable[Mapping], *, observed: datetime,
                      via: str, snapshot: bool = False) -> list[TradeEvent]:
-        """Store ``fills`` of ``addr``; unless ``snapshot``, emit the new legs at or after
-        the live start with ``observed_time = observed``. ``via``: ws | poll | recovery."""
+        """Store ``fills`` of ``addr``; unless ``snapshot``, queue the new legs at or after
+        the live start (observed at ``observed``) order by order, and emit every order
+        that is complete (P65). Returns the events emitted by this call; the order
+        still filling is emitted later by :meth:`flush_due`. ``via``: ws | poll |
+        recovery."""
         addr = addr.lower()
         fills = [dict(f) for f in fills]
         release = via == "recovery"  # a successful recovery releases the held fills
@@ -539,6 +578,10 @@ class FillWatcher:
             self._retry_due.pop(addr, None)
         if not snapshot:
             self._advance(addr, newest)
+        await self._deliver(out)
+        return out
+
+    async def _deliver(self, out: list[TradeEvent]) -> None:
         for ev in out:
             self.events.append(ev)
             if self.on_fill is not None:
@@ -548,7 +591,6 @@ class FillWatcher:
                         await res
                 except Exception:  # a consumer bug must not stop the watcher
                     log.exception("hl watcher: on_fill failed for %s", ev.source_ref)
-        return out
 
     def _advance(self, addr: str, newest: int) -> None:
         if newest > self._newest_ms.get(addr, 0):
@@ -556,6 +598,10 @@ class FillWatcher:
         if addr not in self.recovery_floor_ms:  # else held at the floor until recovery
             # after a release this jumps past the held fills too (all committed)
             newest = self._newest_ms.get(addr, 0)
+            # P65: ... but never past a piece that is buffered, not yet an event: a
+            # restart then re-fetches it (inclusive) instead of losing it
+            for g in self._agg.get(addr, ()):
+                newest = min(newest, min(lg.time_ms for lg in g.legs))
             if newest > self.last_seen_ms.get(addr, 0):
                 self.last_seen_ms[addr] = newest
         self._persist_cursor(addr)
@@ -564,51 +610,123 @@ class FillWatcher:
                         lev: Mapping[str, Decimal], observed: datetime,
                         vias: Mapping[int, str],
                         stale_before_ms: int | None = None) -> list[TradeEvent]:
-        """Synchronous (no await): store fills, persist the new legs' events (one
-        chain-ordered batch, all ``observed``), commit. ``vias``: tid -> via. Legs with
-        a leader time before ``stale_before_ms`` are stored settled as missed (P47)."""
+        """Synchronous (no await): store fills, queue the new legs order by order (one
+        chain-ordered batch, all observed at ``observed``) and persist the events of the
+        orders that are complete (P65: every queued order but the last, which waits
+        for more pieces unless ``aggregate_window_s`` is 0). ``vias``: tid -> via.
+        Legs with a leader time before ``stale_before_ms`` are stale (P47): they are
+        never merged with fresh ones and are stored settled as missed."""
         with Session(self.engine) as s:
             insert_fills(s, addr, fills)
             s.commit()
             if not cand:
                 return []
             legs = self._new_legs(s, addr, cand)
-            if not legs:
-                return []
-            key = KV_SEQ.format(addr)
-            seq = int(pipeline.kv_get_json(s, key) or 0)
-            out: list[TradeEvent] = []
-            for lg in legs:
-                seq += 1
-                ev = TradeEvent(
-                    head=HEAD, wallet=addr, market_id=lg.coin, side=lg.side,  # type: ignore[arg-type]
-                    direction=lg.direction,  # type: ignore[arg-type]
-                    size=lg.size, price=lg.price, notional_usd=lg.size * lg.price,
-                    fee_usd=lg.fee, leader_time=ms_to_dt(lg.time_ms), observed_time=observed,
-                    source_ref=lg.source_ref, leverage=lev.get(lg.coin),
-                    position_id=lg.position_id, group_id=None, seq=seq)
-                delay = _ms(observed) - lg.time_ms
-                stale = stale_before_ms is not None and lg.time_ms < stale_before_ms
-                if stale:
-                    self.stale_missed += 1
-                    log.info("hl watcher %s: fill %s is %.0f min old when observed; missed",
-                             addr, lg.source_ref, delay / 60_000)
-                s.add(PaperEvent(source_ref=ev.source_ref, address=addr,
-                                 json={**event_to_json(ev),
-                                       "via": vias.get(int(lg.fill["tid"]), ""),
-                                       # the leader's signed position around this leg
-                                       # (alerts: size change vs previous size)
-                                       "leader_start": str(lg.start),
-                                       "leader_end": str(lg.end),
-                                       # P49: the leader's realized PnL on this leg
-                                       "leader_closed_pnl": str(lg.closed_pnl),
-                                       **({"stale_recovery": True} if stale else {})},
-                                 observed_time=observed, delay_ms=delay, seq=seq,
-                                 missed=True if stale else None,
-                                 settled_at=observed if stale else None))
-                out.append(ev)
-            pipeline.kv_set_json(s, key, seq)
-            s.commit()
+        for lg in legs:
+            stale = stale_before_ms is not None and lg.time_ms < stale_before_ms
+            key = (*order_key(lg), stale)
+            via = vias.get(int(lg.fill["tid"]), "")
+            q = self._agg.setdefault(addr, [])
+            g = q[-1] if q else None
+            if (g is not None and g.key == key and
+                    (observed - g.observed).total_seconds() <= self.aggregate_window_s):
+                g.legs.append(lg)  # one more piece of the order being filled
+                g.vias.append(via)
+                g.observed = max(g.observed, observed)
+                g.leverage = lev.get(lg.coin, g.leverage)
+            else:  # another order: the previous one is complete
+                q.append(_Order(key, [lg], [via], observed, lev.get(lg.coin), stale))
+        return self._flush(addr)
+
+    def _flush(self, addr: str, *, now: datetime | None = None,
+               force: bool = False) -> list[TradeEvent]:
+        """Synchronous: persist the events of ``addr``'s complete orders, oldest first:
+        every queued order but the last, and the last too when it is due (``force``, a
+        zero window, or ``now`` at least ``aggregate_window_s`` after its last piece).
+        If the write fails nothing is dequeued (the next flush retries)."""
+        q = self._agg.get(addr)
+        if not q:
+            self._agg.pop(addr, None)
+            return []
+        n = len(q) - 1
+        due = force or self.aggregate_window_s <= 0 or (
+            now is not None
+            and (now - q[-1].observed).total_seconds() >= self.aggregate_window_s)
+        if due:
+            n += 1
+        if not n:
+            return []
+        with Session(self.engine) as s:
+            out = self._emit(s, addr, q[:n])
+        self.stale_missed += sum(1 for g in q[:n] if g.stale)
+        del q[:n]
+        if not q:
+            del self._agg[addr]
+        return out
+
+    def _emit(self, s: Session, addr: str, orders: list[_Order]) -> list[TradeEvent]:
+        """One event per order, ``seq`` in the given (leader) order; commits."""
+        key = KV_SEQ.format(addr)
+        seq = int(pipeline.kv_get_json(s, key) or 0)
+        out: list[TradeEvent] = []
+        for g in orders:
+            seq += 1
+            order = OrderLegs(tuple(g.legs))
+            ev = order_event(addr, order, observed=g.observed, leverage=g.leverage, seq=seq)
+            # the feed delay: observing the last piece vs the leader making it
+            delay = _ms(g.observed) - order.last_time_ms
+            if g.stale:
+                log.info("hl watcher %s: fill %s is %.0f min old when observed; missed",
+                         addr, ev.source_ref, delay / 60_000)
+            js = {**event_to_json(ev), "via": g.vias[-1],
+                  # the leader's signed position around this order
+                  # (alerts: size change vs previous size)
+                  "leader_start": str(order.start), "leader_end": str(order.end),
+                  # P49: the leader's realized PnL on this order
+                  "leader_closed_pnl": str(order.closed_pnl),
+                  # P65 evidence: the order and the fills this event is made of
+                  "oid": order.oid, "tids": order.tids}
+            if len(g.legs) > 1:
+                js["pieces"] = [{"ref": lg.source_ref, "tid": int(lg.fill["tid"]),
+                                 "sz": str(lg.size), "px": str(lg.price),
+                                 "time": lg.time_ms, "via": via}
+                                for lg, via in zip(g.legs, g.vias)]
+                _insert_ignore(s, PaperPiece.__table__, [
+                    {"address": addr, "piece_ref": ref, "source_ref": ev.source_ref}
+                    for ref in order.refs])
+            if g.stale:
+                js["stale_recovery"] = True
+            s.add(PaperEvent(source_ref=ev.source_ref, address=addr, json=js,
+                             observed_time=g.observed, delay_ms=delay, seq=seq,
+                             missed=True if g.stale else None,
+                             settled_at=g.observed if g.stale else None))
+            out.append(ev)
+        pipeline.kv_set_json(s, key, seq)
+        s.commit()
+        return out
+
+    def has_buffered(self, addr: str) -> bool:
+        """P65: pieces of ``addr`` are stored but not yet an event (an order is still
+        filling, or a flush failed and is retried)."""
+        return bool(self._agg.get(addr.lower()))
+
+    async def flush_due(self, now: datetime | None = None, *,
+                        force: bool = False) -> list[TradeEvent]:
+        """P65: emit every buffered order whose last piece reached us at least
+        ``aggregate_window_s`` ago (``force``: all of them). Called by the timer in
+        :meth:`run` and when the watcher stops. Returns the events emitted."""
+        now = now or self._now()
+        out: list[TradeEvent] = []
+        for addr in list(self._agg):
+            try:
+                evs = self._flush(addr, now=now, force=force)
+            except Exception:  # a DB error: the orders stay queued, retried next tick
+                log.exception("hl watcher %s: emitting the buffered order failed", addr)
+                continue
+            if evs:
+                self._advance(addr, 0)  # the cursor may now pass the emitted pieces
+                await self._deliver(evs)
+                out.extend(evs)
         return out
 
     def _new_legs(self, s: Session, addr: str, cand: list[dict]):
@@ -621,6 +739,11 @@ class FillWatcher:
                                             Fill.time >= ctx_start)
                          .order_by(Fill.time, Fill.tid))
         ctx = [pipeline.fill_dict(r) for r in rows]
+        # a fill stored before P65 has no oid in its row: take it from the delivery
+        oids = {int(f["tid"]): f["oid"] for f in cand if f.get("oid") is not None}
+        for f in ctx:
+            if f.get("oid") is None and int(f["tid"]) in oids:
+                f["oid"] = oids[int(f["tid"])]
         tids = {int(f["tid"]) for f in cand}
         legs = [lg for lg in fill_legs(addr, ctx, sz_decimals=self.sz_decimals)
                 if int(lg.fill["tid"]) in tids]
@@ -631,6 +754,11 @@ class FillWatcher:
         done = set(s.scalars(select(PaperEvent.source_ref)
                              .where(PaperEvent.address == addr,
                                     PaperEvent.source_ref.in_(refs))))
+        # P65: ... or merged into an event as a later piece, or still buffered
+        done.update(s.scalars(select(PaperPiece.piece_ref)
+                              .where(PaperPiece.address == addr,
+                                     PaperPiece.piece_ref.in_(refs))))
+        done.update(lg.source_ref for g in self._agg.get(addr, ()) for lg in g.legs)
         return [lg for lg in legs if lg.source_ref not in done]
 
     async def _leverage_for(self, addr: str) -> dict[str, Decimal]:
@@ -683,12 +811,30 @@ class FillWatcher:
             tasks.append(asyncio.create_task(self._retry_loop()))
         if self.poll_addresses:
             tasks.append(asyncio.create_task(self._poll_loop()))
+        if self.aggregate_window_s > 0:
+            tasks.append(asyncio.create_task(self._agg_loop()))
         try:
             await stop.wait()
         finally:
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            try:  # P65: an order still buffered becomes its event before we stop
+                await self.flush_due(force=True)
+            except Exception:
+                log.exception("hl watcher: flushing the buffered orders at stop failed")
+
+    async def _agg_loop(self) -> None:
+        """P65: emit a buffered order once no further piece came for the window."""
+        tick = max(0.02, min(0.25, self.aggregate_window_s / 4))
+        while True:
+            await asyncio.sleep(tick)
+            try:
+                await self.flush_due()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("hl watcher: flushing the buffered orders failed")
 
     async def _recover(self, addrs: Iterable[str], *, retry: bool = False) -> None:
         """REST backfill since the last seen fill (the floor after a failed recovery);

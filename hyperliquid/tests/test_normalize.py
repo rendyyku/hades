@@ -7,6 +7,7 @@ from hades_hl.normalize import (
     HEAD,
     fill_legs,
     fills_to_events,
+    group_legs,
     is_own_liquidation,
     is_spot,
     normalize_fills,
@@ -254,7 +255,10 @@ def test_real_fixture_events(fixture, caplog):
         evs = fills_to_events(meta["address"], fills)
     n_flips = sum(1 for f in fills if ">" in f["dir"])
     assert n_flips == 29
-    assert len(evs) == len(fills) + n_flips
+    legs = fill_legs(meta["address"], fills)
+    assert len(legs) == len(fills) + n_flips
+    # P65: one event per leader order and position, not per fill
+    assert len(evs) == len(group_legs(legs)) == 1033
     assert len({e.source_ref for e in evs}) == len(evs)
     assert {e.side for e in evs} <= {"open", "increase", "reduce", "close"}
     times = [e.leader_time for e in evs]

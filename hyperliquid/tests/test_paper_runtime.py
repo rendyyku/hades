@@ -321,7 +321,7 @@ async def test_integration_follow_fills_paper_promotion(engine):
     promotion after the gate passes (fake clock) -> ladder alert."""
     clock = Clock(START)
     w = FillWatcher(engine, None, {A: START}, start_time=START, now=clock,
-                    fetch_leverage=False, sz_decimals={})
+                    fetch_leverage=False, sz_decimals={}, aggregate_window_s=0)
     tid = 1000
     for i in range(30):
         t_open = START + timedelta(days=i, hours=1)

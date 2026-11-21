@@ -45,6 +45,7 @@ class Clock:
 
 def polled(engine, client, clock, **kw):
     """A watcher whose only follow is POLLED (no WS slot), as the 11th+ follow is."""
+    kw.setdefault("aggregate_window_s", 0)  # P65: no wait for further pieces here
     w = FillWatcher(engine, client, {A: START}, start_time=clock.t, now=clock,
                     ws_max_user_subs=0, fetch_leverage=False, sz_decimals={}, **kw)
     assert w.poll_addresses == [A] and w.ws_addresses == []
@@ -104,7 +105,7 @@ async def test_c1_round_trip_made_during_outage_is_not_a_closed_paper_trade(engi
 async def test_c1_staleness_applies_to_every_live_ingest_path(engine, via):
     now = START + timedelta(days=1)
     w = FillWatcher(engine, LiveClient(), {A: START}, start_time=START, now=lambda: now,
-                    fetch_leverage=False, sz_decimals={})
+                    fetch_leverage=False, sz_decimals={}, aggregate_window_s=0)
     old = mk("BTC", "B", "1", "100", "0", ms(now - 11 * MIN), tid=31)
     edge = mk("ETH", "B", "1", "10", "0", ms(now - 10 * MIN), tid=32)  # exactly 10 min: kept
     await w.ingest(A, [old, edge], observed=now, via=via)
@@ -172,7 +173,7 @@ def test_i1_repromotion_waits_for_the_cooldown_after_a_demotion(engine, session)
 async def test_i2_counterparties_of_one_trade_both_get_their_event(engine):
     now = START + timedelta(days=1)
     w = FillWatcher(engine, LiveClient(), {A: START, B: START}, start_time=START,
-                    now=lambda: now, fetch_leverage=False, sz_decimals={})
+                    now=lambda: now, fetch_leverage=False, sz_decimals={}, aggregate_window_s=0)
     t = ms(now) - 1000
     buy = mk("BTC", "B", "1", "100", "0", t, tid=77, hash="0xsame")
     sell = mk("BTC", "A", "1", "100", "0", t, tid=77, hash="0xsame")

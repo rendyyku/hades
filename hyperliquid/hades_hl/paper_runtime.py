@@ -28,7 +28,9 @@
   ``ladder_cooldown_until``), so a rolling net hovering around zero cannot flip the
   ladder every run.
 - a JSON snapshot (kv ``hl:paper:{addr}``) for the API: the :class:`PaperSummary`, open
-  positions, winrate with n, both gates, a downsampled equity curve, the latest fills,
+  positions, winrate with n, both gates, a downsampled equity curve, the latest fills
+  (a missed one with its ``reason``), ``missed`` and ``missed_reasons`` (P65: ``cap``,
+  ``no_price``, ``stale``),
   and the gap (P49): ``gap_usd`` = per copied and closed position, the leader's
   closedPnl on it scaled by our qty / the leader's qty, minus our pnl on it; plus the
   raw ``leader_realized_usd`` (the leader's closedPnl on positions opened since the
@@ -376,7 +378,26 @@ def _fill_json(f) -> dict:
             "direction": f.direction, "size": str(f.size),
             "price": None if f.price is None else str(f.price), "fee": str(f.fee),
             "realized_pnl": str(f.realized_pnl), "missed": f.missed,
+            # why it was missed (P65): "no_price" | "cap" | "stale"; None when copied
+            "reason": f.reason,
             "position_id": f.position_id, "at": None if f.at is None else f.at.isoformat()}
+
+
+def missed_reasons(res: PaperResult, rows: list[PaperEvent]) -> dict[str, int]:
+    """The missed fills by reason, e.g. ``{"cap": 2, "no_price": 1}`` (P65):
+
+    - ``cap``: the part of an open / increase beyond a margin cap (core), not copied;
+    - ``stale``: the fill was too old when we observed it (P47);
+    - ``no_price``: no recorded price in the event's window (P45)."""
+    stale = {r.source_ref for r in rows if (r.json or {}).get("stale_recovery")}
+    out: dict[str, int] = {}
+    for f in res.fills:
+        if f.missed:
+            why = f.reason or "no_price"
+            if why == "no_price" and f.ev_ref in stale:
+                why = "stale"
+            out[why] = out.get(why, 0) + 1
+    return dict(sorted(out.items()))
 
 
 def needs_run(session: Session, addr: str, now: datetime) -> bool:
@@ -490,6 +511,8 @@ def run_paper(session: Session, addr: str, now: datetime, *,
         days_followed=max((now - f.started_at).days, 0), gap_usd=gap_usd,
         origin=f.origin if f.origin in ("auto", "manual") else "manual")
     seqs = [e.seq for e in events]
+    reasons = missed_reasons(res, rows)
+    stale_refs = {r.source_ref for r in rows if (r.json or {}).get("stale_recovery")}
     snap = {
         "summary": summary.model_dump(mode="json"),
         "computed_at": now.isoformat(),
@@ -497,10 +520,12 @@ def run_paper(session: Session, addr: str, now: datetime, *,
         "last_seq": max(seqs + [last_seq or 0]),
         "events": len(events),
         "missed": sum(1 for x in res.fills if x.missed),
+        "missed_reasons": reasons,
         "open_positions": [{"position_id": p.position_id, "market_id": p.market_id,
                             "direction": p.direction, "qty": str(p.qty),
                             "entry_price": str(p.entry_price), "margin": str(p.margin),
-                            "leverage": str(p.leverage), "leader_size": str(p.leader_size)}
+                            "leverage": str(p.leverage), "leader_size": str(p.leader_size),
+                            "ratio": str(p.ratio)}
                            for p in res.open_positions.values()],
         "winrate": (wins / len(closed)) if closed else None,
         "n": len(closed),
@@ -510,7 +535,9 @@ def run_paper(session: Session, addr: str, now: datetime, *,
         "gap_usd": str(gap_usd),
         "leader_realized_usd": str(lead),
         "equity_curve": _downsample(curve, CURVE_MAX_POINTS),
-        "fills": [_fill_json(x) for x in res.fills[-FILLS_KEEP:]],
+        "fills": [{**_fill_json(x), "reason": "stale"}
+                  if x.missed and x.reason == "no_price" and x.ev_ref in stale_refs
+                  else _fill_json(x) for x in res.fills[-FILLS_KEEP:]],
         "funding_missing_hours": funding.missing_hours if funding is not None else None,
     }
     pipeline.kv_set_json(session, KV_PAPER.format(addr), snap)
@@ -691,5 +718,6 @@ class Reconciler:
 
 __all__ = ["GATE", "KV_PAPER", "PRICE_KEEP_DAYS", "RECONCILE_INTERVAL_S", "ROLLING_DAYS",
            "Marks", "RecordedPrices", "Reconciler", "SettledModel", "ensure_funding",
-           "event_coins", "gap_report", "load_events", "needs_run", "reconcile",
+           "event_coins", "gap_report", "load_events", "missed_reasons", "needs_run",
+           "reconcile",
            "record_marks", "run_paper", "run_paper_live", "settle", "snapshot"]

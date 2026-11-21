@@ -50,7 +50,7 @@ class Gated(FakeClient):
 def mkw(engine, c, got):
     start = datetime.now(UTC) - timedelta(hours=1)
     w = FillWatcher(engine, c, {A: None}, start_time=start, fetch_leverage=False,
-                    sz_decimals={}, on_fill=got.append)
+                    sz_decimals={}, on_fill=got.append, aggregate_window_s=0)
     return start, w
 
 
@@ -132,7 +132,8 @@ class Clock:
 async def test_restart_recovers_fills_made_while_down(engine):
     t0 = datetime.now(UTC) - timedelta(hours=3)
     c = FakeClient()
-    w1 = FillWatcher(engine, c, {A: t0}, start_time=t0, fetch_leverage=False, sz_decimals={})
+    w1 = FillWatcher(engine, c, {A: t0}, start_time=t0, fetch_leverage=False, sz_decimals={},
+                     aggregate_window_s=0)
     f1 = mk("BTC", "B", "1", "100", "0", ms(t0) + 60_000, tid=1)
     await w1.ingest(A, [f1], observed=t0 + timedelta(minutes=1, seconds=1), via="ws")
     # process down; the leader trades meanwhile
@@ -142,7 +143,7 @@ async def test_restart_recovers_fills_made_while_down(engine):
     clock = Clock(restart + timedelta(seconds=2))
     got = []
     w2 = FillWatcher(engine, c, {A: t0}, start_time=restart, now=clock, fetch_leverage=False,
-                     sz_decimals={}, on_fill=got.append)
+                     sz_decimals={}, on_fill=got.append, aggregate_window_s=0)
     assert w2.last_seen_ms[A] == ms(t0) + 60_000  # restored, not the restart time
     await w2._recover([A])
     assert [(e.source_ref, e.side) for e in got] == [("0xh2:2", "close")]
@@ -155,13 +156,14 @@ async def test_restart_recovers_fills_made_while_down(engine):
 async def test_restart_recovers_even_when_no_fill_was_seen_before(engine):
     t0 = datetime.now(UTC) - timedelta(hours=3)
     c = FakeClient()
-    FillWatcher(engine, c, {A: t0}, start_time=t0, fetch_leverage=False, sz_decimals={})
+    FillWatcher(engine, c, {A: t0}, start_time=t0, fetch_leverage=False, sz_decimals={},
+                aggregate_window_s=0)
     assert kv(engine, f"hl:last_seen:{A}") == ms(t0)  # the live start is persisted
     f = mk("BTC", "B", "1", "100", "0", ms(t0) + 3_600_000, tid=3)  # made while down
     c.fills[A] = [f]
     got = []
     w2 = FillWatcher(engine, c, {A: t0}, start_time=t0 + timedelta(hours=2),
-                     fetch_leverage=False, sz_decimals={}, on_fill=got.append)
+                     fetch_leverage=False, sz_decimals={}, on_fill=got.append, aggregate_window_s=0)
     await w2._recover([A])
     assert [e.source_ref for e in got] == ["0xh3:3"]
 
@@ -169,11 +171,12 @@ async def test_restart_recovers_even_when_no_fill_was_seen_before(engine):
 async def test_restart_restores_pending_floor_and_holds_live_fills(engine):
     t0 = datetime.now(UTC) - timedelta(hours=3)
     c = Gated()
-    w1 = FillWatcher(engine, c, {A: t0}, start_time=t0, fetch_leverage=False, sz_decimals={})
+    w1 = FillWatcher(engine, c, {A: t0}, start_time=t0, fetch_leverage=False, sz_decimals={},
+                     aggregate_window_s=0)
     await w1._recover([A])  # fails -> floor persisted
     got = []
     w2 = FillWatcher(engine, c, {A: t0}, start_time=t0 + timedelta(hours=2),
-                     fetch_leverage=False, sz_decimals={}, on_fill=got.append)
+                     fetch_leverage=False, sz_decimals={}, on_fill=got.append, aggregate_window_s=0)
     assert w2.recovery_floor_ms[A] == ms(t0)
     live_f = mk("BTC", "B", "1", "100", "0", ms(t0) + 7_300_000, tid=9)
     assert await w2.ingest(A, [live_f], observed=datetime.now(UTC), via="ws") == []
@@ -187,7 +190,7 @@ def test_persisted_last_seen_never_before_follow_start(engine):
         s.commit()
     later = t0 + timedelta(days=3)  # re-followed after the old cursor
     w = FillWatcher(engine, FakeClient(), {A: later}, start_time=later + timedelta(hours=1),
-                    fetch_leverage=False, sz_decimals={})
+                    fetch_leverage=False, sz_decimals={}, aggregate_window_s=0)
     assert w.last_seen_ms[A] == ms(later) and w.live_from_ms[A] == ms(later)
 
 
@@ -196,7 +199,7 @@ def test_persisted_last_seen_never_before_follow_start(engine):
 def test_poll_interval_counts_item_weight_and_state_calls(engine):
     addrs = [f"0x{i:040x}" for i in range(1, 26)]  # 25 follows -> 15 polled
     w = FillWatcher(engine, FakeClient(), {a: None for a in addrs}, fetch_leverage=True,
-                    sz_decimals={})
+                    sz_decimals={}, aggregate_window_s=0)
     # 15 x 20 per cycle; clearinghouseState (weight 2) up to once a minute for each
     # of the 25 follows = 50/min out of the 600/min polling share
     assert w.poll_interval() == pytest.approx(300 * 60 / 550)

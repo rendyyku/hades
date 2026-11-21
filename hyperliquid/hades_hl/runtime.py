@@ -11,7 +11,8 @@ paper copies live.
 - every ``paper_interval_s`` (60 s): :func:`paper_runtime.run_paper_live` for each
   follow that needs it (new settled events, never run, or last run over an hour ago).
 - every ``reconcile_tick_s``: the P11 reconcile, at most once per 5 min per follow with
-  open paper positions (skipped while the watcher recovers that wallet).
+  open paper positions (skipped while the watcher recovers that wallet or still
+  buffers the pieces of one of its orders, P65).
 - the price recorder: ``fastAssetCtxs`` with ``allMids`` fallback (P41), recording
   the watch set (P42: coins traded by follows in the last 30 days, coins of open paper
   positions, plus BTC/ETH; refreshed every ``watch_refresh_s``; a new fill's coin joins
@@ -318,8 +319,15 @@ class HLRuntime:
         return ran
 
     def _pending(self, addr: str) -> bool:
+        """Fills of ``addr`` are on their way: a recovery is pending (P46), or an
+        order is buffered and not yet an event (P65). No reconcile meanwhile."""
         w = self.watcher
-        return bool(w is not None and addr in (getattr(w, "recovery_floor_ms", None) or {}))
+        if w is None:
+            return False
+        if addr in (getattr(w, "recovery_floor_ms", None) or {}):
+            return True
+        buffered = getattr(w, "has_buffered", None)
+        return bool(buffered is not None and buffered(addr))
 
     async def reconcile_tick(self) -> list[TradeEvent]:
         now = self._now()

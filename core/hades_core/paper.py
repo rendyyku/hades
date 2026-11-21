@@ -18,6 +18,26 @@ Accounting:
   (equity) immediately and is deducted from the position's ClosedTrade pnl at close.
   It is not part of the isolated-margin cap.
 
+Sizing (ruling P65). One event is one leader ORDER: a head merges the fills of one
+order into one event before it gets here.
+- open: margin = ``risk_fraction`` (5%) of the current equity, notional = margin x
+  min(leader leverage, max leverage), and the copy ratio ``r`` = our qty / the leader's
+  size after that opening order is fixed for the life of the position.
+- increase: we add ``r`` x the leader's size delta. reduce: we cut the leader's
+  fraction (delta / leader size) of OUR actual position, so a reduce can never take
+  more than we hold or flip us. reduce / close / resolve are never capped.
+- hard caps on every margin we add (open or increase), measured against the equity at
+  that moment: one position's margin never exceeds ``max_position_margin_fraction``
+  (20%) of the equity, and the margin committed over all open positions never exceeds
+  ``max_total_margin_fraction`` (100%) of it. The part beyond a cap is not copied: it
+  is recorded as a missed fill with ``reason == "cap"`` (its size is the qty not
+  copied) and costs nothing; the leader's size is still tracked in full. An open with
+  no room at all is not opened and the rest of that episode is ignored. The caps
+  hold on the equity left after the fill's own fee. They limit what we ADD; they
+  never force a reduce when the equity falls later.
+- a missed fill carries a ``reason``: ``"no_price"`` (the model had no price) or
+  ``"cap"``.
+
 Event handling:
 - Input is de-duplicated by ``source_ref`` (first occurrence in input order wins), then
   sorted by :func:`event_sort_key` = ``(observed_time, seq, source_ref)``: ``seq`` is the
@@ -86,6 +106,9 @@ class PaperConfig:
     bankroll: Decimal = Decimal("10000")
     risk_fraction: Decimal = Decimal("0.05")
     max_leverage: Decimal = Decimal("10")
+    # ruling P65: hard caps on the margin we add, as fractions of the current equity
+    max_position_margin_fraction: Decimal = Decimal("0.20")  # one position
+    max_total_margin_fraction: Decimal = Decimal("1")  # all open positions together
 
 
 @dataclass
@@ -101,6 +124,8 @@ class PaperFill:
     missed: bool
     position_id: str | None = None
     at: datetime | None = None
+    # why a missed fill was missed: "no_price" | "cap" (P65); None when copied
+    reason: str | None = None
 
 
 @dataclass
@@ -123,6 +148,8 @@ class OpenPosition:
     margin: Decimal
     leverage: Decimal
     leader_size: Decimal
+    # P65: our qty / the leader's size after the opening order; fixed at open
+    ratio: Decimal = ZERO
 
 
 @dataclass
@@ -264,6 +291,29 @@ def simulate(
             total += p.unrealized(px)
         return total
 
+    def room(eq: Decimal, held: Decimal) -> Decimal:
+        """P65: the margin a position already holding ``held`` may still add."""
+        committed = sum((q.pos.margin for q in book.values()), ZERO)
+        return max(min(cfg.max_position_margin_fraction * eq - held,
+                       cfg.max_total_margin_fraction * eq - committed), ZERO)
+
+    def fit(want: Decimal, held: Decimal, lev: Decimal) -> Decimal:
+        """P65: how much of the margin ``want`` fits under both caps. The caps are
+        measured against the equity left after this fill's own fee (the fee of a
+        smaller add is assumed no larger)."""
+        eq = equity()
+        margin = min(want, room(eq, held))
+        if margin > ZERO:
+            fee = model.fee(margin * lev)
+            if fee > ZERO:
+                margin = min(margin, room(eq - fee, held))
+        return margin
+
+    def missed(ev: TradeEvent, size: Decimal, price: Decimal | None, reason: str,
+               at: datetime) -> None:
+        res.fills.append(PaperFill(ev.source_ref, ev.market_id, ev.side, ev.direction,
+                                   size, price, ZERO, ZERO, True, ev.position_id, at, reason))
+
     def mark_until(limit: datetime | None) -> None:
         """Process the periodic marks at or before ``limit`` (all when None)."""
         while pending_marks and (limit is None or pending_marks[-1] <= limit):
@@ -308,8 +358,7 @@ def simulate(
         lead = abs(ev.size)
         price = model.fill_price(ev)
         if price is None:
-            res.fills.append(PaperFill(ev.source_ref, ev.market_id, ev.side, ev.direction,
-                                       ZERO, None, ZERO, ZERO, True, ev.position_id, at))
+            missed(ev, ZERO, None, "no_price", at)
             p = book.get(key)
             if p is None:  # missed open: never opened, ignore the rest of this episode
                 ignored[key] = lead
@@ -333,34 +382,54 @@ def simulate(
 
         if p is None:  # open
             eq = equity()
-            margin = cfg.risk_fraction * eq
-            if margin > ZERO and price > ZERO:
+            want = cfg.risk_fraction * eq
+            if want > ZERO and price > ZERO:
                 lev = min(ev.leverage or ONE, cfg.max_leverage, model.max_leverage)
-                qty = margin * lev / price
-                fee = model.fee(qty * price)
-                base -= fee
-                book[key] = _Pos(
-                    OpenPosition(key, ev.market_id, ev.direction, qty, price, margin, lev, lead),
-                    opened_at=at, fees=fee, accrued_to=at, group_id=ev.group_id)
-                res.fills.append(PaperFill(ev.source_ref, ev.market_id, ev.side, ev.direction,
-                                           qty, price, fee, ZERO, False, key, at))
+                margin = fit(want, ZERO, lev)
+                if margin > ZERO:
+                    qty = margin * lev / price
+                    fee = model.fee(qty * price)
+                    base -= fee
+                    book[key] = _Pos(
+                        OpenPosition(key, ev.market_id, ev.direction, qty, price, margin, lev,
+                                     lead, qty / lead if lead > ZERO else ZERO),
+                        opened_at=at, fees=fee, accrued_to=at, group_id=ev.group_id)
+                    res.fills.append(PaperFill(ev.source_ref, ev.market_id, ev.side,
+                                               ev.direction, qty, price, fee, ZERO, False,
+                                               key, at))
+                else:  # no room at all: never opened, ignore the rest of this episode
+                    ignored[key] = lead
+                if margin < want:
+                    missed(ev, (want - margin) * lev / price, price, "cap", at)
             else:
                 ignored[key] = lead
         elif terminal:
             close_out(key, price, model.fee(p.pos.qty * price), ev.source_ref, ev.side, at, False)
         elif ev.side in ("increase", "open"):
             pos = p.pos
-            if pos.leader_size > ZERO:
-                add = pos.qty * lead / pos.leader_size
-                fee = model.fee(add * price)
-                new_qty = pos.qty + add
-                pos.entry_price = (pos.entry_price * pos.qty + price * add) / new_qty
-                pos.qty = new_qty
-                pos.margin += add * price / pos.leverage
-                p.fees += fee
-                base -= fee
-                res.fills.append(PaperFill(ev.source_ref, ev.market_id, ev.side, ev.direction,
-                                           add, price, fee, ZERO, False, key, at))
+            # P65: the ratio fixed at open (a position opened on a zero-size event has
+            # none: fall back to our qty / the leader's size so far)
+            ratio = pos.ratio
+            if ratio <= ZERO and pos.leader_size > ZERO:
+                ratio = pos.qty / pos.leader_size
+            want = ratio * lead
+            if want > ZERO and price > ZERO:
+                want_margin = want * price / pos.leverage
+                margin = fit(want_margin, pos.margin, pos.leverage)
+                add = want if margin == want_margin else margin * pos.leverage / price
+                if add > ZERO:
+                    fee = model.fee(add * price)
+                    new_qty = pos.qty + add
+                    pos.entry_price = (pos.entry_price * pos.qty + price * add) / new_qty
+                    pos.qty = new_qty
+                    pos.margin += margin
+                    p.fees += fee
+                    base -= fee
+                    res.fills.append(PaperFill(ev.source_ref, ev.market_id, ev.side,
+                                               ev.direction, add, price, fee, ZERO, False,
+                                               key, at))
+                if add < want:  # the part beyond a cap is not copied
+                    missed(ev, want - add, price, "cap", at)
             pos.leader_size += lead
         else:  # reduce
             pos = p.pos

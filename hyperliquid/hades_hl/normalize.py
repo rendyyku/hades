@@ -29,6 +29,19 @@ where the chain gives ``-613298.43``). Every chain / zero comparison uses
 1e-9 x |position|)``, relative, ruling P34): a start
 within ``tol`` of the previous end is snapped to it, and a start or end within ``tol``
 of 0 is snapped to 0. Pass ``sz_decimals`` (see :func:`sz_decimals_by_coin`).
+
+One order, one event (ruling P65): a leader order usually fills in several pieces
+(178 of the 1003 orders in the real fixture). A copy sized on the first piece and
+scaled by the later ones is wrong by orders of magnitude, so the legs of one order on
+one position are merged into ONE event before anything is sized: :func:`order_key`
+says which legs belong together (same HL ``oid``; without ``oid`` the same coin and
+direction in the same millisecond), :func:`group_legs` merges consecutive legs with
+the same key observed at most ``AGG_WINDOW_S`` (2 s) after the previous piece, and
+:func:`order_event` is the merged TradeEvent (size = sum, price = size-weighted
+average, ``observed_time`` = the last piece's, ``source_ref`` = the first piece's;
+the pieces stay available as :attr:`OrderLegs.tids` / ``refs``). A flip inside one
+order gives one close and one open. The live watcher merges the same way, piece by
+piece as they arrive (:class:`hades_hl.live.FillWatcher`).
 """
 
 from __future__ import annotations
@@ -36,7 +49,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 
 from hades_core.events import TradeEvent
@@ -398,6 +411,147 @@ def _check_dir(f: Mapping, last: Leg) -> None:
                     f.get("tid"), text, last.direction)
 
 
+# -- ruling P65: one leader order = one event --------------------------------------------
+
+AGG_WINDOW_S = 2.0  # a piece joins its order if observed at most this long after the last
+
+
+def order_key(lg: Leg) -> tuple:
+    """Legs with the same key are pieces of ONE leader order on ONE position: the same
+    coin and episode (so the same direction), both growing or both shrinking it, and
+    the same HL ``oid``. A fill without ``oid`` falls back to its millisecond: the same
+    coin and direction in the same ms."""
+    oid = lg.fill.get("oid")
+    order = ("oid", str(oid)) if oid is not None else ("ms", lg.time_ms)
+    return (lg.coin, lg.position_id, lg.side in ("open", "increase"), order)
+
+
+@dataclass(frozen=True)
+class OrderLegs:
+    """The legs of one leader order on one position, in execution order."""
+
+    legs: tuple[Leg, ...]
+
+    @property
+    def coin(self) -> str:
+        return self.legs[0].coin
+
+    @property
+    def position_id(self) -> str:
+        return self.legs[0].position_id
+
+    @property
+    def direction(self) -> str:
+        return self.legs[0].direction
+
+    @property
+    def side(self) -> str:
+        """open / increase by the first leg; reduce, or close when the last leg ends
+        the position."""
+        first, last = self.legs[0].side, self.legs[-1].side
+        return first if first in ("open", "increase") else last
+
+    @property
+    def size(self) -> Decimal:
+        return sum((lg.size for lg in self.legs), ZERO)
+
+    @property
+    def notional(self) -> Decimal:
+        return sum((lg.size * lg.price for lg in self.legs), ZERO)
+
+    @property
+    def price(self) -> Decimal:
+        """The leader's size-weighted average price (one leg: its own price)."""
+        return self.legs[0].price if len(self.legs) == 1 else self.notional / self.size
+
+    @property
+    def fee(self) -> Decimal:
+        return sum((lg.fee for lg in self.legs), ZERO)
+
+    @property
+    def closed_pnl(self) -> Decimal:
+        return sum((lg.closed_pnl for lg in self.legs), ZERO)
+
+    @property
+    def start(self) -> Decimal:
+        return self.legs[0].start
+
+    @property
+    def end(self) -> Decimal:
+        return self.legs[-1].end
+
+    @property
+    def time_ms(self) -> int:
+        """The leader time of the first piece (when the order started to fill)."""
+        return self.legs[0].time_ms
+
+    @property
+    def last_time_ms(self) -> int:
+        return self.legs[-1].time_ms
+
+    @property
+    def source_ref(self) -> str:
+        """The first piece's ref: unchanged for a one-piece order, stable for more."""
+        return self.legs[0].source_ref
+
+    @property
+    def refs(self) -> list[str]:
+        return [lg.source_ref for lg in self.legs]
+
+    @property
+    def tids(self) -> list[int]:
+        return [int(lg.fill["tid"]) for lg in self.legs]
+
+    @property
+    def oid(self) -> str | None:
+        oid = self.legs[0].fill.get("oid")
+        return None if oid is None else str(oid)
+
+
+def group_legs(legs: Iterable[Leg], observed: Callable[[Leg], datetime] | None = None,
+               window_s: float = AGG_WINDOW_S) -> list[OrderLegs]:
+    """Merge consecutive legs with the same :func:`order_key`, each observed at most
+    ``window_s`` after the previous piece (``observed(leg)``; default its leader time).
+    The order of the legs is kept; a leg of another order ends the run."""
+    window = timedelta(seconds=window_s)
+    out: list[list[Leg]] = []
+    key = last = None
+    for lg in legs:
+        k = order_key(lg)
+        at = observed(lg) if observed is not None else ms_to_dt(lg.time_ms)
+        if out and k == key and at - last <= window:
+            out[-1].append(lg)
+        else:
+            out.append([lg])
+        key, last = k, at
+    return [OrderLegs(tuple(g)) for g in out]
+
+
+def order_event(addr: str, order: OrderLegs, *, observed: datetime,
+                leverage: Decimal | None = None, seq: int = 0) -> TradeEvent:
+    """The TradeEvent of one leader order (ruling P65). ``observed``: when the LAST of
+    its pieces was observed. ``leader_time`` is the FIRST piece's: an order that
+    started before a follow did is not ours to copy."""
+    return TradeEvent(
+        head=HEAD,
+        wallet=addr,
+        market_id=order.coin,
+        side=order.side,  # type: ignore[arg-type]
+        direction=order.direction,  # type: ignore[arg-type]
+        size=order.size,
+        price=order.price,
+        notional_usd=order.notional,
+        fee_usd=order.fee,
+        leader_time=ms_to_dt(order.time_ms),
+        observed_time=observed,
+        source_ref=order.source_ref,
+        leverage=leverage,
+        position_id=order.position_id,
+        group_id=None,
+        seq=seq,
+    )
+
+
 def fills_to_events(
     addr: str,
     fills: Iterable[Mapping],
@@ -406,35 +560,22 @@ def fills_to_events(
     leverage: Mapping[str, Decimal] | None = None,
     sz_decimals: SzDecimals = None,
 ) -> list[TradeEvent]:
-    """Map raw HL fills of ``addr`` to TradeEvents, in execution order.
+    """Map raw HL fills of ``addr`` to TradeEvents, in execution order: one event per
+    leader order and position (ruling P65, :func:`group_legs`).
 
     ``observed_time_fn(fill) -> datetime`` gives the observed time; by default it is the
-    leader time (historical normalization; the live watcher passes its own).
+    leader time (historical normalization; the live watcher merges its own way). An
+    event's observed time is its last piece's.
     ``leverage``: ``{coin: leverage}``, e.g. :func:`leverage_by_coin` of the wallet's
     clearinghouseState; coins without an entry get ``leverage=None``.
     ``sz_decimals``: ``{coin: szDecimals}`` for the chain tolerance (ruling P28).
     """
     lev = leverage or {}
-    out: list[TradeEvent] = []
-    for seq, lg in enumerate(fill_legs(addr, fills, sz_decimals=sz_decimals)):
-        leader_time = ms_to_dt(lg.time_ms)
-        observed = observed_time_fn(lg.fill) if observed_time_fn else leader_time
-        out.append(TradeEvent(
-            head=HEAD,
-            wallet=addr,
-            market_id=lg.coin,
-            side=lg.side,  # type: ignore[arg-type]
-            direction=lg.direction,  # type: ignore[arg-type]
-            size=lg.size,
-            price=lg.price,
-            notional_usd=lg.size * lg.price,
-            fee_usd=lg.fee,
-            leader_time=leader_time,
-            observed_time=observed,
-            source_ref=lg.source_ref,
-            leverage=lev.get(lg.coin),
-            position_id=lg.position_id,
-            group_id=None,
-            seq=seq,
-        ))
-    return out
+
+    def observed(lg: Leg) -> datetime:
+        return observed_time_fn(lg.fill) if observed_time_fn else ms_to_dt(lg.time_ms)
+
+    groups = group_legs(fill_legs(addr, fills, sz_decimals=sz_decimals), observed)
+    return [order_event(addr, g, observed=observed(g.legs[-1]), leverage=lev.get(g.coin),
+                        seq=seq)
+            for seq, g in enumerate(groups)]
