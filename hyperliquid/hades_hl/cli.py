@@ -42,6 +42,16 @@ def make_client(settings: Settings) -> HLClient:
     return HLClient.from_settings(settings)
 
 
+def make_server(settings: Settings, host: str, port: int) -> Any:
+    """The head API server (uvicorn, in serve's event loop)."""
+    import uvicorn
+
+    from hades_hl.api import create_app
+
+    return uvicorn.Server(uvicorn.Config(create_app(settings), host=host, port=port,
+                                         log_level="warning"))
+
+
 def _setup_logging() -> None:
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
     logging.getLogger("hades_hl").setLevel(logging.INFO)
@@ -225,14 +235,14 @@ def serve(
 ) -> None:
     """Run the head: the background runtime (daily rescore + follow sync + price
     pruning, paper runs every 60 s, P11 reconcile, price recorder, fill watcher) and
-    the API on --host/--port (Task 10; until then the runtime only)."""
+    the head API on --host/--port (unless --no-api). Either one stopping stops both."""
     _setup_logging()
     settings = get_settings()
     engine = make_engine(settings.DATABASE_URL)
     init_db(engine)
-    if not no_api:
-        typer.echo(f"serve: the head API (Task 10) is not built yet; {host}:{port} is not "
-                   "bound. Running the background runtime only.")
+    server = None if no_api else make_server(settings, host, port)
+    if server is not None:
+        typer.echo(f"serve: api on http://{host}:{port}")
 
     async def main(client: HLClient) -> rt.HLRuntime:
         r = rt.HLRuntime(engine, client, ws_url=settings.WS_URL,
@@ -240,15 +250,19 @@ def serve(
                          max_follows=settings.MAX_FOLLOWS,
                          auto_follow_n=settings.AUTO_FOLLOW_N)
         stop = asyncio.Event()
-        task = asyncio.create_task(r.run(stop))
+        tasks = [asyncio.create_task(r.run(stop))]
+        if server is not None:
+            tasks.append(asyncio.create_task(server.serve()))
         try:
-            if seconds is None:
-                await task
-            else:
-                await asyncio.sleep(seconds)
+            await asyncio.wait(tasks, timeout=seconds, return_when=asyncio.FIRST_COMPLETED)
         finally:
             stop.set()
-            await asyncio.gather(task, return_exceptions=True)
+            if server is not None:
+                server.should_exit = True
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for t in tasks:  # a crash of either one is not swallowed
+            if not t.cancelled() and t.exception() is not None:
+                raise t.exception()
         return r
 
     typer.echo(f"serve: runtime starting on {masked_url(settings.DATABASE_URL)}")

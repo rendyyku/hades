@@ -192,6 +192,48 @@ def test_serve_defaults_localhost_8010(env):
     assert "--no-api" in r.output and "--seconds" in r.output
 
 
+def test_serve_runs_api_alongside_runtime(env, monkeypatch):
+    """Task 10: serve binds the head API (default 127.0.0.1:8010) next to the runtime
+    and stops both."""
+    import asyncio as _asyncio
+
+    seen = {}
+
+    class FakeRuntime:
+        def __init__(self, *a, **kw):
+            self.recorder = None
+            self.watch_set = set()
+            self.fills_observed = self.paper_runs = self.reconcile_events = 0
+            self.alerts_emitted = self.watcher_starts = 0
+
+        async def run(self, stop):
+            await stop.wait()
+
+    class FakeServer:
+        def __init__(self):
+            self.should_exit = False
+
+        async def serve(self):
+            while not self.should_exit:
+                await _asyncio.sleep(0.01)
+            seen["stopped"] = True
+
+    def fake_make_server(settings, host, port):
+        seen["bind"] = (host, port)
+        return FakeServer()
+
+    monkeypatch.setattr(cli.rt, "HLRuntime", FakeRuntime)
+    monkeypatch.setattr(cli, "make_server", fake_make_server)
+    r = invoke("serve", "--seconds", "0.05")
+    assert r.exit_code == 0, r.output
+    assert seen == {"bind": ("127.0.0.1", 8010), "stopped": True}
+    assert "api on http://127.0.0.1:8010" in r.output
+    seen.clear()
+    r = invoke("serve", "--seconds", "0.05", "--no-api")
+    assert r.exit_code == 0, r.output
+    assert seen == {}
+
+
 # -- Task 9: follows + paper-run -------------------------------------------------------
 
 def _seed_scored(url, n=12, bots=()):

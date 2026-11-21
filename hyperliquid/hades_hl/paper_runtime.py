@@ -340,6 +340,13 @@ def _gate_dict(g: GateResult) -> dict[str, Any]:
     return {"passed": g.passed, "checks": dict(g.checks), "values": dict(g.values)}
 
 
+def gate_config(gate: GateConfig = GATE) -> dict[str, Any]:
+    """The gate thresholds as stored with each ladder change (and served by the API)."""
+    return {"min_days": gate.min_days, "min_closed": gate.min_closed,
+            "max_dd": str(gate.max_dd), "max_top_share": str(gate.max_top_share),
+            "rolling_days": ROLLING_DAYS}
+
+
 def _downsample(curve: list[tuple[datetime, Decimal]], n: int) -> list[list[str]]:
     if len(curve) > n:
         step = (len(curve) - 1) / (n - 1)
@@ -412,9 +419,7 @@ def run_paper(session: Session, addr: str, now: datetime, *,
     current = f.ladder or "PAPER"
     new = next_ladder(current, full, rolling)  # type: ignore[arg-type]
     gate_snap = {"full": _gate_dict(full), "rolling": _gate_dict(rolling),
-                 "config": {"min_days": gate.min_days, "min_closed": gate.min_closed,
-                            "max_dd": str(gate.max_dd), "max_top_share": str(gate.max_top_share),
-                            "rolling_days": ROLLING_DAYS}}
+                 "config": gate_config(gate)}
     change = None
     if new != current:
         f.ladder = new
