@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("server-only", () => ({}));
 
-import { handleHeadFollow, headFetch, headFetchCore, HEAD_TIMEOUT_MS } from "./headProxy";
+import { handleHeadAlerts, handleHeadFollow, headFetch, headFetchCore, HEAD_TIMEOUT_MS } from "./headProxy";
 
 const KEY = "hl-secret-key-xyz";
 const ADDR = "0x" + "ab".repeat(20);
@@ -176,5 +176,50 @@ describe("handleHeadFollow", () => {
     const res = await handleHeadFollow(req("POST", { body: { address: ADDR } }), "hyperliquid", { env, fetchImpl: f });
     expect(res.status).toBe(502);
     expect(await res.json()).toEqual({ error: "head offline", offline: true });
+  });
+});
+
+describe("handleHeadAlerts (Cerberus reconnect backfill)", () => {
+  const PUB = { ...env, HADES_PUBLIC_ORIGIN: "http://localhost:3000" };
+  const get = (query = "", host = "localhost:3000", method = "GET") =>
+    new Request(`http://${host}/api/heads/hyperliquid/alerts${query}`, { method, headers: { host } });
+
+  it("checks the Host allow-list before any upstream fetch", async () => {
+    const f = vi.fn();
+    const res = await handleHeadAlerts(get("", "evil.example:3000"), "hyperliquid", { env: PUB, fetchImpl: f });
+    expect(res.status).toBe(403);
+    expect(f).not.toHaveBeenCalled();
+  });
+
+  it("is GET only, for known heads, with a validated limit", async () => {
+    const f = vi.fn();
+    expect((await handleHeadAlerts(get("", "localhost:3000", "POST"), "hyperliquid", { env: PUB, fetchImpl: f })).status).toBe(405);
+    expect((await handleHeadAlerts(get(), "polymarket", { env: PUB, fetchImpl: f })).status).toBe(404);
+    for (const q of ["?limit=0", "?limit=201", "?limit=abc", "?limit=5%20"]) {
+      expect((await handleHeadAlerts(get(q), "hyperliquid", { env: PUB, fetchImpl: f })).status).toBe(400);
+    }
+    expect(f).not.toHaveBeenCalled();
+  });
+
+  it("relays the head's alert array, fetched with the key server-side", async () => {
+    const f = vi.fn().mockResolvedValue(jsonRes(200, [{ id: 1 }]));
+    const res = await handleHeadAlerts(get("?limit=20"), "hyperliquid", { env: PUB, fetchImpl: f });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual([{ id: 1 }]);
+    expect(f.mock.calls[0][0]).toBe("http://hl.test/api/alerts?limit=20");
+    expect(new Headers(f.mock.calls[0][1].headers).get("X-Hades-Key")).toBe(KEY);
+  });
+
+  it("answers 502 without the upstream body or key when the head is offline, errors or sends a non-array", async () => {
+    const impls = [
+      vi.fn().mockRejectedValue(new Error(KEY)),
+      vi.fn().mockResolvedValue(jsonRes(500, { detail: KEY })),
+      vi.fn().mockResolvedValue(jsonRes(200, { detail: "x" })),
+    ];
+    for (const f of impls) {
+      const res = await handleHeadAlerts(get(), "hyperliquid", { env: PUB, fetchImpl: f });
+      expect(res.status).toBe(502);
+      expect(await res.text()).not.toContain(KEY);
+    }
   });
 });

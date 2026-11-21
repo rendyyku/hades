@@ -1,12 +1,15 @@
 import Link from "next/link";
 
-const LINKS = [
+/** Spec 10 order. Polymarket has no head yet: shown, but disabled (no page, no link). */
+export const NAV_LINKS: readonly { href: string | null; label: string }[] = [
   { href: "/", label: "Overview" },
-  { href: "/wallets", label: "Judgement" },
+  { href: "/wallets", label: "Solana" },
   { href: "/hyperliquid", label: "Hyperliquid" },
+  { href: null, label: "Polymarket" },
+  { href: "/arena", label: "Paper Arena" },
   { href: "/live", label: "Cerberus" },
   { href: "/watchlist", label: "Watchlist" },
-] as const;
+];
 
 /**
  * Below 640px the links wrap onto a second row under the wordmark (no horizontal
@@ -27,14 +30,25 @@ export function Nav() {
           HADES
         </Link>
         <ul className="-mx-2 flex w-[calc(100%+1rem)] flex-wrap items-center justify-between gap-x-1 sm:w-auto sm:flex-1 sm:justify-end">
-          {LINKS.map((l) => (
-            <li key={l.href}>
-              <Link
-                href={l.href}
-                className="inline-flex min-h-11 cursor-pointer items-center rounded px-2 text-sm text-muted transition-colors duration-200 hover:text-fg"
-              >
-                {l.label}
-              </Link>
+          {NAV_LINKS.map((l) => (
+            <li key={l.label}>
+              {l.href ? (
+                <Link
+                  href={l.href}
+                  className="inline-flex min-h-11 cursor-pointer items-center rounded px-2 text-sm text-muted transition-colors duration-200 hover:text-fg"
+                >
+                  {l.label}
+                </Link>
+              ) : (
+                <span
+                  aria-disabled="true"
+                  title="Polymarket head: coming soon"
+                  className="inline-flex min-h-11 cursor-not-allowed items-center rounded px-2 text-sm text-muted/60"
+                >
+                  {l.label}
+                  <span className="sr-only"> (coming soon)</span>
+                </span>
+              )}
             </li>
           ))}
         </ul>

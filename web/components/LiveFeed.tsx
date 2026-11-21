@@ -2,36 +2,58 @@
 
 import { Pause, Play } from "lucide-react";
 import Link from "next/link";
-import { useCallback, useEffect, useRef, useState } from "react";
-import type { AlertRow } from "@/lib/api";
-import { mergeAlerts, parseAlertEvent, parseAlertList, pausedNewLabel, shouldBackfill } from "@/lib/live";
-import { AlertTable } from "./AlertTable";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { HEADS, type HeadId } from "@/lib/heads";
+import {
+  filterFeed,
+  mergeFeed,
+  parseFeedEvent,
+  parseHeadStatus,
+  pausedNewLabel,
+  shouldBackfill,
+  toFeedItems,
+  type FeedFilter,
+  type FeedItem,
+} from "@/lib/live";
+import { FeedTable } from "./FeedTable";
 import { LiveBadge } from "./LiveBadge";
 
 const TICK_MS = 5_000;
 const ANNOUNCE_DEBOUNCE_MS = 1_500;
 const RETRY_MIN_MS = 2_000;
 const RETRY_MAX_MS = 30_000;
-const BACKFILL_URL = "/api/alerts?limit=50";
+const BACKFILL_LIMIT = 50;
 
 const BTN =
   "inline-flex min-h-11 cursor-pointer items-center gap-2 rounded-lg border px-4 text-sm transition-colors duration-200";
+const PILL =
+  "inline-flex min-h-11 cursor-pointer items-center gap-2 rounded-full border px-4 text-sm transition-colors duration-200";
+const PILL_ON = "border-fg bg-fg text-bg";
+const PILL_OFF = "border-border text-muted hover:border-fg/40 hover:text-fg";
 
 function plural(n: number, word: string) {
   return `${n} ${word}${n === 1 ? "" : "s"}`;
 }
 
+const FILTERS: { value: FeedFilter; label: string }[] = [
+  { value: "all", label: "All heads" },
+  ...HEADS.map((h) => ({ value: h.id as FeedFilter, label: h.label })),
+];
+
 /**
- * Cerberus live feed. EventSource on the same-origin proxy (/api/stream); the engine
- * key never reaches the browser. Keeps the newest 200 alerts; pause buffers new ones.
+ * Cerberus live feed over every head. One EventSource on the same-origin fan-in
+ * (/api/stream): every event carries its `head`; head keys never reach the browser.
+ * Keeps the newest 200 alerts; pause buffers new ones; the head filter only changes the view.
  */
-export function LiveFeed({ initial }: { initial: AlertRow[] }) {
-  const [alerts, setAlerts] = useState<AlertRow[]>(() => mergeAlerts([], initial));
-  const [buffer, setBuffer] = useState<AlertRow[]>([]);
+export function LiveFeed({ initial }: { initial: FeedItem[] }) {
+  const [alerts, setAlerts] = useState<FeedItem[]>(() => mergeFeed([], initial));
+  const [buffer, setBuffer] = useState<FeedItem[]>([]);
   // True number of alerts received while paused (the buffer itself is capped at 200).
   const [pausedCount, setPausedCount] = useState(0);
   const [paused, setPaused] = useState(false);
+  const [filter, setFilter] = useState<FeedFilter>("all");
   const [connected, setConnected] = useState(false);
+  const [headUp, setHeadUp] = useState<Partial<Record<HeadId, boolean>>>({});
   const [lastEventAt, setLastEventAt] = useState<number | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const [announcement, setAnnouncement] = useState("");
@@ -40,7 +62,7 @@ export function LiveFeed({ initial }: { initial: AlertRow[] }) {
   const pending = useRef(0);
   const announceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Only alerts that arrive after the first render slide in (never the server-rendered ones).
-  const [animateAbove] = useState(() => initial.reduce((m, a) => Math.max(m, a.id), 0));
+  const [initialKeys] = useState<ReadonlySet<string>>(() => new Set(initial.map((i) => i.key)));
 
   // Relative times re-render every 5s.
   useEffect(() => {
@@ -67,20 +89,26 @@ export function LiveFeed({ initial }: { initial: AlertRow[] }) {
     let disposed = false;
     let opens = 0;
 
-    // After a reconnect, fetch what was missed while disconnected (same-origin proxy;
-    // the key stays on the server). Failures are ignored: the live stream continues.
-    const backfill = async () => {
-      try {
-        const res = await fetch(BACKFILL_URL, { cache: "no-store" });
-        if (!res.ok || disposed) return;
-        const rows = parseAlertList(await res.json());
-        if (disposed || rows.length === 0) return;
-        if (pausedRef.current) setBuffer((b) => mergeAlerts(b, rows));
-        else setAlerts((a) => mergeAlerts(a, rows));
-      } catch {
-        /* ignore */
-      }
+    const add = (rows: FeedItem[]) => {
+      if (disposed || rows.length === 0) return;
+      if (pausedRef.current) setBuffer((b) => mergeFeed(b, rows));
+      else setAlerts((a) => mergeFeed(a, rows));
     };
+
+    // After a reconnect, fetch what each head emitted while disconnected (same-origin
+    // proxies; keys stay on the server). Failures are ignored: the live stream continues.
+    const backfill = () =>
+      Promise.all(
+        HEADS.map(async (h) => {
+          try {
+            const res = await fetch(`/api/heads/${h.id}/alerts?limit=${BACKFILL_LIMIT}`, { cache: "no-store" });
+            if (!res.ok || disposed) return;
+            add(toFeedItems(h.id, await res.json()));
+          } catch {
+            /* ignore */
+          }
+        }),
+      );
 
     const connect = () => {
       es = new EventSource("/api/stream");
@@ -93,8 +121,9 @@ export function LiveFeed({ initial }: { initial: AlertRow[] }) {
       };
       es.onerror = () => {
         setConnected(false);
+        setHeadUp({});
         // The browser retries on its own unless the connection is CLOSED (e.g. the
-        // proxy answered 502 JSON); then reconnect with exponential backoff.
+        // fan-in answered 502 JSON: no head reachable); then reconnect with backoff.
         if (es && es.readyState === EventSource.CLOSED && !disposed) {
           es.close();
           retry = setTimeout(connect, backoff);
@@ -102,14 +131,18 @@ export function LiveFeed({ initial }: { initial: AlertRow[] }) {
         }
       };
       es.addEventListener("ping", () => setLastEventAt(Date.now()));
+      es.addEventListener("head", (ev) => {
+        const s = parseHeadStatus((ev as MessageEvent<string>).data);
+        if (s) setHeadUp((h) => ({ ...h, [s.head]: s.up }));
+      });
       es.addEventListener("alert", (ev) => {
         setLastEventAt(Date.now());
-        const row = parseAlertEvent((ev as MessageEvent<string>).data);
+        const row = parseFeedEvent((ev as MessageEvent<string>).data);
         if (!row) return;
         if (pausedRef.current) {
-          setBuffer((b) => mergeAlerts(b, [row]));
+          setBuffer((b) => mergeFeed(b, [row]));
           setPausedCount((n) => n + 1);
-        } else setAlerts((a) => mergeAlerts(a, [row]));
+        } else setAlerts((a) => mergeFeed(a, [row]));
         announce();
       });
     };
@@ -126,7 +159,7 @@ export function LiveFeed({ initial }: { initial: AlertRow[] }) {
   function resume() {
     pausedRef.current = false;
     setPaused(false);
-    setAlerts((a) => mergeAlerts(a, buffer));
+    setAlerts((a) => mergeFeed(a, buffer));
     setBuffer([]);
     setPausedCount(0);
   }
@@ -141,12 +174,21 @@ export function LiveFeed({ initial }: { initial: AlertRow[] }) {
     }
   }
 
+  const shown = useMemo(() => filterFeed(alerts, filter), [alerts, filter]);
+  const downHeads = HEADS.filter((h) => headUp[h.id] === false);
+  const filterLabel = FILTERS.find((f) => f.value === filter)?.label ?? "All heads";
+
   return (
     <div className="flex flex-col gap-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-3">
           <LiveBadge connected={connected} lastEventAt={lastEventAt} />
           <span className="font-mono text-xs tabular-nums text-muted">{plural(alerts.length, "alert")} · max 200</span>
+          {connected && downHeads.length ? (
+            <span className="font-mono text-xs text-loss">
+              {downHeads.map((h) => h.label).join(", ")} stream offline · retrying
+            </span>
+          ) : null}
         </div>
         <div className="flex flex-wrap items-center gap-3">
           {paused ? (
@@ -174,25 +216,54 @@ export function LiveFeed({ initial }: { initial: AlertRow[] }) {
         </div>
       </div>
 
+      <div role="group" aria-label="Filter by head" className="flex flex-wrap items-center gap-3">
+        <span className="w-16 text-xs uppercase tracking-[0.16em] text-muted">Head</span>
+        <ul className="flex flex-wrap gap-2">
+          {FILTERS.map((f) => {
+            const on = filter === f.value;
+            const n = filterFeed(alerts, f.value).length;
+            return (
+              <li key={f.value}>
+                <button type="button" aria-pressed={on} onClick={() => setFilter(f.value)} className={`${PILL} ${on ? PILL_ON : PILL_OFF}`}>
+                  {f.label}
+                  <span className="font-mono text-xs tabular-nums">{n}</span>
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      </div>
+
       <p role="status" aria-live="polite" aria-atomic="true" className="sr-only">
         {announcement}
       </p>
 
-      {alerts.length === 0 ? (
+      {shown.length === 0 ? (
         <div className="rounded-lg border border-border bg-surface p-5 text-sm text-muted">
-          <p>
-            No alerts yet. Cerberus alerts on swaps by{" "}
-            <Link
-              href="/watchlist"
-              className="cursor-pointer rounded text-fg underline decoration-primary decoration-2 underline-offset-4"
-            >
-              watched wallets
-            </Link>{" "}
-            and the top 25 non-bot wallets scoring 70+ (both are subscribed to the Helius webhook).
-          </p>
+          {alerts.length > 0 ? (
+            <p>No alerts from this head yet.</p>
+          ) : (
+            <p>
+              No alerts yet. Cerberus alerts on swaps by{" "}
+              <Link
+                href="/watchlist"
+                className="cursor-pointer rounded text-fg underline decoration-primary decoration-2 underline-offset-4"
+              >
+                watched wallets
+              </Link>{" "}
+              and the top 25 non-bot Solana wallets scoring 70+, and on the trades of{" "}
+              <Link
+                href="/arena"
+                className="cursor-pointer rounded text-fg underline decoration-primary decoration-2 underline-offset-4"
+              >
+                paper-followed wallets
+              </Link>{" "}
+              that reached NOTIF or COPY.
+            </p>
+          )}
         </div>
       ) : (
-        <AlertTable rows={alerts} now={now} caption="Cerberus alerts, newest first" animateAbove={animateAbove} />
+        <FeedTable rows={shown} now={now} caption={`Cerberus alerts, ${filterLabel.toLowerCase()}, newest first`} initialKeys={initialKeys} />
       )}
     </div>
   );

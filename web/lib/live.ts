@@ -2,6 +2,7 @@
 
 import type { AlertRow } from "./api";
 import { relTime } from "./format";
+import { isHeadId, type HeadId } from "./heads";
 
 /** LIVE only while the SSE is connected and the last event (alert or ping) is < 60 s old. */
 export const LIVE_WINDOW_MS = 60_000;
@@ -67,4 +68,99 @@ export function pausedNewLabel(received: number, cap: number = FEED_CAP): string
 /** Backfill missed alerts on every (re)open except the very first one (the server render covers it). */
 export function shouldBackfill(previousOpens: number): boolean {
   return previousOpens > 0;
+}
+
+// -- multi-head Cerberus feed (the /api/stream fan-in tags every event with `head`) ------
+
+/** core/hades_core/contract.py Alert (Hyperliquid head). */
+export interface HlAlert {
+  id: number;
+  kind: string;
+  wallet: string;
+  market_id: string | null;
+  payload: Record<string, unknown>;
+  created_at: string | null;
+}
+
+export type FeedItem =
+  | { head: "solana"; key: string; id: number; at: string | null; alert: AlertRow }
+  | { head: "hyperliquid"; key: string; id: number; at: string | null; alert: HlAlert };
+
+export type FeedFilter = HeadId | "all";
+
+function toHlAlert(v: unknown): HlAlert | null {
+  if (!v || typeof v !== "object") return null;
+  const o = v as Record<string, unknown>;
+  if (typeof o.id !== "number" || !Number.isFinite(o.id)) return null;
+  if (typeof o.kind !== "string" || typeof o.wallet !== "string") return null;
+  const p = o.payload;
+  return {
+    id: o.id,
+    kind: o.kind,
+    wallet: o.wallet,
+    market_id: typeof o.market_id === "string" ? o.market_id : null,
+    payload: p && typeof p === "object" && !Array.isArray(p) ? (p as Record<string, unknown>) : {},
+    created_at: typeof o.created_at === "string" ? o.created_at : null,
+  };
+}
+
+function toFeedItem(head: HeadId, v: unknown): FeedItem | null {
+  if (head === "solana") {
+    const a = toAlertRow(v);
+    return a ? { head, key: `solana:${a.id}`, id: a.id, at: a.block_time, alert: a } : null;
+  }
+  const a = toHlAlert(v);
+  return a ? { head, key: `hyperliquid:${a.id}`, id: a.id, at: a.created_at, alert: a } : null;
+}
+
+/** A head-tagged SSE `alert` payload; null if untagged, unknown head or the wrong shape. */
+export function parseFeedEvent(data: string): FeedItem | null {
+  let v: unknown;
+  try {
+    v = JSON.parse(data);
+  } catch {
+    return null;
+  }
+  const head = v && typeof v === "object" ? (v as Record<string, unknown>).head : undefined;
+  return typeof head === "string" && isHeadId(head) ? toFeedItem(head, v) : null;
+}
+
+/** A head's decoded alert list (GET /api/alerts of that head) as feed items. */
+export function toFeedItems(head: HeadId, data: unknown): FeedItem[] {
+  if (!Array.isArray(data)) return [];
+  return data.map((v) => toFeedItem(head, v)).filter((i): i is FeedItem => i !== null);
+}
+
+function timeOf(i: FeedItem): number {
+  const t = i.at ? Date.parse(i.at) : NaN;
+  return Number.isNaN(t) ? -Infinity : t;
+}
+
+/** Dedupe by head+id (ids of different heads never collide), newest first, capped. */
+export function mergeFeed(existing: FeedItem[], incoming: FeedItem[], cap: number = FEED_CAP): FeedItem[] {
+  const byKey = new Map<string, FeedItem>();
+  for (const i of existing) byKey.set(i.key, i);
+  for (const i of incoming) byKey.set(i.key, i);
+  return [...byKey.values()]
+    .sort((a, b) => {
+      const ta = timeOf(a);
+      const tb = timeOf(b);
+      if (ta !== tb) return tb > ta ? 1 : -1;
+      return b.id - a.id || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
+    })
+    .slice(0, Math.max(0, cap));
+}
+
+export function filterFeed(items: FeedItem[], filter: FeedFilter): FeedItem[] {
+  return filter === "all" ? items : items.filter((i) => i.head === filter);
+}
+
+/** SSE `head` event of the fan-in: one head's upstream stream went up or down. */
+export function parseHeadStatus(data: string): { head: HeadId; up: boolean } | null {
+  try {
+    const v = JSON.parse(data) as Record<string, unknown>;
+    return typeof v.head === "string" && isHeadId(v.head) && typeof v.up === "boolean" ? { head: v.head, up: v.up } : null;
+  } catch {
+    return null;
+  }
 }

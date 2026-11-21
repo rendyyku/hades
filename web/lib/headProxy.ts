@@ -33,6 +33,15 @@ function safePath(path: string): boolean {
   return /^\/api\/[^\s]*$/.test(path) && !path.includes("..") && !path.startsWith("//");
 }
 
+/** Base URL (no trailing slash) and key of a head, from env (server-only values). */
+export function headTarget(headId: HeadId, env: Env): { base: string; key: string } {
+  const head = getHead(headId);
+  return {
+    base: (env[head.baseUrlEnv] || head.defaultUrl).replace(/\/+$/, ""),
+    key: env[head.keyEnv] ?? "",
+  };
+}
+
 /** Pure core (env + fetch injected) so vitest can drive it. */
 export async function headFetchCore<T>(
   headId: HeadId,
@@ -41,9 +50,7 @@ export async function headFetchCore<T>(
   deps: HeadDeps,
 ): Promise<HeadResult<T>> {
   if (!isHeadId(headId) || !safePath(path)) return OFFLINE;
-  const head = getHead(headId);
-  const key = deps.env[head.keyEnv] ?? "";
-  const base = (deps.env[head.baseUrlEnv] || head.defaultUrl).replace(/\/+$/, "");
+  const { base, key } = headTarget(headId, deps.env);
   const doFetch = deps.fetchImpl ?? fetch;
   let res: Response;
   try {
@@ -129,4 +136,33 @@ export async function handleHeadFollow(req: Request, headParam: string, deps: He
   if (res.offline) return json(502, { error: "head offline", offline: true });
   const msg = FOLLOW_ERRORS[res.status];
   return msg ? json(res.status, { error: msg }) : json(502, { error: `head HTTP ${res.status}` });
+}
+
+// -- alerts backfill (GET /api/heads/[head]/alerts) --------------------------------------
+
+const ALERTS_DEFAULT_LIMIT = 50;
+/** The Solana engine caps /api/alerts at 200 (the HL head at 500). */
+const ALERTS_MAX_LIMIT = 200;
+
+/**
+ * Read-only, Host-guarded proxy to a head's recent alerts (Cerberus reconnect backfill).
+ * The key is added here; an upstream error body is never relayed.
+ */
+export async function handleHeadAlerts(req: Request, headParam: string, deps: HeadDeps): Promise<Response> {
+  if (req.method.toUpperCase() !== "GET") return json(405, { error: "method not allowed" }, { allow: "GET" });
+  if (!hostAllowed(req, parseAllowList(deps.env.HADES_PUBLIC_ORIGIN))) return json(403, { error: "forbidden" });
+  if (!isHeadId(headParam)) return json(404, { error: "unknown head" });
+
+  const raw = new URL(req.url).searchParams.get("limit");
+  let limit = ALERTS_DEFAULT_LIMIT;
+  if (raw !== null) {
+    if (!/^\d+$/.test(raw)) return json(400, { error: "invalid limit" });
+    limit = Number(raw);
+    if (limit < 1 || limit > ALERTS_MAX_LIMIT) return json(400, { error: "invalid limit" });
+  }
+
+  const res = await headFetchCore<unknown>(headParam, `/api/alerts?limit=${limit}`, undefined, deps);
+  if (!res.ok) return json(502, { error: res.offline ? "head offline" : `head HTTP ${res.status}`, offline: res.offline });
+  if (!Array.isArray(res.data)) return json(502, { error: "invalid head response" });
+  return json(200, res.data);
 }
