@@ -475,3 +475,55 @@ def test_seq_defaults_to_zero_and_sort_key_is_public():
     e = ev("x", "open", 1)
     assert e.seq == 0
     assert event_sort_key(e) == (e.observed_time, 0, "x")
+
+
+# -- P48: mark_times (periodic equity marks between events) ---------------------------
+
+def test_mark_times_show_unrealized_drawdown_between_events():
+    from hades_core.gate import DEFAULT_GATE, evaluate_gate
+
+    events = [ev("o", "open", 1, leverage="10"), ev("c", "close", 120)]
+    model = FakeModel({"o": Decimal("100"), "c": Decimal("100")})
+    dip = T0 + timedelta(minutes=60)
+
+    def mark(m, t):
+        return Decimal("95") if t == dip else None
+
+    plain = simulate(events, model, CFG, FOLLOW, mark=mark)
+    marked = simulate(events, model, CFG, FOLLOW, mark=mark, mark_times=[dip])
+    # qty 50 (margin 500 x10 / 100); a 5-point dip = -250 unrealized at the mark
+    assert dict(marked.equity_curve)[dip] == Decimal("9750")
+    assert dip not in dict(plain.equity_curve)
+    now = T0 + timedelta(days=1)
+    dd_plain = Decimal(evaluate_gate(plain, FOLLOW, now, DEFAULT_GATE).values["max_dd"])
+    dd_marked = Decimal(evaluate_gate(marked, FOLLOW, now, DEFAULT_GATE).values["max_dd"])
+    assert dd_plain == 0
+    assert dd_marked == Decimal("0.025")
+    assert final_equity(marked) == final_equity(plain) == Decimal("10000")
+    # the curve stays time-ordered
+    ts = [t for t, _ in marked.equity_curve]
+    assert ts == sorted(ts)
+
+
+def test_mark_times_liquidate_and_trailing_mark_is_last_point():
+    events = [ev("o", "open", 1, leverage="10")]
+    model = FakeModel({"o": Decimal("100")})
+    m1, m2 = T0 + timedelta(minutes=30), T0 + timedelta(minutes=90)
+    px = {m1: Decimal("97"), m2: Decimal("85")}
+    res = simulate(events, model, CFG, FOLLOW, mark=lambda m, t: px.get(t),
+                   mark_times=[m2, m1])  # unsorted input is fine
+    assert dict(res.equity_curve)[m1] == Decimal("9850")
+    assert res.equity_curve[-1] == (m2, Decimal("9500"))  # liquidated at the margin
+    assert res.open_positions == {}
+    assert [c.pnl_usd for c in res.closed_trades] == [Decimal("-500")]
+
+
+def test_mark_times_before_follow_ignored_and_none_unchanged():
+    events = [ev("o", "open", 1), ev("c", "close", 5)]
+    model = FakeModel({"o": Decimal("100"), "c": Decimal("110")})
+    base = simulate(events, model, CFG, FOLLOW)
+    same = simulate(events, model, CFG, FOLLOW, mark_times=None)
+    assert base.equity_curve == same.equity_curve
+    assert base.fills == same.fills and base.closed_trades == same.closed_trades
+    early = simulate(events, model, CFG, FOLLOW, mark_times=[T0 - timedelta(hours=1)])
+    assert early.equity_curve == base.equity_curve

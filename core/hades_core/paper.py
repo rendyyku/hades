@@ -28,6 +28,12 @@ Event handling:
   to 0. Then the key (position_id, or the wallet:market:direction fallback) is free.
 - An increase/reduce/close/resolve for a position we never held is a pure no-op: no
   fill, no price observation, no equity point.
+
+Periodic marks (``mark_times``, optional): at each mark time t (>= follow_started_at,
+processed before any event observed at or after t) holding costs are accrued to t,
+every open position is marked through ``mark`` (which may liquidate it, as at an
+event) and an equity point ``(t, equity)`` is appended. This shows unrealized
+drawdown between events. Without ``mark_times`` the result is unchanged.
 """
 
 from __future__ import annotations
@@ -160,8 +166,15 @@ def simulate(
     cfg: PaperConfig,
     follow_started_at: datetime,
     mark: Mark | None = None,
+    mark_times: Iterable[datetime] | None = None,
 ) -> PaperResult:
     require_utc("follow_started_at", follow_started_at)
+    pending_marks: list[datetime] = []
+    for t in mark_times or ():
+        require_utc("mark_time", t)
+        if t >= follow_started_at:
+            pending_marks.append(t)
+    pending_marks = sorted(set(pending_marks), reverse=True)  # pop() yields the earliest
     res = PaperResult(equity_curve=[(follow_started_at, cfg.bankroll)])
     book: dict[str, _Pos] = {}
     # Ignored leader episodes -> the leader's tracked size in that episode
@@ -236,8 +249,21 @@ def simulate(
             total += p.unrealized(px)
         return total
 
+    def mark_until(limit: datetime | None) -> None:
+        """Process the periodic marks at or before ``limit`` (all when None)."""
+        while pending_marks and (limit is None or pending_marks[-1] <= limit):
+            t = pending_marks.pop()
+            accrue(t)
+            if mark is not None:
+                for mkt in sorted({p.pos.market_id for p in book.values()}):
+                    px = mark(mkt, t)
+                    if px is not None:
+                        observe(mkt, px, t, f"mark:{t.isoformat()}")
+            res.equity_curve.append((t, equity()))
+
     ordered = sorted(_dedupe(events), key=event_sort_key)
     for ev in ordered:
+        mark_until(ev.observed_time)
         key = _key(ev)
         terminal = ev.side in ("close", "resolve")
 
@@ -341,5 +367,6 @@ def simulate(
 
         res.equity_curve.append((at, equity()))
 
+    mark_until(None)
     res.open_positions = {k: book[k].pos for k in sorted(book)}
     return res
