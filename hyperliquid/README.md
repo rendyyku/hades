@@ -46,13 +46,20 @@ hades-hl serve --no-api               # background runtime (Task 10 adds the API
   fills), cached 24 h in kv `hl:probe:<address>`. It is rejected if it has no fill in
   30 days, or if fills/day > 300, median hold < 60 s or maker share > 70% (the bot
   rule). Probing stops at `--limit` accepted or 5 x `--limit` probe requests.
-- **Paper runtime (`serve`).** Daily: rescore, auto-follow sync, prune prices older
-  than 14 days. Every 60 s: a paper run for follows with new settled events (an event
-  is processed once its 30 s price window is over) or not run for an hour. Every
-  follow with open paper positions is checked against `clearinghouseState` at most
-  every 5 min; a copy the leader no longer holds gets a synthetic `reconcile:` close.
-  Prices are recorded from `fastAssetCtxs` (falls back to `allMids` after 3 failed
-  connections) for the watch set only: BTC, ETH, coins the follows traded in 30 days,
-  and open paper positions. The fill watcher persists its cursor per wallet (kv
-  `hl:last_seen:<address>`, `hl:floor:<address>`); after a restart, fills made while
-  it was down are recovered and copied with the recovery time as `observed_time`.
+- **Paper runtime (`serve`).** Daily (in the background): incremental backfill of the
+  follows and the top 50 candidates, rescore, auto-follow sync, then hourly marks and
+  pruning of raw prices older than 2 days. Every 60 s: a paper run for follows with new
+  settled events or not run for an hour. An event is settled once, by the first run
+  31 s after it was observed: its model price (or `missed`) is stored in
+  `paper_events` and never re-priced. Hourly marks are kept in `marks`, so the
+  equity curve (marked every hour) does not change when raw prices are pruned. A
+  recovered fill more than 10 min old is copied as missed. Every follow with open paper
+  positions is checked against `clearinghouseState` at most every 5 min; a copy the
+  leader no longer holds gets a synthetic `reconcile:` close, unless an event of that
+  coin is still pending. Prices are recorded from `fastAssetCtxs` (falls back to
+  `allMids` after 3 failed connections): the watch set (BTC, ETH, coins the follows
+  traded in 30 days, open paper positions) at most 1 row/s, every other perp coin at
+  most every 5 s. A dead watcher or recorder is restarted. The fill watcher persists its
+  cursor per wallet (kv `hl:last_seen:<address>`, `hl:floor:<address>`); after a
+  restart, fills made while it was down are recovered and copied with the recovery time
+  as `observed_time`.

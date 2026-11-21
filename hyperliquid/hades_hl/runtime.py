@@ -1,19 +1,27 @@
 """Background runtime of ``hades-hl serve`` (Task 9): the scheduler that keeps the
 paper copies live.
 
-- daily: rescore (stored fills) then the auto-follow sync, and price pruning (P42:
-  prices older than ``PRICE_KEEP_DAYS`` = 14 days). The last run time is persisted
-  (kv ``hl:daily_at``), so a restart does not redo it.
+- daily (a background job; startup never waits for it): incremental ``backfill`` of
+  the followed wallets and the current top candidates (at most
+  ``BACKFILL_CANDIDATES`` = 50, paced, stops on a rate limit; P50), then rescore, then
+  the auto-follow sync, then the hourly marks of the follows' coins and price pruning
+  (P52: raw prices older than ``PRICE_KEEP_DAYS`` = 2 days; marks and settled prices
+  are kept). The last run time is persisted (kv ``hl:daily_at``), so a restart does
+  not redo it.
 - every ``paper_interval_s`` (60 s): :func:`paper_runtime.run_paper_live` for each
   follow that needs it (new settled events, never run, or last run over an hour ago).
 - every ``reconcile_tick_s``: the P11 reconcile, at most once per 5 min per follow with
   open paper positions (skipped while the watcher recovers that wallet).
 - the price recorder: ``fastAssetCtxs`` with ``allMids`` fallback (P41), recording
-  only the watch set (P42): coins traded by follows in the last 30 days, coins of open
-  paper positions, plus BTC/ETH; refreshed every ``watch_refresh_s``.
+  the watch set (P42: coins traded by follows in the last 30 days, coins of open paper
+  positions, plus BTC/ETH; refreshed every ``watch_refresh_s``; a new fill's coin joins
+  at once) at most 1 row/s per coin, and every other perp coin at most every 5 s
+  (P53, so a leader's first trade in a new coin is priced).
 - the fill watcher over the active follows; restarted when the follow set changes
   (checked every ``watch_refresh_s`` and after a follow sync). The watcher's persisted
   cursors make the restart lossless. New fills alert at once (NOTIF/COPY wallets).
+- supervision (I4): a watcher or recorder task that died is logged and restarted on
+  the next ``watch_refresh_s`` check; a failing job is logged and retried.
 
 Task 10 mounts the API in the same process: ``await rt.start()`` in the app lifespan,
 ``await rt.shutdown()`` on exit.
@@ -34,15 +42,19 @@ from sqlalchemy.orm import Session
 from hades_core.events import TradeEvent
 from hades_hl import alerts, follows, pipeline
 from hades_hl import paper_runtime as pr
-from hades_hl.client import WEIGHT_PER_MIN, info_weight
+from hades_hl.client import WEIGHT_PER_MIN, HLRateLimited, info_weight
 from hades_hl.db import Fill, Price, utcnow
-from hades_hl.live import DEFAULT_WS_URL, FillWatcher, FundingRates, PriceRecorder
+from hades_hl.live import (DEFAULT_WS_URL, OTHER_COINS_INTERVAL_S, FillWatcher, FundingRates,
+                           PriceRecorder)
 
 log = logging.getLogger(__name__)
 
 ALWAYS_COINS = frozenset({"BTC", "ETH"})
 WATCH_DAYS = 30
-PRICE_KEEP_DAYS = 14
+PRICE_KEEP_DAYS = pr.PRICE_KEEP_DAYS  # P52: raw prices only; marks are kept
+BACKFILL_CANDIDATES = 50  # P50: top candidates backfilled daily (besides the follows)
+BACKFILL_DAYS = 90
+BACKFILL_PAUSE_S = 1.0
 KV_DAILY = "hl:daily_at"
 DAILY_INTERVAL_S = 86_400.0
 DAILY_CHECK_S = 600.0
@@ -79,6 +91,16 @@ def watch_coins(session: Session, now: datetime) -> set[str]:
     return {c for c in coins if c and _perp(c)}
 
 
+def record_follow_marks(session: Session, now: datetime, since: datetime | None = None) -> int:
+    """P52: persist the hourly marks of every active follow's coins, from ``since`` (or
+    the follow start, if later) to now. Run BEFORE :func:`prune_prices`."""
+    n = 0
+    for f in follows.active_follows(session):
+        start = f.started_at if since is None else max(f.started_at, since)
+        n += pr.record_marks(session, pr.event_coins(session, f.address), start, now)
+    return n
+
+
 def prune_prices(session: Session, now: datetime, keep_days: int = PRICE_KEEP_DAYS) -> int:
     res = session.execute(delete(Price).where(
         Price.time < _ms(now - timedelta(days=keep_days))))
@@ -99,6 +121,9 @@ class HLRuntime:
                  watch_refresh_s: float = WATCH_REFRESH_S,
                  daily_interval_s: float = DAILY_INTERVAL_S,
                  daily_check_s: float = DAILY_CHECK_S, run_daily: bool = True,
+                 backfill_candidates: int = BACKFILL_CANDIDATES,
+                 backfill_days: int = BACKFILL_DAYS,
+                 backfill_pause_s: float = BACKFILL_PAUSE_S,
                  watcher_factory: WatcherFactory | None = None,
                  recorder_factory: RecorderFactory | None = None) -> None:
         self.engine = engine
@@ -114,6 +139,9 @@ class HLRuntime:
         self.daily_interval_ms = int(daily_interval_s * 1000)
         self.daily_check_s = daily_check_s
         self.run_daily = run_daily
+        self.backfill_candidates = backfill_candidates
+        self.backfill_days = backfill_days
+        self.backfill_pause_s = backfill_pause_s
         self.watcher_factory = watcher_factory or self._default_watcher
         self.recorder_factory = recorder_factory or self._default_recorder
         self.funding = FundingRates(engine)
@@ -125,6 +153,10 @@ class HLRuntime:
         self._watcher_follows: dict[str, datetime] | None = None
         self._watcher_stop: asyncio.Event | None = None
         self._watcher_task: asyncio.Task | None = None
+        self._rec_stop: asyncio.Event | None = None
+        self._rec_task: asyncio.Task | None = None
+        self.recorder_starts = 0
+        self.backfills = 0
         self._stop: asyncio.Event | None = None
         self._task: asyncio.Task | None = None
         # counters (smoke / health)
@@ -147,7 +179,8 @@ class HLRuntime:
 
     def _default_recorder(self, coins: Callable[[], set[str]]) -> PriceRecorder:
         return PriceRecorder(self.engine, self.ws_url, now=self._now, coins=coins,
-                             feed=PRIMARY_FEED, fallback_feed=FALLBACK_FEED)
+                             feed=PRIMARY_FEED, fallback_feed=FALLBACK_FEED,
+                             other_interval_s=OTHER_COINS_INTERVAL_S)
 
     # -- jobs ------------------------------------------------------------------------
 
@@ -155,6 +188,8 @@ class HLRuntime:
         """Watcher hook: alert at once (NOTIF/COPY), mark the follow for a paper run."""
         self.fills_observed += 1
         self.dirty.add(ev.wallet)
+        if _perp(ev.market_id):  # P53: watch the coin at full rate from now on
+            self.watch_set.add(ev.market_id)
         self._alert(ev.wallet, [ev])
 
     def _alert(self, addr: str, evs: list[TradeEvent]) -> None:
@@ -171,13 +206,46 @@ class HLRuntime:
             self.watch_set = watch_coins(s, self._now())
         return self.watch_set
 
+    async def backfill_wallets(self, now: datetime) -> int:
+        """P50: incremental backfill of the followed wallets, then the current top
+        candidates (at most ``backfill_candidates``), one at a time with a pause; stops
+        at the first rate limit. Errors are logged per wallet."""
+        with Session(self.engine) as s:
+            addrs = [f.address for f in follows.active_follows(s)]
+            addrs += [a for a in follows.top_candidates(s, self.backfill_candidates)
+                      if a not in addrs]
+        done = 0
+        for i, a in enumerate(addrs):
+            if i and self.backfill_pause_s > 0:
+                await asyncio.sleep(self.backfill_pause_s)
+            try:
+                with Session(self.engine) as s:
+                    await pipeline.backfill(s, self.client, a, days=self.backfill_days,
+                                            now=now)
+                    s.commit()
+            except HLRateLimited:
+                log.warning("hl daily: backfill rate limited after %d wallet(s); the rest "
+                            "waits for tomorrow", done)
+                break
+            except Exception:
+                log.exception("hl daily: backfill %s failed", a)
+                continue
+            done += 1
+        self.backfills += done
+        return done
+
     async def daily(self) -> bool:
-        """Rescore, then the auto-follow sync, then price pruning; once per day."""
+        """Backfill, rescore, the auto-follow sync, then hourly marks and price
+        pruning; once per day."""
         now = self._now()
         with Session(self.engine) as s:
             last = pipeline.kv_get_json(s, KV_DAILY)
         if isinstance(last, int) and _ms(now) - last < self.daily_interval_ms:
             return False
+        try:
+            await self.backfill_wallets(now)
+        except Exception:
+            log.exception("hl daily: backfill failed; rescoring the stored fills")
         try:
             with Session(self.engine) as s:
                 szd = await pipeline.load_sz_decimals(s, self.client, now)
@@ -192,12 +260,17 @@ class HLRuntime:
             log.exception("hl daily: rescore failed; follow sync uses the previous scores")
         with Session(self.engine) as s:
             diff = follows.sync_auto_follows(s, now, n=self.auto_follow_n, cap=self.max_follows)
+            # marks first (since the last daily run): pruning then loses no history
+            since = None
+            if isinstance(last, int):
+                since = datetime.fromtimestamp(last / 1000, tz=now.tzinfo) - timedelta(hours=1)
+            marks = record_follow_marks(s, now, since)
             pruned = prune_prices(s, now)
             pipeline.kv_set_json(s, KV_DAILY, _ms(now))
             s.commit()
-        log.info("hl daily: follows +%d -%d (kept open %d, over cap %d); pruned %d price rows",
-                 len(diff.added), len(diff.removed), len(diff.kept_open),
-                 len(diff.skipped_cap), pruned)
+        log.info("hl daily: follows +%d -%d (kept open %d, over cap %d); %d mark(s); "
+                 "pruned %d price rows", len(diff.added), len(diff.removed),
+                 len(diff.kept_open), len(diff.skipped_cap), marks, pruned)
         if diff.added or diff.removed:
             self.refresh_watch_set()
             await self.sync_watcher()
@@ -259,7 +332,13 @@ class HLRuntime:
         """(Re)start the fill watcher when the active follow set changed."""
         with Session(self.engine) as s:
             want = {f.address: f.started_at for f in follows.active_follows(s)}
-        if self.watcher is not None and want == self._watcher_follows:
+        t = self._watcher_task
+        dead = t is not None and t.done()
+        if dead:  # I4: the watcher task died: log it, restart below
+            exc = None if t.cancelled() else t.exception()
+            log.error("hl runtime: fill watcher stopped unexpectedly (%r); restarting", exc,
+                      exc_info=exc)
+        if self.watcher is not None and want == self._watcher_follows and not dead:
             return
         if self.watcher is None and not want:
             return
@@ -282,8 +361,30 @@ class HLRuntime:
         self._watcher_stop = None
         self._watcher_follows = None
 
+    def ensure_recorder(self) -> None:
+        """Start the price recorder, or restart it if its task died (I4)."""
+        t = self._rec_task
+        if t is not None and not t.done():
+            return
+        if t is not None:
+            exc = None if t.cancelled() else t.exception()
+            log.error("hl runtime: price recorder stopped unexpectedly (%r); restarting",
+                      exc, exc_info=exc)
+        self.recorder = self.recorder_factory(lambda: self.watch_set)
+        self._rec_stop = asyncio.Event()
+        self._rec_task = asyncio.create_task(self.recorder.run(self._rec_stop))
+        self.recorder_starts += 1
+
+    async def stop_recorder(self) -> None:
+        if self._rec_task is not None and self._rec_stop is not None:
+            self._rec_stop.set()
+            await asyncio.gather(self._rec_task, return_exceptions=True)
+        self._rec_task = None
+        self._rec_stop = None
+
     async def _refresh(self) -> None:
         self.refresh_watch_set()
+        self.ensure_recorder()
         await self.sync_watcher()
 
     # -- run -------------------------------------------------------------------------
@@ -301,15 +402,10 @@ class HLRuntime:
 
     async def run(self, stop: asyncio.Event) -> None:
         self.refresh_watch_set()
-        if self.run_daily:
-            try:
-                await self.daily()
-            except Exception:
-                log.exception("hl runtime: daily jobs failed")
         await self.sync_watcher()
-        self.recorder = self.recorder_factory(lambda: self.watch_set)
-        rec_stop = asyncio.Event()
-        rec_task = asyncio.create_task(self.recorder.run(rec_stop))
+        self.ensure_recorder()
+        # the daily job (first run at once) is a background job like the others, so
+        # startup and shutdown never wait for it
         jobs = [
             asyncio.create_task(self._every(self.paper_interval_s, self.paper_tick, "paper")),
             asyncio.create_task(self._every(self.reconcile_tick_s, self.reconcile_tick,
@@ -325,8 +421,7 @@ class HLRuntime:
             for t in jobs:
                 t.cancel()
             await asyncio.gather(*jobs, return_exceptions=True)
-            rec_stop.set()
-            await asyncio.gather(rec_task, return_exceptions=True)
+            await self.stop_recorder()
             await self.stop_watcher()
 
     async def start(self) -> None:
@@ -340,4 +435,5 @@ class HLRuntime:
             await asyncio.gather(self._task, return_exceptions=True)
 
 
-__all__ = ["ALWAYS_COINS", "HLRuntime", "PRICE_KEEP_DAYS", "prune_prices", "watch_coins"]
+__all__ = ["ALWAYS_COINS", "BACKFILL_CANDIDATES", "HLRuntime", "PRICE_KEEP_DAYS",
+           "prune_prices", "record_follow_marks", "watch_coins"]

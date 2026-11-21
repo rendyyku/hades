@@ -352,7 +352,8 @@ def follow_add(addresses: list[str] = typer.Argument(..., help="wallet address(e
             try:
                 follows.add_follow(s, a, pipeline.utcnow(), cap=settings.MAX_FOLLOWS)
             except ValueError as e:
-                typer.echo(f"follow-add: {e}")
+                s.commit()  # keep the valid adds before the bad address
+                typer.echo(f"follow-add: {e}; following {added} new wallet(s)")
                 raise typer.Exit(1)
             except follows.FollowCapError:
                 s.commit()

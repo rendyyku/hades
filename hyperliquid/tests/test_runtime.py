@@ -118,12 +118,13 @@ def test_watch_coins_follow_trades_open_positions_and_majors(engine):
         assert rt.watch_coins(s, NOW) == {"BTC", "ETH", "SOL", "WIF"}
 
 
-def test_prune_prices_older_than_14_days(engine):
+def test_prune_prices_keep_days_parameter(engine):
+    # the default is 2 days since fix round 1 (P52; see test_t9_fix_r1)
     with Session(engine) as s:
         s.add_all([Price(coin="BTC", time=ms(NOW - timedelta(days=15)), mid="1"),
                    Price(coin="BTC", time=ms(NOW - timedelta(days=13)), mid="2")])
         s.commit()
-        assert rt.prune_prices(s, NOW) == 1
+        assert rt.prune_prices(s, NOW, keep_days=14) == 1
         s.commit()
         assert [p.mid for p in s.scalars(select(Price))] == [Decimal("2")]
 

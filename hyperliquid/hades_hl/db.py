@@ -188,6 +188,24 @@ class PaperEvent(Base):
     delay_ms: Mapped[int | None] = mapped_column(Integer)
     # per-address monotonic order (kv ``hl:seq:{addr}``, ruling P26) = TradeEvent.seq
     seq: Mapped[int | None] = mapped_column(Integer)
+    # ruling P52, settle once: the first paper run after ``observed_time + 31 s`` stores
+    # the model's fill price (or ``missed``); later runs reuse it, never re-price.
+    # P47: a stale recovered fill is stored already settled as missed.
+    fill_price: Mapped[Decimal | None] = mapped_column(DecimalText, nullable=True)
+    missed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    settled_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+
+
+class Mark(Base):
+    """Persistent hourly mark (ruling P52/P48): the latest recorded mid of ``coin`` at
+    or before ``hour_ts`` (epoch ms of a UTC hour), at most 15 min old. Raw ``prices``
+    are pruned after 2 days; marks are kept, so a re-run sees the same curve."""
+
+    __tablename__ = "marks"
+
+    coin: Mapped[str] = mapped_column(String, primary_key=True)
+    hour_ts: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    mid: Mapped[Decimal] = mapped_column(DecimalText)
 
 
 class Alert(Base):
@@ -238,6 +256,9 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("fills", "liquidated_user", "VARCHAR"),
     ("fills", "builder_fee", "VARCHAR"),
     ("paper_events", "seq", "INTEGER"),
+    ("paper_events", "fill_price", "VARCHAR"),
+    ("paper_events", "missed", "BOOLEAN"),
+    ("paper_events", "settled_at", "DATETIME"),
 )
 
 

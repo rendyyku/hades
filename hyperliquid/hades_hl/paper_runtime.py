@@ -2,20 +2,28 @@
 
 :func:`run_paper` rebuilds a followed wallet's paper copy from scratch on every run:
 
-- events: every ``paper_events`` row of the wallet that is *settled* (observed at
-  least ``SETTLE_S`` = 30 s before ``now``: the model's price window
-  ``[observed + 1 s, observed + 30 s]`` must be over, or a fill would be judged missed
-  only because its price was not recorded yet). Later events wait for the next run.
-- simulate (core) with :class:`~hades_hl.live.HLExecutionModel` over the recorded
-  prices, ``follow_started_at`` = the follow's ``started_at``, and a ``mark`` function
-  (the latest recorded mid at or before the step, at most ``MARK_MAX_AGE_S`` old) so
-  open positions are marked to market at every step of the equity curve.
+- settle once (ruling P52): an event is SETTLED by the first run that sees it at least
+  ``SETTLE_S`` = 31 s after its ``observed_time`` (the model's price window
+  ``[observed + 1 s, observed + 30 s]`` is over): the model price
+  (:class:`~hades_hl.live.HLExecutionModel` over the recorded prices) is stored in the
+  row (``fill_price``), or the row is marked ``missed``. It is never re-priced: the
+  simulation reads the stored price through :class:`SettledModel`. Younger events
+  wait for the next run. Stale recovered fills (P47) arrive already settled as missed.
+- hourly marks (P48/P52): for every hour with a recorded price, the mark (latest mid at
+  or before the hour, at most ``MARK_MAX_AGE_S`` old) is persisted in ``marks`` BEFORE
+  the raw prices are pruned (2 days). simulate (core) gets ``mark_times`` = every hour
+  in ``[follow_start, now)`` plus ``now``; the hourly points read ``marks``, the final
+  ``now`` point the live recorded price. So the curve shows unrealized drawdown between
+  events and a re-run after pruning gives the same history.
 - gates: the default (HL) gate in full, and the rolling 28-day gate; then
   ``next_ladder``. A change updates the follow, writes ``ladder_history`` with the gate
   snapshot, and alerts.
 - a JSON snapshot (kv ``hl:paper:{addr}``) for the API: the :class:`PaperSummary`, open
-  positions, winrate with n, both gates, a downsampled equity curve and the latest
-  fills.
+  positions, winrate with n, both gates, a downsampled equity curve, the latest fills,
+  and the gap (P49): ``gap_usd`` = per copied and closed position, the leader's
+  closedPnl on it scaled by our qty / the leader's qty, minus our pnl on it; plus the
+  raw ``leader_realized_usd`` (the leader's closedPnl on positions opened since the
+  follow start). Pre-follow positions are in neither.
 
 :func:`run_paper_live` first makes sure the funding rates of the coins involved are
 cached (``FundingRates.ensure``, ruling P43), so the simulator charges funding.
@@ -24,7 +32,9 @@ cached (``FundingRates.ensure``, ruling P43), so the simulator charges funding.
 ``clearinghouseState`` shows them flat (or flipped) in that coin, a synthetic ``close``
 event is persisted: ``source_ref = reconcile:{addr}:{position_id}:{ts_ms}``,
 ``observed_time = now``, ``seq`` from the persisted counter; the model prices it like
-any event. :class:`Reconciler` limits it to once per 5 min per wallet.
+any event. A coin is skipped while any of its events is unsettled or newer than the
+snapshot (I2: a live close may be on its way). :class:`Reconciler` limits it to once
+per 5 min per wallet.
 
 Callers commit (``reconcile``: before their next ``await``, so no other writer can
 take a ``seq`` in between).
@@ -34,11 +44,11 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from hades_core.contract import PaperSummary
@@ -47,8 +57,8 @@ from hades_core.gate import DEFAULT_GATE, GateConfig, GateResult, evaluate_gate,
 from hades_core.ladder import gap, next_ladder
 from hades_core.paper import PaperConfig, PaperResult, simulate
 from hades_hl import alerts, pipeline
-from hades_hl.db import Fill, Follow, Funding, LadderHistory, PaperEvent, Price
-from hades_hl.follows import KV_PAPER
+from hades_hl.db import Fill, Follow, LadderHistory, Mark, PaperEvent, Price, _insert_ignore
+from hades_hl.follows import KV_FOLLOW_SEQ, KV_PAPER
 from hades_hl.live import (
     KV_SEQ,
     PRICE_WINDOW_S,
@@ -63,8 +73,12 @@ log = logging.getLogger(__name__)
 
 GATE: GateConfig = DEFAULT_GATE  # spec 12b: Hyperliquid keeps the default gate
 ROLLING_DAYS = 28
-SETTLE_S = PRICE_WINDOW_S  # an event is processed once its price window is over
+SETTLE_S = PRICE_WINDOW_S + 1  # P52: settled once its price window is over (31 s)
 MARK_MAX_AGE_S = 900  # a mark older than 15 min is not used
+PRICE_KEEP_DAYS = 2  # P52: raw prices are pruned after 2 days (marks are kept)
+MARK_FINAL_S = 60  # an hourly mark is computed once the hour is 60 s past
+HOUR = timedelta(hours=1)
+HOUR_MS = 3_600_000
 RERUN_AFTER_S = 3600  # re-evaluate at least hourly (the gate depends on time too)
 RECONCILE_INTERVAL_S = 300  # P11: at most once per 5 min per wallet
 CURVE_MAX_POINTS = 500
@@ -80,18 +94,24 @@ def _ms(dt: datetime) -> int:
 
 # -- inputs --------------------------------------------------------------------------
 
-def load_events(session: Session, addr: str, until: datetime | None = None) -> list[TradeEvent]:
+def _rows(session: Session, addr: str, until: datetime | None = None) -> list[PaperEvent]:
     q = select(PaperEvent).where(PaperEvent.address == addr)
     if until is not None:
         q = q.where(PaperEvent.observed_time <= until)
-    out: list[TradeEvent] = []
-    for r in session.scalars(q.order_by(PaperEvent.observed_time, PaperEvent.seq)):
-        try:
-            out.append(event_from_json(r.json))
-        except Exception as e:  # a corrupt row must not stop the copy
-            log.warning("hl paper %s: unreadable event %s (%s)", addr, r.source_ref,
-                        type(e).__name__)
-    return out
+    return list(session.scalars(q.order_by(PaperEvent.observed_time, PaperEvent.seq)))
+
+
+def _event(addr: str, r: PaperEvent) -> TradeEvent | None:
+    try:
+        return event_from_json(r.json)
+    except Exception as e:  # a corrupt row must not stop the copy
+        log.warning("hl paper %s: unreadable event %s (%s)", addr, r.source_ref,
+                    type(e).__name__)
+        return None
+
+
+def load_events(session: Session, addr: str, until: datetime | None = None) -> list[TradeEvent]:
+    return [e for e in (_event(addr, r) for r in _rows(session, addr, until)) if e is not None]
 
 
 class RecordedPrices:
@@ -115,20 +135,171 @@ class RecordedPrices:
             .order_by(Price.time.desc()).limit(1))
 
 
-def leader_pnl(session: Session, addr: str, start: datetime, end: datetime) -> Decimal:
-    """The leader's realized perp PnL over [start, end]: closedPnl - fee of the stored
-    fills, plus stored funding (the gap report's leader side)."""
-    lo, hi = _ms(start), _ms(end)
-    total = ZERO
-    for coin, cpnl, fee in session.execute(select(Fill.coin, Fill.closed_pnl, Fill.fee).where(
-            Fill.address == addr, Fill.time >= lo, Fill.time <= hi)):
-        if coin.startswith("@") or "/" in coin:  # spot
+class SettledModel:
+    """The execution model over SETTLED prices (P52): ``fill_price`` returns the price
+    stored at settle time (None = missed); fees, funding and leverage come from
+    ``base``."""
+
+    def __init__(self, base: Any, settled: dict[str, Decimal | None]) -> None:
+        self.base = base
+        self.settled = settled
+        self.max_leverage = base.max_leverage
+
+    def fill_price(self, ev: TradeEvent) -> Decimal | None:
+        return self.settled.get(ev.source_ref)
+
+    def fee(self, notional: Decimal) -> Decimal:
+        return self.base.fee(notional)
+
+    def holding_cost(self, pos: Any, start: datetime, end: datetime) -> Decimal:
+        hc = getattr(self.base, "holding_cost", None)
+        return ZERO if hc is None else Decimal(hc(pos, start, end))
+
+
+def settle(session: Session, addr: str, now: datetime, model: Any) -> int:
+    """P52: price (or mark missed) every unsettled event of ``addr`` whose price window
+    is over; store it once. Returns the number settled. Flushes."""
+    n = 0
+    for r in session.scalars(select(PaperEvent).where(
+            PaperEvent.address == addr, PaperEvent.settled_at.is_(None),
+            PaperEvent.observed_time <= now - timedelta(seconds=SETTLE_S))):
+        ev = _event(addr, r)
+        px = None if ev is None else model.fill_price(ev)
+        r.fill_price = px
+        r.missed = px is None
+        r.settled_at = now
+        n += 1
+    if n:
+        session.flush()
+    return n
+
+
+def _hour_ceil(dt: datetime) -> int:
+    t = _ms(dt)
+    return -(-t // HOUR_MS) * HOUR_MS
+
+
+def _dt(ms: int) -> datetime:
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+
+
+def record_marks(session: Session, coins: set[str] | list[str], since: datetime,
+                 now: datetime) -> int:
+    """P48/P52: persist the hourly mark of each coin for every hour ``h`` in
+    ``[since, now - MARK_FINAL_S]`` not stored yet that has a recorded price (the latest
+    mid at or before ``h``, at most ``MARK_MAX_AGE_S`` old). Returns rows written."""
+    lo = _hour_ceil(since)
+    hi = _ms(now) - MARK_FINAL_S * 1000
+    if hi < lo or not coins:
+        return 0
+    prices = RecordedPrices(session)
+    rows: list[dict] = []
+    for coin in sorted(coins):
+        have = set(session.scalars(select(Mark.hour_ts).where(
+            Mark.coin == coin, Mark.hour_ts >= lo, Mark.hour_ts <= hi)))
+        for h in range(lo, hi + 1, HOUR_MS):
+            if h in have:
+                continue
+            mid = prices.mark(coin, _dt(h))
+            if mid is not None:
+                rows.append({"coin": coin, "hour_ts": h, "mid": str(mid)})
+    if rows:
+        _insert_ignore(session, Mark.__table__, rows)
+        session.flush()
+    return len(rows)
+
+
+def event_coins(session: Session, addr: str) -> set[str]:
+    out: set[str] = set()
+    for js in session.scalars(select(PaperEvent.json).where(PaperEvent.address == addr)):
+        coin = (js or {}).get("market_id")
+        if coin:
+            out.add(str(coin))
+    return out
+
+
+class Marks:
+    """The simulator's ``mark``: persisted hourly marks (``marks``) for past times, the
+    live recorded price at ``now`` (the final point only)."""
+
+    def __init__(self, session: Session, coins: set[str], start: datetime,
+                 now: datetime) -> None:
+        self.now = now
+        self.live = RecordedPrices(session)
+        self.hourly: dict[tuple[str, int], Decimal] = {}
+        if coins:
+            for coin, h, mid in session.execute(select(Mark.coin, Mark.hour_ts, Mark.mid).where(
+                    Mark.coin.in_(sorted(coins)), Mark.hour_ts >= _ms(start) - HOUR_MS,
+                    Mark.hour_ts <= _ms(now))):
+                self.hourly[(coin, h)] = mid
+
+    def __call__(self, coin: str, at: datetime) -> Decimal | None:
+        if at >= self.now:
+            return self.live.mark(coin, at)
+        t = _ms(at)
+        return self.hourly.get((coin, t // HOUR_MS * HOUR_MS))  # the hour's mark (<= at)
+
+    def times(self, start: datetime) -> list[datetime]:
+        return [_dt(h) for h in range(_hour_ceil(start), _ms(self.now), HOUR_MS)] + [self.now]
+
+
+def _leader_cpnl(session: Session, addr: str, r: PaperEvent) -> Decimal:
+    """The leader's HL closedPnl of this event's leg (stored by the watcher; older rows:
+    the stored fill's, a flip's open leg 0; reconcile events 0)."""
+    js = r.json or {}
+    v = js.get("leader_closed_pnl")
+    if v is not None:
+        return Decimal(str(v))
+    ref = r.source_ref
+    if ref.startswith("reconcile:"):
+        return ZERO
+    parts = ref.split(":")
+    if len(parts) < 2 or (len(parts) > 2 and parts[2] == "open"):
+        return ZERO
+    try:
+        tid = int(parts[1])
+    except ValueError:
+        return ZERO
+    cpnl = session.scalar(select(Fill.closed_pnl).where(Fill.address == addr, Fill.tid == tid))
+    return ZERO if cpnl is None else Decimal(cpnl)
+
+
+def gap_report(session: Session, addr: str, start: datetime, rows: list[PaperEvent],
+               events: dict[str, TradeEvent], res: PaperResult,
+               now: datetime) -> tuple[Decimal, Decimal]:
+    """P49: ``(gap_usd, leader_realized_usd)``.
+
+    - gap: over the copied positions closed by ``now``, the sum of (the leader's
+      closedPnl on that position x our open qty / the leader's open size) minus our pnl
+      on it.
+    - leader_realized: the leader's raw closedPnl on positions opened since ``start``.
+    Pre-follow positions are in neither; missed / uncopied positions are not in the gap.
+    """
+    by_pos: dict[str, Decimal] = {}
+    post_follow: set[str] = set()
+    for r in rows:
+        ev = events.get(r.source_ref)
+        if ev is None or ev.position_id is None:
             continue
-        total += Decimal(cpnl) - Decimal(fee)
-    for usdc in session.scalars(select(Funding.usdc).where(
-            Funding.address == addr, Funding.time >= lo, Funding.time <= hi)):
-        total += Decimal(usdc)
-    return total
+        if ev.side == "open" and ev.leader_time >= start:
+            post_follow.add(ev.position_id)
+        cp = _leader_cpnl(session, addr, r)
+        if cp:
+            by_pos[ev.position_id] = by_pos.get(ev.position_id, ZERO) + cp
+    leader_realized = sum((v for k, v in by_pos.items() if k in post_follow), ZERO)
+    opens = {(f.position_id, f.at): f for f in res.fills
+             if f.side == "open" and not f.missed}
+    scaled = ours = ZERO
+    for ct in res.closed_trades:
+        if ct.closed_at > now or ct.position_id not in post_follow:
+            continue
+        f = opens.get((ct.position_id, ct.opened_at))
+        ev = events.get(f.ev_ref) if f is not None else None
+        if f is None or ev is None or not ev.size:
+            continue
+        scaled += by_pos.get(ct.position_id, ZERO) * f.size / abs(ev.size)
+        ours += ct.pnl_usd
+    return gap(scaled, ours), leader_realized
 
 
 # -- snapshot ------------------------------------------------------------------------
@@ -171,6 +342,12 @@ def needs_run(session: Session, addr: str, now: datetime) -> bool:
         PaperEvent.observed_time <= now - timedelta(seconds=SETTLE_S))))
 
 
+def follow_seq(session: Session, addr: str) -> int:
+    """The alert watermark (P51): the wallet's event seq when the follow started."""
+    v = pipeline.kv_get_json(session, KV_FOLLOW_SEQ.format(addr))
+    return v if isinstance(v, int) else 0
+
+
 # -- run -----------------------------------------------------------------------------
 
 def run_paper(session: Session, addr: str, now: datetime, *,
@@ -183,10 +360,25 @@ def run_paper(session: Session, addr: str, now: datetime, *,
         raise KeyError(addr)
     cfg = cfg or PaperConfig()
     prev = snapshot(session, addr)
-    events = load_events(session, addr, until=now - timedelta(seconds=SETTLE_S))
     prices = RecordedPrices(session)
     model = HLExecutionModel(prices, funding)
-    res: PaperResult = simulate(events, model, cfg, f.started_at, prices.mark)
+    settle(session, addr, now, model)
+    coins = event_coins(session, addr)
+    # persist the hourly marks while the raw prices are still there (P52)
+    record_marks(session, coins,
+                 max(f.started_at, now - timedelta(days=PRICE_KEEP_DAYS) - HOUR), now)
+    rows = [r for r in _rows(session, addr, until=now - timedelta(seconds=SETTLE_S))
+            if r.settled_at is not None]
+    by_ref: dict[str, TradeEvent] = {}
+    for r in rows:
+        e = _event(addr, r)
+        if e is not None:
+            by_ref[r.source_ref] = e
+    events = list(by_ref.values())
+    settled = {r.source_ref: (None if r.missed else r.fill_price) for r in rows}
+    marks = Marks(session, coins, f.started_at, now)
+    res: PaperResult = simulate(events, SettledModel(model, settled), cfg, f.started_at,
+                                marks, mark_times=marks.times(f.started_at))
 
     full = evaluate_gate(res, f.started_at, now, gate)
     rolling = evaluate_rolling(res, now, gate, ROLLING_DAYS)
@@ -209,7 +401,9 @@ def run_paper(session: Session, addr: str, now: datetime, *,
         f.ladder = current
 
     last_seq = int(prev.get("last_seq") or 0) if prev else None
-    new_events = [e for e in events if last_seq is None or e.seq > last_seq]
+    # alert watermark: never alert events from before the follow started (P51)
+    mark_seq = max(last_seq or 0, follow_seq(session, addr))
+    new_events = [e for e in events if e.seq > mark_seq]
     # events are judged at the ladder they happened under (before this change)
     alerts.emit_alerts(session, addr, new_events, change, ladder=current, now=now)
 
@@ -218,11 +412,11 @@ def run_paper(session: Session, addr: str, now: datetime, *,
     net = equity - cfg.bankroll
     closed = [c for c in res.closed_trades if c.closed_at <= now]
     wins = sum(1 for c in closed if c.pnl_usd > 0)
-    lead = leader_pnl(session, addr, f.started_at, now)
+    gap_usd, lead = gap_report(session, addr, f.started_at, rows, by_ref, res, now)
     summary = PaperSummary(
         address=addr, ladder=new, equity_usd=equity, net_pnl_usd=net,
         max_dd=Decimal(full.values["max_dd"]), closed_trades=len(closed),
-        days_followed=max((now - f.started_at).days, 0), gap_usd=gap(lead, net),
+        days_followed=max((now - f.started_at).days, 0), gap_usd=gap_usd,
         origin=f.origin if f.origin in ("auto", "manual") else "manual")
     seqs = [e.seq for e in events]
     snap = {
@@ -241,7 +435,8 @@ def run_paper(session: Session, addr: str, now: datetime, *,
         "n": len(closed),
         "gate": _gate_dict(full),
         "rolling": _gate_dict(rolling),
-        "leader_pnl_usd": str(lead),
+        "gap_usd": str(gap_usd),
+        "leader_realized_usd": str(lead),
         "equity_curve": _downsample(curve, CURVE_MAX_POINTS),
         "fills": [_fill_json(x) for x in res.fills[-FILLS_KEEP:]],
         "funding_missing_hours": funding.missing_hours if funding is not None else None,
@@ -295,14 +490,17 @@ def _leader_positions(state: Any) -> dict[str, Decimal]:
     return out
 
 
-def _pending_reconciles(session: Session, addr: str, since: datetime | None) -> set[str]:
-    """Position ids with a reconcile close not yet processed by a paper run."""
-    prefix = f"reconcile:{addr}:"
-    q = select(PaperEvent.source_ref).where(PaperEvent.address == addr,
-                                            PaperEvent.source_ref.like(prefix + "%"))
-    if since is not None:
-        q = q.where(PaperEvent.observed_time > since)
-    return {ref[len(prefix):].rsplit(":", 1)[0] for ref in session.scalars(q)}
+def _busy_coins(session: Session, addr: str, last_seq: int) -> set[str]:
+    """I2: coins with an event not yet reflected in the snapshot (unsettled, or newer
+    than its ``last_seq``): a live close may be on its way, so no synthetic close."""
+    out: set[str] = set()
+    for js in session.scalars(select(PaperEvent.json).where(
+            PaperEvent.address == addr,
+            or_(PaperEvent.settled_at.is_(None), PaperEvent.seq > last_seq))):
+        coin = (js or {}).get("market_id")
+        if coin:
+            out.add(str(coin))
+    return out
 
 
 async def reconcile(session: Session, client: Any, addr: str, now: datetime, *,
@@ -314,9 +512,8 @@ async def reconcile(session: Session, client: Any, addr: str, now: datetime, *,
     opens = (snap or {}).get("open_positions") or []
     if not opens or (pending is not None and pending(addr)):
         return []
-    computed = datetime.fromisoformat(snap["computed_at"]) if snap.get("computed_at") else None
-    waiting = _pending_reconciles(session, addr, computed)
-    todo = [p for p in opens if p["position_id"] not in waiting]
+    busy = _busy_coins(session, addr, int(snap.get("last_seq") or 0))
+    todo = [p for p in opens if p["market_id"] not in busy]
     if not todo:
         return []
     try:
@@ -379,6 +576,7 @@ class Reconciler:
         return await reconcile(session, client, addr, now, pending=pending)
 
 
-__all__ = ["GATE", "KV_PAPER", "RECONCILE_INTERVAL_S", "ROLLING_DAYS", "RecordedPrices",
-           "Reconciler", "ensure_funding", "leader_pnl", "load_events", "needs_run",
-           "reconcile", "run_paper", "run_paper_live", "snapshot"]
+__all__ = ["GATE", "KV_PAPER", "PRICE_KEEP_DAYS", "RECONCILE_INTERVAL_S", "ROLLING_DAYS",
+           "Marks", "RecordedPrices", "Reconciler", "SettledModel", "ensure_funding",
+           "event_coins", "gap_report", "load_events", "needs_run", "reconcile",
+           "record_marks", "run_paper", "run_paper_live", "settle", "snapshot"]

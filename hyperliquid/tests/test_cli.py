@@ -239,6 +239,13 @@ def test_follow_add_cap(env, monkeypatch):
     assert r.exit_code == 1 and "cap" in r.output
 
 
+def test_follow_add_commits_valid_adds_before_invalid_address(env):
+    r = invoke("follow-add", A, "not-an-address", B)
+    assert r.exit_code == 1 and "not a Hyperliquid address" in r.output
+    r = invoke("follows")
+    assert A in r.output and B not in r.output
+
+
 def test_paper_run_requires_address_or_all(env):
     assert invoke("paper-run").exit_code != 0
 

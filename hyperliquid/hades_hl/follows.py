@@ -11,7 +11,10 @@
   :class:`FollowCapError`, auto-follows beyond it are skipped.
 - ``started_at`` = the follow time. Paper copying starts there; there is no history
   fill-in. A re-follow (after any removal) is a new follow: ``started_at`` = now and the
-  ladder restarts at PAPER.
+  ladder restarts at PAPER (P51: the ``ladder_history`` row is ``from_`` the ladder the
+  wallet had when it was removed; removal keeps it). Every follow start clears the old
+  paper snapshot (I3) and sets the alert watermark ``hl:follow_seq:{addr}`` to the
+  wallet's current event seq, so events from before the follow never alert.
 
 Callers commit.
 """
@@ -26,11 +29,13 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from hades_hl import pipeline
-from hades_hl.db import Follow, LadderHistory, PaperEvent, Wallet
+from hades_hl.db import Follow, Kv, LadderHistory, PaperEvent, Wallet
 
 AUTO_FOLLOW_N = 10
 MAX_FOLLOWS = 25
 KV_PAPER = "hl:paper:{}"  # paper snapshot per address (written by paper_runtime)
+KV_FOLLOW_SEQ = "hl:follow_seq:{}"  # alert watermark: event seq at the follow start
+KV_SEQ = "hl:seq:{}"  # per-address event counter (live.KV_SEQ)
 
 _ADDR = re.compile(r"^0x[0-9a-f]{40}$")
 
@@ -71,14 +76,17 @@ def has_open_positions(session: Session, addr: str) -> bool:
     snap = pipeline.kv_get_json(session, KV_PAPER.format(addr))
     if isinstance(snap, dict) and snap.get("open_positions"):
         return True
-    q = select(func.count()).select_from(PaperEvent).where(PaperEvent.address == addr)
+    mark = pipeline.kv_get_json(session, KV_FOLLOW_SEQ.format(addr))
+    last = mark if isinstance(mark, int) else 0
     if isinstance(snap, dict) and snap.get("last_seq") is not None:
-        q = q.where(PaperEvent.seq > int(snap["last_seq"]))
+        last = max(last, int(snap["last_seq"]))
+    q = select(func.count()).select_from(PaperEvent).where(PaperEvent.address == addr,
+                                                           PaperEvent.seq > last)
     return bool(session.scalar(q))
 
 
 def _start_follow(session: Session, f: Follow, origin: str, now: datetime) -> None:
-    prev = f.ladder if f.removed_at is None else None
+    prev = f.ladder  # P51: the stored ladder (kept at removal), None for a new follow
     f.origin = origin
     f.started_at = now
     f.removed_at = None
@@ -87,6 +95,14 @@ def _start_follow(session: Session, f: Follow, origin: str, now: datetime) -> No
     f.ladder_changed_at = now
     session.add(LadderHistory(address=f.address, from_=prev, to="PAPER",
                               gate_json={"reason": f"follow ({origin})"}, at=now))
+    # I3: a new follow starts from a clean paper snapshot; P51: alert watermark
+    old = session.get(Kv, KV_PAPER.format(f.address))
+    if old is not None:
+        session.delete(old)
+        session.flush()
+    seq = pipeline.kv_get_json(session, KV_SEQ.format(f.address))
+    pipeline.kv_set_json(session, KV_FOLLOW_SEQ.format(f.address),
+                         seq if isinstance(seq, int) else 0)
 
 
 def _new_follow(session: Session, addr: str, origin: str, now: datetime) -> Follow:

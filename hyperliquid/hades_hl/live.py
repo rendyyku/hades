@@ -26,6 +26,10 @@ No hindsight (spec section 7, 12a):
   held fills as ONE chain-ordered batch (seq in that order), every event with the
   recovery response time as ``observed_time``; then the floor clears and ``last_seen``
   advances. Held fills are not emitted if the watcher stops first.
+- Recovery max age (P47): a recovered (or held-and-released) fill whose leader time is
+  more than RECOVERY_MAX_AGE_S (10 min) before the recovery time is emitted as MISSED:
+  stored already settled (``missed=True``), never priced. Copying a days-old open at
+  today's price would be fiction.
 
 Limits (verified 2026-11-21 against
 https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/rate-limits-and-user-limits):
@@ -87,6 +91,8 @@ RECOVERY_RETRY_S = 10.0  # failed recovery: retry after 10 s, doubling ...
 RECOVERY_RETRY_MAX_S = 60.0  # ... up to 60 s
 FEED_FALLBACK_AFTER = 3  # P41: consecutive failed price-feed connections before fallback
 FEED_PRIMARY_RETRY_S = 3600.0  # ... and the primary is retried after an hour
+RECOVERY_MAX_AGE_S = 600.0  # P47: older recovered fills are emitted as missed
+OTHER_COINS_INTERVAL_S = 5.0  # P53: coins outside the watch set, at most every 5 s
 
 # -- execution model constants ---------------------------------------------------------
 PRICE_WINDOW_S = 30  # spec 12a: no live price within 30 s -> missed
@@ -157,9 +163,11 @@ class PriceRecorder:
     At most one row per coin per second (``min_interval_s``); an unchanged mid is only
     rewritten every ``refresh_s`` (< PRICE_WINDOW_S, so every 30 s window still has a
     row: the mid of a row written later with the same value is the mid at the earlier
-    time). Spot mids (``@N``, ``A/B``) are skipped; ``coins()`` (optional) limits
-    recording to a set of coins; ``#N`` outcome tokens are skipped too. Row times are
-    OUR receipt time (epoch ms).
+    time). Spot mids (``@N``, ``A/B``) are skipped; ``coins()`` (optional) is the watch
+    set: coins outside it are skipped, or, with ``other_interval_s`` (ruling P53),
+    recorded at most every ``other_interval_s`` (so a leader's first trade in a new
+    coin still finds a price in its 30 s window); ``#N`` outcome tokens are skipped
+    too. Row times are OUR receipt time (epoch ms).
     """
 
     def __init__(self, engine: Engine, ws_url: str = DEFAULT_WS_URL, *,
@@ -170,7 +178,8 @@ class PriceRecorder:
                  ping_interval_s: float = PING_INTERVAL_S,
                  feed: str = "allMids", fallback_feed: str | None = None,
                  fallback_after: int = FEED_FALLBACK_AFTER,
-                 primary_retry_s: float = FEED_PRIMARY_RETRY_S) -> None:
+                 primary_retry_s: float = FEED_PRIMARY_RETRY_S,
+                 other_interval_s: float | None = None) -> None:
         if feed not in PRICE_FEEDS:
             raise ValueError(f"feed must be one of {PRICE_FEEDS}")
         if fallback_feed is not None and fallback_feed not in PRICE_FEEDS:
@@ -189,6 +198,8 @@ class PriceRecorder:
         self._mids: dict[str, str] = {}  # fastAssetCtxs: latest midPx per coin
         self._now = now
         self.min_interval_ms = int(min_interval_s * 1000)
+        self.other_min_interval_ms = (None if other_interval_s is None
+                                      else int(other_interval_s * 1000))
         self.refresh_ms = int(refresh_s * 1000)
         self._coins = coins
         self._last: dict[str, tuple[int, Decimal, int]] = {}  # coin -> (second, mid, ms)
@@ -209,8 +220,11 @@ class PriceRecorder:
             coin = str(coin)
             if coin.startswith(("@", "#")) or "/" in coin:  # spot, outcome tokens
                 continue
+            interval = self.min_interval_ms
             if allowed is not None and coin not in allowed:
-                continue
+                if self.other_min_interval_ms is None:
+                    continue
+                interval = max(interval, self.other_min_interval_ms)
             try:
                 mid = Decimal(str(raw))
             except (InvalidOperation, TypeError):
@@ -218,7 +232,7 @@ class PriceRecorder:
             last = self._last.get(coin)
             if last is not None:
                 last_sec, last_mid, last_ms = last
-                if (sec - last_sec) * 1000 < self.min_interval_ms:
+                if (sec - last_sec) * 1000 < interval:
                     continue
                 if mid == last_mid and at_ms - last_ms < self.refresh_ms:
                     continue
@@ -374,7 +388,8 @@ class FillWatcher:
                  sz_decimals: Mapping[str, int] | None = None,
                  recovery_retry_s: float = RECOVERY_RETRY_S,
                  recovery_retry_max_s: float = RECOVERY_RETRY_MAX_S,
-                 extra_weight_per_min: float = 0.0) -> None:
+                 extra_weight_per_min: float = 0.0,
+                 recovery_max_age_s: float = RECOVERY_MAX_AGE_S) -> None:
         self.engine = engine
         self.client = client
         self.ws_url = ws_url
@@ -401,6 +416,8 @@ class FillWatcher:
         self._held: dict[str, dict[int, tuple[dict, str]]] = {}
         self.recovery_retry_s = recovery_retry_s
         self.recovery_retry_max_s = recovery_retry_max_s
+        self.recovery_max_age_s = recovery_max_age_s
+        self.stale_missed = 0  # P47: recovered fills emitted as missed
         self._retry_delay: dict[str, float] = {}
         self._retry_due: dict[str, float] = {}  # loop.time() of the next retry
         self.poll_interval_s = poll_interval_s
@@ -456,15 +473,19 @@ class FillWatcher:
         cur = (self.last_seen_ms.get(addr), self.recovery_floor_ms.get(addr))
         if self._persisted.get(addr) == cur:
             return
-        with Session(self.engine) as s:
-            pipeline.kv_set_json(s, KV_LAST_SEEN.format(addr), cur[0])
-            if cur[1] is None:
-                row = s.get(Kv, KV_FLOOR.format(addr))
-                if row is not None:
-                    s.delete(row)
-            else:
-                pipeline.kv_set_json(s, KV_FLOOR.format(addr), cur[1])
-            s.commit()
+        try:
+            with Session(self.engine) as s:
+                pipeline.kv_set_json(s, KV_LAST_SEEN.format(addr), cur[0])
+                if cur[1] is None:
+                    row = s.get(Kv, KV_FLOOR.format(addr))
+                    if row is not None:
+                        s.delete(row)
+                else:
+                    pipeline.kv_set_json(s, KV_FLOOR.format(addr), cur[1])
+                s.commit()
+        except Exception:  # I4: a DB error must not kill the watcher; retried next change
+            log.exception("hl watcher %s: persisting the cursor failed", addr)
+            return
         self._persisted[addr] = cur
 
     # -- ingest ----------------------------------------------------------------------
@@ -500,7 +521,9 @@ class FillWatcher:
                     vias[tid] = f"{v}:held"
                     if tid not in {int(x["tid"]) for x in fills}:
                         fills.append(f)  # re-store (insert dedupes) for the chain context
-        out = self._store_and_emit(addr, fills, cand, lev, observed, vias)
+        # P47: a recovered fill older than the max age is emitted as missed
+        stale_ms = _ms(observed) - int(self.recovery_max_age_s * 1000) if release else None
+        out = self._store_and_emit(addr, fills, cand, lev, observed, vias, stale_ms)
         # only now is everything up to ``newest`` committed
         if release:
             self._held.pop(addr, None)
@@ -534,9 +557,11 @@ class FillWatcher:
 
     def _store_and_emit(self, addr: str, fills: list[dict], cand: list[dict],
                         lev: Mapping[str, Decimal], observed: datetime,
-                        vias: Mapping[int, str]) -> list[TradeEvent]:
+                        vias: Mapping[int, str],
+                        stale_before_ms: int | None = None) -> list[TradeEvent]:
         """Synchronous (no await): store fills, persist the new legs' events (one
-        chain-ordered batch, all ``observed``), commit. ``vias``: tid -> via."""
+        chain-ordered batch, all ``observed``), commit. ``vias``: tid -> via. Legs with
+        a leader time before ``stale_before_ms`` are stored settled as missed (P47)."""
         with Session(self.engine) as s:
             insert_fills(s, addr, fills)
             s.commit()
@@ -558,14 +583,24 @@ class FillWatcher:
                     source_ref=lg.source_ref, leverage=lev.get(lg.coin),
                     position_id=lg.position_id, group_id=None, seq=seq)
                 delay = _ms(observed) - lg.time_ms
+                stale = stale_before_ms is not None and lg.time_ms < stale_before_ms
+                if stale:
+                    self.stale_missed += 1
+                    log.info("hl watcher %s: recovered fill %s is %.0f min old; missed",
+                             addr, lg.source_ref, delay / 60_000)
                 s.add(PaperEvent(source_ref=ev.source_ref, address=addr,
                                  json={**event_to_json(ev),
                                        "via": vias.get(int(lg.fill["tid"]), ""),
                                        # the leader's signed position around this leg
                                        # (alerts: size change vs previous size)
                                        "leader_start": str(lg.start),
-                                       "leader_end": str(lg.end)},
-                                 observed_time=observed, delay_ms=delay, seq=seq))
+                                       "leader_end": str(lg.end),
+                                       # P49: the leader's realized PnL on this leg
+                                       "leader_closed_pnl": str(lg.closed_pnl),
+                                       **({"stale_recovery": True} if stale else {})},
+                                 observed_time=observed, delay_ms=delay, seq=seq,
+                                 missed=True if stale else None,
+                                 settled_at=observed if stale else None))
                 out.append(ev)
             pipeline.kv_set_json(s, key, seq)
             s.commit()
