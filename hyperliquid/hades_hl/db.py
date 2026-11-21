@@ -179,10 +179,15 @@ class Price(Base):
 
 
 class PaperEvent(Base):
+    """One leader event of one followed wallet, keyed by ``(address, source_ref)``:
+    ``source_ref`` is ``hash:tid`` (plus a flip suffix) and HL gives both counterparties
+    of a trade the same hash and tid, so it is unique per wallet only (final review
+    I2; like ``fills``). ``seq`` is per address too (P26)."""
+
     __tablename__ = "paper_events"
 
-    source_ref: Mapped[str] = mapped_column(String, primary_key=True)
     address: Mapped[str] = mapped_column(String, index=True)
+    source_ref: Mapped[str] = mapped_column(String)
     json: Mapped[Any] = mapped_column(JSON)
     observed_time: Mapped[datetime] = mapped_column(UTCDateTime)
     delay_ms: Mapped[int | None] = mapped_column(Integer)
@@ -194,6 +199,10 @@ class PaperEvent(Base):
     fill_price: Mapped[Decimal | None] = mapped_column(DecimalText, nullable=True)
     missed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     settled_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+
+    __table_args__ = (
+        PrimaryKeyConstraint("address", "source_ref", name="pk_paper_events"),
+    )
 
 
 class Mark(Base):
@@ -270,17 +279,20 @@ def _existing_columns(conn, table: str) -> set[str]:
 
 def init_db(engine: Engine) -> None:
     """Create missing tables, add columns missing from older databases, and rebuild
-    an old ``fills`` table keyed by ``tid`` alone (finding I4). Idempotent."""
+    an old ``fills`` table keyed by ``tid`` alone (finding I4) and an old
+    ``paper_events`` table keyed by ``source_ref`` alone (final review I2). Idempotent."""
     Base.metadata.create_all(engine)
     with engine.begin() as conn:
         for table, column, sql_type in _ADDED_COLUMNS:
             if column not in _existing_columns(conn, table):
                 conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}"))
-    _migrate_fills_pk(engine)
+    _migrate_pk(engine, Fill.__table__, FILLS_PK)
+    _migrate_pk(engine, PaperEvent.__table__, PAPER_EVENTS_PK)
     _migrate_wallets_first_seen(engine)
 
 
 FILLS_PK = ["address", "tid"]
+PAPER_EVENTS_PK = ["address", "source_ref"]
 
 
 def _migrate_wallets_first_seen(engine: Engine) -> None:
@@ -299,21 +311,26 @@ def _migrate_wallets_first_seen(engine: Engine) -> None:
     _rebuild_table(engine, Wallet.__table__, cols, select_cols)
 
 
-def _migrate_fills_pk(engine: Engine) -> None:
-    """Rebuild ``fills`` with the composite ``(address, tid)`` key if it still has the
-    pre-Task-6-fix single-column ``tid`` key: create the new table, copy every row,
-    drop the old table, rename, recreate the indexes, all in ONE SQLite transaction
-    (explicit ``BEGIN IMMEDIATE`` on the raw connection: pysqlite would otherwise
-    autocommit each DDL statement). No-op when the key is already composite."""
+def _migrate_pk(engine: Engine, table, pk: list[str]) -> None:
+    """Rebuild ``table`` with the composite key ``pk`` if the stored table still has
+    an older key (``fills``: ``tid`` alone, before the Task 6 fix; ``paper_events``:
+    ``source_ref`` alone, before the final review): create the new table, copy every
+    row, drop the old table, rename, recreate the indexes, all in ONE SQLite
+    transaction (explicit ``BEGIN IMMEDIATE`` on the raw connection: pysqlite would
+    otherwise autocommit each DDL statement), so a failure leaves the old table
+    untouched. Every old row is unique under the wider key, so none is lost. No-op
+    when the key is already ``pk``."""
+    name = table.name
     with engine.connect() as conn:
-        pk = inspect(conn).get_pk_constraint("fills")["constrained_columns"]
-        if list(pk) == FILLS_PK:
+        current = inspect(conn).get_pk_constraint(name)["constrained_columns"]
+        if list(current) == pk:
             return
         if conn.dialect.name != "sqlite":  # pragma: no cover - SQLite only for now
-            raise NotImplementedError(f"fills PK migration not implemented for {conn.dialect.name}")
-        old_cols = _existing_columns(conn, "fills")
-    cols = [c.name for c in Fill.__table__.columns if c.name in old_cols]
-    _rebuild_table(engine, Fill.__table__, cols, cols)
+            raise NotImplementedError(
+                f"{name} PK migration not implemented for {conn.dialect.name}")
+        old_cols = _existing_columns(conn, name)
+    cols = [c.name for c in table.columns if c.name in old_cols]
+    _rebuild_table(engine, table, cols, cols)
 
 
 def _rebuild_table(engine: Engine, table, cols: list[str], select_cols: list[str]) -> None:

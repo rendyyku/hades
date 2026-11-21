@@ -70,7 +70,7 @@ def _episode_size_before(session: Session, addr: str, ev: TradeEvent) -> Decimal
 
 
 def previous_size(session: Session, addr: str, ev: TradeEvent) -> Decimal | None:
-    row = session.get(PaperEvent, ev.source_ref)
+    row = session.get(PaperEvent, (addr, ev.source_ref))
     start = (row.json or {}).get("leader_start") if row is not None else None
     if start is not None:
         return abs(Decimal(str(start)))

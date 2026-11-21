@@ -57,7 +57,8 @@ class FakeClient:
 
     async def clearinghouse_state(self, addr):
         self.state_calls.append(addr)
-        return {"assetPositions": []}
+        return {"marginSummary": {"accountValue": "1000", "totalNtlPos": "0"},
+                "assetPositions": []}
 
     async def meta(self):
         return {"universe": [{"name": "BTC", "szDecimals": 5}]}

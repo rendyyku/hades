@@ -34,6 +34,16 @@ processed before any event observed at or after t) holding costs are accrued to 
 every open position is marked through ``mark`` (which may liquidate it, as at an
 event) and an equity point ``(t, equity)`` is appended. This shows unrealized
 drawdown between events. Without ``mark_times`` the result is unchanged.
+
+Display point (``display_time``, optional; ruling P54): the equity at one last moment
+(the head's unsaved "now") for display only. It is computed after everything else from
+``mark`` (else each market's last price) and the holding cost accrued so far, with the
+loss of every position capped at its margin, and returned as
+``PaperResult.display_point``. It is NOT history: it never liquidates, never charges,
+never adds a fill, a closed trade or an ``equity_curve`` point, so the gates (which
+read ``equity_curve`` and ``closed_trades``) cannot see it and a later run reproduces
+the same history whatever the price was at that moment. It is meant to be at or after
+every event and mark time.
 """
 
 from __future__ import annotations
@@ -121,6 +131,8 @@ class PaperResult:
     equity_curve: list[tuple[datetime, Decimal]] = field(default_factory=list)
     open_positions: dict[str, OpenPosition] = field(default_factory=dict)
     closed_trades: list[ClosedTrade] = field(default_factory=list)
+    # display-only (time, equity) at ``display_time``; never part of ``equity_curve``
+    display_point: tuple[datetime, Decimal] | None = None
 
 
 @dataclass
@@ -167,8 +179,11 @@ def simulate(
     follow_started_at: datetime,
     mark: Mark | None = None,
     mark_times: Iterable[datetime] | None = None,
+    display_time: datetime | None = None,
 ) -> PaperResult:
     require_utc("follow_started_at", follow_started_at)
+    if display_time is not None:
+        require_utc("display_time", display_time)
     pending_marks: list[datetime] = []
     for t in mark_times or ():
         require_utc("mark_time", t)
@@ -368,5 +383,18 @@ def simulate(
         res.equity_curve.append((at, equity()))
 
     mark_until(None)
+    if display_time is not None and display_time >= follow_started_at:
+        # P54: read-only. No observe() (so no liquidation), no accrue(): nothing here
+        # changes the book, the fills, the closed trades or the equity curve.
+        total = base
+        for key in sorted(book):
+            p = book[key]
+            if holding_cost is not None and p.accrued_to is not None                     and display_time > p.accrued_to:
+                total -= Decimal(holding_cost(p.pos, p.accrued_to, display_time))
+            px = mark(p.pos.market_id, display_time) if mark is not None else None
+            if px is None:
+                px = last_price.get(p.pos.market_id, p.pos.entry_price)
+            total += p.unrealized(px)
+        res.display_point = (display_time, total)
     res.open_positions = {k: book[k].pos for k in sorted(book)}
     return res

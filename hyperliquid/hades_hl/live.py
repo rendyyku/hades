@@ -26,10 +26,12 @@ No hindsight (spec section 7, 12a):
   held fills as ONE chain-ordered batch (seq in that order), every event with the
   recovery response time as ``observed_time``; then the floor clears and ``last_seen``
   advances. Held fills are not emitted if the watcher stops first.
-- Recovery max age (P47): a recovered (or held-and-released) fill whose leader time is
-  more than RECOVERY_MAX_AGE_S (10 min) before the recovery time is emitted as MISSED:
-  stored already settled (``missed=True``), never priced. Copying a days-old open at
-  today's price would be fiction.
+- Max age (P47): a fill whose leader time is more than RECOVERY_MAX_AGE_S (10 min)
+  before the time we observe it is emitted as MISSED: stored already settled
+  (``missed=True``), never priced. Copying a days-old open at today's price would be
+  fiction. This holds on EVERY non-snapshot path (recovery, held-and-released, the
+  REST poll of the 11th+ follow, a late WS message): a polled follow restarts from
+  its persisted cursor, so its first poll after an outage returns the whole gap.
 
 Limits (verified 2026-11-21 against
 https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/rate-limits-and-user-limits):
@@ -417,7 +419,7 @@ class FillWatcher:
         self.recovery_retry_s = recovery_retry_s
         self.recovery_retry_max_s = recovery_retry_max_s
         self.recovery_max_age_s = recovery_max_age_s
-        self.stale_missed = 0  # P47: recovered fills emitted as missed
+        self.stale_missed = 0  # P47: fills too old when observed, emitted as missed
         self._retry_delay: dict[str, float] = {}
         self._retry_due: dict[str, float] = {}  # loop.time() of the next retry
         self.poll_interval_s = poll_interval_s
@@ -521,8 +523,11 @@ class FillWatcher:
                     vias[tid] = f"{v}:held"
                     if tid not in {int(x["tid"]) for x in fills}:
                         fills.append(f)  # re-store (insert dedupes) for the chain context
-        # P47: a recovered fill older than the max age is emitted as missed
-        stale_ms = _ms(observed) - int(self.recovery_max_age_s * 1000) if release else None
+        # P47: a fill older than the max age when we observe it is emitted as missed,
+        # whatever the path (final review C1): a recovery, a poll after an outage (a
+        # polled follow restarts from its persisted cursor) or a late WS message. A
+        # live fill is seconds old, so nothing changes for it.
+        stale_ms = None if snapshot else _ms(observed) - int(self.recovery_max_age_s * 1000)
         out = self._store_and_emit(addr, fills, cand, lev, observed, vias, stale_ms)
         # only now is everything up to ``newest`` committed
         if release:
@@ -586,7 +591,7 @@ class FillWatcher:
                 stale = stale_before_ms is not None and lg.time_ms < stale_before_ms
                 if stale:
                     self.stale_missed += 1
-                    log.info("hl watcher %s: recovered fill %s is %.0f min old; missed",
+                    log.info("hl watcher %s: fill %s is %.0f min old when observed; missed",
                              addr, lg.source_ref, delay / 60_000)
                 s.add(PaperEvent(source_ref=ev.source_ref, address=addr,
                                  json={**event_to_json(ev),
@@ -622,8 +627,10 @@ class FillWatcher:
         if not legs:
             return []
         refs = [lg.source_ref for lg in legs]
+        # per wallet (final review I2): both counterparties of a trade share hash:tid
         done = set(s.scalars(select(PaperEvent.source_ref)
-                             .where(PaperEvent.source_ref.in_(refs))))
+                             .where(PaperEvent.address == addr,
+                                    PaperEvent.source_ref.in_(refs))))
         return [lg for lg in legs if lg.source_ref not in done]
 
     async def _leverage_for(self, addr: str) -> dict[str, Decimal]:
@@ -703,6 +710,9 @@ class FillWatcher:
                 since = self.recovery_floor_ms.get(a, self.last_seen_ms[a])
                 try:
                     page = await self.client.user_fills_by_time(a, since)
+                    if getattr(page, "truncated", False):  # the 10k-fill cap: newest lost
+                        log.warning("hl watcher %s: recovery since %d hit the fill cap; the "
+                                    "newest fills of the gap are not recovered", a, since)
                     await self.ingest(a, page.fills, observed=self._now(), via="recovery")
                 except asyncio.CancelledError:
                     raise
@@ -774,21 +784,27 @@ class FillWatcher:
         await self.ingest(user, data.get("fills") or [], observed=received, via="ws",
                           snapshot=bool(data.get("isSnapshot")))
 
+    async def _poll_once(self) -> None:
+        """One poll cycle over the polled follows. The first cycle after a restart
+        returns every fill since the persisted cursor; ``ingest`` stores the old ones
+        as missed (P47)."""
+        for a in self.poll_addresses:
+            try:
+                page = await self.client.user_fills_by_time(a, self.last_seen_ms[a])
+                self._note_poll(a, len(page.fills))
+                await self.ingest(a, page.fills, observed=self._now(), via="poll")
+            except asyncio.CancelledError:
+                raise
+            except HLError as e:
+                log.warning("hl watcher %s: poll failed (%s)", a, type(e).__name__)
+            except Exception:  # malformed answer, DB error: log, keep polling
+                log.exception("hl watcher %s: poll iteration failed", a)
+
     async def _poll_loop(self) -> None:
         loop = asyncio.get_running_loop()
         while True:
             t0 = loop.time()
-            for a in self.poll_addresses:
-                try:
-                    page = await self.client.user_fills_by_time(a, self.last_seen_ms[a])
-                    self._note_poll(a, len(page.fills))
-                    await self.ingest(a, page.fills, observed=self._now(), via="poll")
-                except asyncio.CancelledError:
-                    raise
-                except HLError as e:
-                    log.warning("hl watcher %s: poll failed (%s)", a, type(e).__name__)
-                except Exception:  # malformed answer, DB error: log, keep polling
-                    log.exception("hl watcher %s: poll iteration failed", a)
+            await self._poll_once()
             await asyncio.sleep(max(0.0, self.poll_interval() - (loop.time() - t0)))
 
 

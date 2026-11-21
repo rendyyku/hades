@@ -70,7 +70,7 @@ def test_event_settled_once_and_never_repriced(engine, session):
     price(session, "BTC", t + timedelta(seconds=1), 100)
     e = store(session, "open", t, start=0)
     pr.run_paper(session, A, t + timedelta(minutes=1))
-    row = session.get(PaperEvent, e.source_ref)
+    row = session.get(PaperEvent, (A, e.source_ref))
     assert row.settled_at == t + timedelta(minutes=1)
     assert row.missed is False and row.fill_price is not None
     stored = row.fill_price
@@ -78,7 +78,7 @@ def test_event_settled_once_and_never_repriced(engine, session):
     session.execute(Price.__table__.delete())
     price(session, "BTC", t + timedelta(seconds=2), 200)
     pr.run_paper(session, A, t + timedelta(hours=2))
-    row = session.get(PaperEvent, e.source_ref)
+    row = session.get(PaperEvent, (A, e.source_ref))
     assert row.fill_price == stored and row.settled_at == t + timedelta(minutes=1)
     assert pr.snapshot(session, A)["fills"][0]["price"] == str(stored)
 
@@ -89,17 +89,17 @@ def test_missed_settle_is_final_and_young_events_wait(engine, session):
     young = store(session, "open", t + timedelta(minutes=10), coin="ETH", pid="ETH:1", start=0)
     now = t + timedelta(minutes=10, seconds=20)  # ETH's window is not over yet
     pr.run_paper(session, A, now)
-    r = session.get(PaperEvent, e.source_ref)
+    r = session.get(PaperEvent, (A, e.source_ref))
     assert r.missed is True and r.fill_price is None and r.settled_at == now
-    y = session.get(PaperEvent, young.source_ref)
+    y = session.get(PaperEvent, (A, young.source_ref))
     assert y.settled_at is None
     assert pr.snapshot(session, A)["events"] == 1
     # a late price row inside the missed event's window changes nothing
     price(session, "BTC", t + timedelta(seconds=5), 100)
     price(session, "ETH", t + timedelta(minutes=10, seconds=2), 10)
     pr.run_paper(session, A, t + timedelta(minutes=12))
-    assert session.get(PaperEvent, e.source_ref).missed is True
-    y = session.get(PaperEvent, young.source_ref)
+    assert session.get(PaperEvent, (A, e.source_ref)).missed is True
+    y = session.get(PaperEvent, (A, young.source_ref))
     assert y.settled_at is not None and y.missed is False
     snap = pr.snapshot(session, A)
     assert snap["events"] == 2 and snap["missed"] == 1
@@ -110,10 +110,10 @@ def test_settle_window_is_31_seconds(engine, session):
     t = START + H
     e = store(session, "open", t, start=0)
     pr.run_paper(session, A, t + timedelta(seconds=30))
-    assert session.get(PaperEvent, e.source_ref).settled_at is None
+    assert session.get(PaperEvent, (A, e.source_ref)).settled_at is None
     price(session, "BTC", t + timedelta(seconds=30), 100)  # last moment of the window
     pr.run_paper(session, A, t + timedelta(seconds=31))
-    r = session.get(PaperEvent, e.source_ref)
+    r = session.get(PaperEvent, (A, e.source_ref))
     assert r.settled_at is not None and r.missed is False
 
 
@@ -174,7 +174,7 @@ def test_init_db_migrates_old_paper_events(tmp_path):
     assert {"fill_price", "missed", "settled_at"} <= cols
     assert "marks" in tables
     with Session(eng) as s:
-        r = s.get(PaperEvent, "r1")
+        r = s.get(PaperEvent, ("a", "r1"))
         assert r.settled_at is None and r.fill_price is None and r.seq == 1
 
 
@@ -239,7 +239,7 @@ async def test_reconcile_skips_coin_with_event_after_snapshot(engine, session):
     now = START + 2 * H
     # settled by an earlier run that did not snapshot it (e.g. a crash): seq > last_seq
     e = store(session, "close", now - timedelta(minutes=5), pid="BTC:1", start=2, size="2")
-    row = session.get(PaperEvent, e.source_ref)
+    row = session.get(PaperEvent, (A, e.source_ref))
     row.settled_at, row.missed = now - timedelta(minutes=4), True
     session.commit()
     assert await pr.reconcile(session, FakeClient(), A, now) == []
@@ -381,7 +381,7 @@ async def test_stale_recovered_fills_are_missed_and_never_priced(engine, session
 
 def _store_cpnl(s, side, at, cpnl, **kw):
     e = store(s, side, at, **kw)
-    row = s.get(PaperEvent, e.source_ref)
+    row = s.get(PaperEvent, (A, e.source_ref))
     row.json = {**row.json, "leader_closed_pnl": str(cpnl)}
     s.flush()
     return e
@@ -391,7 +391,7 @@ def test_gap_is_per_copied_position_scaled(engine, session):
     t = START + H
     # pre-follow episode: its close is excluded from both numbers
     pre = store(session, "close", t, coin="SOL", pid="SOL:0", start=3, size="3")
-    row = session.get(PaperEvent, pre.source_ref)
+    row = session.get(PaperEvent, (A, pre.source_ref))
     row.json = {**row.json, "leader_time": (START - H).isoformat(), "leader_closed_pnl": "1000"}
     # copied: leader 2 BTC, +20 closedPnl
     price(session, "BTC", t + timedelta(seconds=1), 100)

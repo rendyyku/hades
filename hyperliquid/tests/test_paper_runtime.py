@@ -204,7 +204,8 @@ class FakeClient:
 
     async def clearinghouse_state(self, addr):
         self.state_calls.append(addr)
-        return {"assetPositions": [{"position": {"coin": c, "szi": szi,
+        return {"marginSummary": {"accountValue": "1000", "totalNtlPos": "0"},
+                "assetPositions": [{"position": {"coin": c, "szi": szi,
                                                  "leverage": {"value": 3}}}
                                    for c, szi in self.positions]}
 
@@ -251,7 +252,7 @@ async def test_reconcile_emits_synthetic_close_when_leader_flat(engine, session)
     assert e.source_ref == f"reconcile:{A}:BTC:1:{ms(now)}"
     assert e.observed_time == now and e.seq == 2 and e.size == Decimal("2")
     assert e.position_id == "BTC:1"
-    row = session.get(PaperEvent, e.source_ref)
+    row = session.get(PaperEvent, (A, e.source_ref))
     assert row.seq == 2 and row.json["via"] == "reconcile"
     assert session.get(Kv, f"hl:seq:{A}").value == "2"
     # priced by the model like any event

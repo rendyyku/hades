@@ -46,3 +46,28 @@ def test_unknown_state_rejected():
 def test_gap_is_leader_minus_paper():
     assert gap(Decimal("1000"), Decimal("650.5")) == Decimal("349.5")
     assert gap(Decimal("-10"), Decimal("5")) == Decimal("-15")
+
+
+# -- final review I1: no flapping ------------------------------------------------------
+
+@pytest.mark.parametrize("rolling", [ROLL_NET_BAD, ROLL_DD_BAD])
+def test_no_promotion_while_rolling_gate_fails(rolling):
+    # a wallet the rolling rule would demote at once is never promoted
+    assert next_ladder("PAPER", FULL_PASS, rolling) == "PAPER"
+
+
+def test_demote_then_rerun_stays_paper():
+    state = next_ladder("NOTIF", FULL_PASS, ROLL_NET_BAD)
+    assert state == "PAPER"
+    for _ in range(3):  # the next runs see the same gates
+        state = next_ladder(state, FULL_PASS, ROLL_NET_BAD)
+        assert state == "PAPER"
+
+
+def test_cooling_down_blocks_promotion_only():
+    assert next_ladder("PAPER", FULL_PASS, ROLL_OK, cooling_down=True) == "PAPER"
+    assert next_ladder("PAPER", FULL_PASS, ROLL_OK, cooling_down=False) == "NOTIF"
+    # a cool-down never delays a demotion and never demotes
+    assert next_ladder("NOTIF", FULL_PASS, ROLL_NET_BAD, cooling_down=True) == "PAPER"
+    assert next_ladder("NOTIF", FULL_FAIL, ROLL_OK, cooling_down=True) == "NOTIF"
+    assert next_ladder("COPY", FULL_PASS, ROLL_OK, cooling_down=True) == "COPY"

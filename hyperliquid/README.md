@@ -16,7 +16,10 @@ hades-hl paper-run --all              # one paper run, prints the summaries
 hades-hl serve                        # API on 127.0.0.1:8010 + background runtime (--no-api: runtime only)
 ```
 
-`HL_DATABASE_URL` selects the SQLite database (default `sqlite:///hades_hl.db`).
+`HL_DATABASE_URL` selects the SQLite database (default `sqlite:///hades_hl.db`). The
+default is relative to the working directory: run every command and `serve` from the
+same directory (`scripts/dev.sh` uses the repo root), or set an absolute path, or the
+CLI and the running head use two different databases.
 
 ## Operational notes
 
@@ -30,9 +33,10 @@ hades-hl serve                        # API on 127.0.0.1:8010 + background runti
   column was added later; old rows have it NULL, and a liquidation without a known
   victim is treated as this wallet's own liquidation. Re-backfilling the wallet (on a
   fresh DB, or after deleting its fills and `hl:cov:<address>`) restores it.
-- Fills are keyed by `(address, tid)`: HL gives both counterparties of a trade the same
-  `tid`. `init-db` (and every command) migrates an older `tid`-only table in place, in
-  one transaction.
+- Fills are keyed by `(address, tid)` and paper events by `(address, source_ref)`: HL
+  gives both counterparties of a trade the same `tid` and hash. `init-db` (and every
+  command) migrates an older `tid`-only / `source_ref`-only table in place, in one
+  transaction per table; a failure leaves the old table untouched.
 - Backfill fetches fills newest first and records the contiguous covered range in kv
   `hl:cov:<address>`; stats use only that range. Wallets with more than 10,000 fills
   in the window are capped (`history_partial`), keeping the newest 10,000. If the
@@ -59,10 +63,12 @@ hades-hl serve                        # API on 127.0.0.1:8010 + background runti
   31 s after it was observed: its model price (or `missed`) is stored in
   `paper_events` and never re-priced. Hourly marks are kept in `marks`, so the
   equity curve (marked every hour) does not change when raw prices are pruned. A
-  recovered fill more than 10 min old is copied as missed. Every follow with open paper
+  fill more than 10 min old when it is observed (after an outage; recovery and REST
+  polling alike) is stored as missed. Every follow with open paper
   positions is checked against `clearinghouseState` at most every 5 min; a copy the
   leader no longer holds gets a synthetic `reconcile:` close, unless an event of that
-  coin is still pending. Prices are recorded from `fastAssetCtxs` (falls back to
+  coin is still pending. A failed, empty, malformed or partial answer is "unknown" and
+  closes nothing; a HIP-3 coin (`dex:COIN`) is checked against that dex's own state. Prices are recorded from `fastAssetCtxs` (falls back to
   `allMids` after 3 failed connections): the watch set (BTC, ETH, coins the follows
   traded in 30 days, open paper positions) at most 1 row/s, every other perp coin at
   most every 5 s. A dead watcher or recorder is restarted. The fill watcher persists its

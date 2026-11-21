@@ -106,6 +106,19 @@ def item_weight(request_type: str, n_items: int) -> int:
     return n_items // per if per else 0
 
 
+def check_clearinghouse_state(state: Any) -> dict:
+    """``state`` if it is a complete ``clearinghouseState`` answer: an object with a
+    ``marginSummary`` object and an ``assetPositions`` list (a flat account has an
+    empty list, never a missing one). Anything else (``null``, ``{}``, an error
+    object, a truncated body) raises HLError: an unknown state must never read as
+    "no positions"."""
+    if not isinstance(state, dict):
+        raise HLError(f"info clearinghouseState: expected an object, got {type(state).__name__}")
+    if not isinstance(state.get("marginSummary"), dict)             or not isinstance(state.get("assetPositions"), list):
+        raise HLError("info clearinghouseState: no marginSummary / assetPositions")
+    return state
+
+
 SleepFn = Callable[[float], Awaitable[Any]]
 PageFn = Callable[[list[dict]], Any]
 ClockFn = Callable[[], float]
@@ -556,8 +569,15 @@ class HLClient:
                     coin, MAX_FUNDING_PAGES)
         return FundingPage(out, truncated=True)
 
-    async def clearinghouse_state(self, addr: str) -> dict:
-        return await self._info({"type": "clearinghouseState", "user": addr})
+    async def clearinghouse_state(self, addr: str, dex: str | None = None) -> dict:
+        """``clearinghouseState`` of ``addr``: the main perp dex, or the HIP-3 dex
+        ``dex`` (the default answer lists main-dex positions only; verified live
+        2026-11-22). Raises HLError unless the answer has the documented shape
+        (:func:`check_clearinghouse_state`): callers close paper positions on it."""
+        body: dict[str, Any] = {"type": "clearinghouseState", "user": addr}
+        if dex:
+            body["dex"] = dex
+        return check_clearinghouse_state(await self._info(body))
 
     async def all_mids(self) -> dict[str, Decimal]:
         raw = await self._info({"type": "allMids"})

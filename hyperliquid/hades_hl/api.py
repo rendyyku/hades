@@ -14,8 +14,11 @@ disabled. Served on 127.0.0.1:8010 by ``hades-hl serve``.
 - ``GET /api/follows``, ``POST/DELETE /api/follows/{address}``: manual follow (409 over
   the cap) and manual removal (remembered: never auto-followed again).
 - ``GET /api/paper/{address}``: the paper runtime's snapshot (T9): summary, fills,
-  equity curve, both gates with checks, ladder history, gap (P49), ``missed_count``,
-  plus ``median_delay_ms`` of the follow's observed events.
+  equity curve, both gates with checks, ladder history, ``ladder_cooldown_until`` (a
+  promotion held back after a demotion), gap (P49), ``missed_count``, plus
+  ``median_delay_ms`` of the follow's observed events. The last curve point and the
+  summary equity are the display-only "now" point (P54); the gates read persisted
+  points only.
 - ``GET /api/alerts?limit=`` and ``GET /api/stream`` (SSE): the contract ``Alert``
   shape. The stream polls the alerts table for rows newer than its start (so alerts
   written by the runtime, in this process or another, reach it) and sends a ``ping``
@@ -105,6 +108,8 @@ class PaperDetail(BaseModel):
     equity_curve: list[list[str]]
     gate: GateStatus | None
     ladder_history: list[LadderStep]
+    # set while a promotion is held back after a demotion (I1 hysteresis)
+    ladder_cooldown_until: datetime | None = None
     gap_usd: Decimal | None
     leader_realized_usd: Decimal | None
     missed_count: int
@@ -365,6 +370,7 @@ def paper(address: str, session: Session = Depends(get_session)) -> PaperDetail:
         winrate=snap.get("winrate") if n > 0 else None, n=n,
         fills=snap.get("fills") or [], open_positions=snap.get("open_positions") or [],
         equity_curve=snap.get("equity_curve") or [], gate=gate, ladder_history=history,
+        ladder_cooldown_until=snap.get("ladder_cooldown_until"),
         gap_usd=dec("gap_usd"), leader_realized_usd=dec("leader_realized_usd"),
         missed_count=int(snap.get("missed") or 0),
         median_delay_ms=median_delay_ms(session, addr, f.started_at),

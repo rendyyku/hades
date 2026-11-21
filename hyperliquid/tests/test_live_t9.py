@@ -148,7 +148,7 @@ async def test_restart_recovers_fills_made_while_down(engine):
     assert [(e.source_ref, e.side) for e in got] == [("0xh2:2", "close")]
     assert got[0].observed_time == clock.t  # the recovery response time
     with Session(engine) as s:
-        assert s.get(PaperEvent, "0xh2:2").json["via"] == "recovery"
+        assert s.get(PaperEvent, (A, "0xh2:2")).json["via"] == "recovery"
     assert (A, ms(t0) + 60_000) in c.calls
 
 

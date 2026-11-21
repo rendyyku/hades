@@ -119,7 +119,7 @@ def test_basic_rows(engine):
         w = s.get(Wallet, ADDR)
         assert w.is_vault is False and w.is_bot is False
         assert w.first_seen.tzinfo is not None
-        assert s.get(PaperEvent, "hl:1").observed_time.tzinfo is not None
+        assert s.get(PaperEvent, (ADDR, "hl:1")).observed_time.tzinfo is not None
 
 
 # -- I4: fills keyed by (address, tid) --------------------------------------------

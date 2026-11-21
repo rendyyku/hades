@@ -376,7 +376,7 @@ async def test_ingest_stores_and_emits_with_honest_delay(engine):
     assert got == evs and len(evs) == 1
     assert evs[0].observed_time == obs and evs[0].leader_time == T0 + timedelta(seconds=1)
     with Session(engine) as s:
-        row = s.get(PaperEvent, evs[0].source_ref)
+        row = s.get(PaperEvent, (A, evs[0].source_ref))
         assert row.delay_ms == 2000 and row.seq == evs[0].seq and row.address == A
         assert event_from_json(row.json) == evs[0]
         assert s.scalar(select(Fill.tid).where(Fill.address == A)) == 1
@@ -461,7 +461,7 @@ async def test_ws_live_fill_emitted_snapshot_suppressed(engine):
     assert [e.source_ref for e in got] == [f"0xh31:31"]
     with Session(engine) as s:
         assert set(s.scalars(select(Fill.tid))) == {30, 31}
-        row = s.get(PaperEvent, "0xh31:31")
+        row = s.get(PaperEvent, (A, "0xh31:31"))
         assert 0 <= row.delay_ms < 5000
 
 
@@ -499,7 +499,7 @@ async def test_reconnect_backfill_observed_is_reconnect_time(engine):
     # backfill asked REST from the last seen fill time (here: the watcher start)
     assert (A, ms(start)) in client.calls
     with Session(engine) as s:
-        row = s.get(PaperEvent, "0xh40:40")
+        row = s.get(PaperEvent, (A, "0xh40:40"))
         assert row.delay_ms == ms(e.observed_time) - gap_fill["time"]
         assert row.json["via"] == "recovery"
 
@@ -527,7 +527,7 @@ async def test_polling_fallback_beyond_subscription_cap(engine):
     assert users == set(addrs[:10])  # never more than 10 users on WS
     assert got[0].wallet == polled and got[0].direction == "short"
     with Session(engine) as s:
-        assert s.get(PaperEvent, got[0].source_ref).json["via"] == "poll"
+        assert s.get(PaperEvent, (polled, got[0].source_ref)).json["via"] == "poll"
 
 
 def test_poll_interval_respects_weight_budget(engine):
@@ -599,7 +599,7 @@ async def test_recovery_failure_keeps_floor_and_emits_gap_later(engine):
     assert A not in w.recovery_floor_ms
     assert w.last_seen_ms[A] == ms(start) + 120_000
     with Session(engine) as s:
-        row = s.get(PaperEvent, "0xh40:40")
+        row = s.get(PaperEvent, (A, "0xh40:40"))
         assert row.json["via"] == "recovery"
     # no chain gap: tid 40 opens, tid 41 increases the same episode
     e40 = next(e for e in w.events if e.source_ref.endswith(":40"))
@@ -887,7 +887,7 @@ async def test_held_live_fills_released_when_recovery_finds_no_gap(engine):
     assert A not in w.recovery_floor_ms
     assert w.last_seen_ms[A] == ms(start) + 60_000
     with Session(engine) as s:
-        assert s.get(PaperEvent, "0xh110:110").json["via"] == "ws:held"
+        assert s.get(PaperEvent, (A, "0xh110:110")).json["via"] == "ws:held"
 
 
 async def test_held_poll_fills_also_buffered(engine):

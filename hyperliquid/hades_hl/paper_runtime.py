@@ -11,13 +11,22 @@
   wait for the next run. Stale recovered fills (P47) arrive already settled as missed.
 - hourly marks (P48/P52): for every hour with a recorded price, the mark (latest mid at
   or before the hour, at most ``MARK_MAX_AGE_S`` old) is persisted in ``marks`` BEFORE
-  the raw prices are pruned (2 days). simulate (core) gets ``mark_times`` = every hour
-  in ``[follow_start, now)`` plus ``now``; the hourly points read ``marks``, the final
-  ``now`` point the live recorded price. So the curve shows unrealized drawdown between
-  events and a re-run after pruning gives the same history.
+  the raw prices are pruned (2 days). simulate (core) gets ``mark_times`` = every final
+  hour in ``[follow_start, now)``, read from ``marks``. So the curve shows unrealized
+  drawdown between events and a re-run after pruning gives the same history.
+- the "now" point (P54) is display-only: simulate's ``display_time`` = ``now`` reads the
+  live recorded price WITHOUT liquidating, charging or adding history. The snapshot
+  shows it as the last curve point and as the headline equity / net PnL. Liquidation,
+  closed trades, fills, both gates, ``max_dd`` and so the ladder read the persisted
+  history only (events and hourly marks), so they can lag the headline by up to an
+  hour, and no run can produce a result a later run would not reproduce.
 - gates: the default (HL) gate in full, and the rolling 28-day gate; then
   ``next_ladder``. A change updates the follow, writes ``ladder_history`` with the gate
-  snapshot, and alerts.
+  snapshot, and alerts. No flapping (final review I1): a promotion needs the full gate
+  AND a passing rolling gate, a demotion happens when the rolling gate fails, and after
+  a demotion no promotion for ``REPROMOTE_COOLDOWN`` (24 h; the snapshot's
+  ``ladder_cooldown_until``), so a rolling net hovering around zero cannot flip the
+  ladder every run.
 - a JSON snapshot (kv ``hl:paper:{addr}``) for the API: the :class:`PaperSummary`, open
   positions, winrate with n, both gates, a downsampled equity curve, the latest fills,
   and the gap (P49): ``gap_usd`` = per copied and closed position, the leader's
@@ -33,8 +42,11 @@ cached (``FundingRates.ensure``, ruling P43), so the simulator charges funding.
 event is persisted: ``source_ref = reconcile:{addr}:{position_id}:{ts_ms}``,
 ``observed_time = now``, ``seq`` from the persisted counter; the model prices it like
 any event. A coin is skipped while any of its events is unsettled or newer than the
-snapshot (I2: a live close may be on its way). :class:`Reconciler` limits it to once
-per 5 min per wallet.
+snapshot (I2: a live close may be on its way). An answer that is failed, empty,
+malformed or partial is "unknown", never "flat": nothing is closed (final review I4).
+A HIP-3 coin (``dex:COIN``) is checked against that dex's own state, since the default
+state lists main-dex positions only. :class:`Reconciler` limits it to once per 5 min
+per wallet.
 
 Callers commit (``reconcile``: before their next ``await``, so no other writer can
 take a ``seq`` in between).
@@ -57,6 +69,7 @@ from hades_core.gate import DEFAULT_GATE, GateConfig, GateResult, evaluate_gate,
 from hades_core.ladder import gap, next_ladder
 from hades_core.paper import PaperConfig, PaperResult, simulate
 from hades_hl import alerts, pipeline
+from hades_hl.client import check_clearinghouse_state
 from hades_hl.db import Fill, Follow, LadderHistory, Mark, PaperEvent, Price, _insert_ignore
 from hades_hl.follows import KV_FOLLOW_SEQ, KV_PAPER
 from hades_hl.live import (
@@ -73,6 +86,8 @@ log = logging.getLogger(__name__)
 
 GATE: GateConfig = DEFAULT_GATE  # spec 12b: Hyperliquid keeps the default gate
 ROLLING_DAYS = 28
+# I1 hysteresis: after a demotion, no promotion for this long (see next_ladder)
+REPROMOTE_COOLDOWN = timedelta(hours=24)
 SETTLE_S = PRICE_WINDOW_S + 1  # P52: settled once its price window is over (31 s)
 MARK_MAX_AGE_S = 900  # a mark older than 15 min is not used
 PRICE_KEEP_DAYS = 2  # P52: raw prices are pruned after 2 days (marks are kept)
@@ -235,7 +250,8 @@ class Marks:
 
     - At a final hour boundary ``h`` (``h <= now - MARK_FINAL_S``): the persisted hourly
       mark of ``h`` (or None).
-    - At ``now``: the live recorded price (the display-only final point, P54).
+    - At ``now``: the live recorded price. Only simulate's ``display_time`` asks for
+      it (the display-only final point, P54); ``now`` is never a mark time.
     - Any other time (event times): None, so the simulator keeps each market's last
       known price - the fill price or a mark at/after it. A persisted mark is never
       re-applied after its own hour (N1: it can predate a fresher fill).
@@ -263,11 +279,12 @@ class Marks:
 
     def times(self, start: datetime) -> list[datetime]:
         """Final hour boundaries strictly after ``start`` (the start point is the
-        simulator's own), then ``now``. An hour less than ``MARK_FINAL_S`` old is not a
-        point yet, so a run never shows an unmarked point a later run would re-mark."""
+        simulator's own). An hour less than ``MARK_FINAL_S`` old is not a point yet, so
+        a run never shows an unmarked point a later run would re-mark. ``now`` is not
+        a mark time (P54): a mark can liquidate, the display point must not."""
         first = _ms(start) // HOUR_MS * HOUR_MS + HOUR_MS
         hours = range(first, min(self.final_ms, _ms(self.now) - 1) + 1, HOUR_MS)
-        return [_dt(h) for h in hours] + [self.now]
+        return [_dt(h) for h in hours]
 
 
 def _leader_cpnl(session: Session, addr: str, r: PaperEvent) -> Decimal:
@@ -376,6 +393,20 @@ def needs_run(session: Session, addr: str, now: datetime) -> bool:
         PaperEvent.observed_time <= now - timedelta(seconds=SETTLE_S))))
 
 
+def cooldown_until(session: Session, addr: str) -> datetime | None:
+    """I1 hysteresis: the end of the promotion cool-down, ``REPROMOTE_COOLDOWN`` after
+    ``addr``'s latest demotion (a ``ladder_history`` row NOTIF/COPY -> PAPER); None if
+    it was never demoted."""
+    at = session.scalar(select(func.max(LadderHistory.at)).where(
+        LadderHistory.address == addr, LadderHistory.to == "PAPER",
+        LadderHistory.from_.in_(("NOTIF", "COPY"))))
+    if at is None:
+        return None
+    if at.tzinfo is None:  # func.max bypasses the UTCDateTime result processing
+        at = at.replace(tzinfo=timezone.utc)
+    return at + REPROMOTE_COOLDOWN
+
+
 def follow_seq(session: Session, addr: str) -> int:
     """The alert watermark (P51): the wallet's event seq when the follow started."""
     v = pipeline.kv_get_json(session, KV_FOLLOW_SEQ.format(addr))
@@ -411,13 +442,19 @@ def run_paper(session: Session, addr: str, now: datetime, *,
     events = list(by_ref.values())
     settled = {r.source_ref: (None if r.missed else r.fill_price) for r in rows}
     marks = Marks(session, coins, f.started_at, now)
+    # P54: ``now`` is the display point, never a mark time: it cannot liquidate and is
+    # not in ``res.equity_curve``, so the gates below read persisted history only
     res: PaperResult = simulate(events, SettledModel(model, settled), cfg, f.started_at,
-                                marks, mark_times=marks.times(f.started_at))
+                                marks, mark_times=marks.times(f.started_at),
+                                display_time=now)
 
     full = evaluate_gate(res, f.started_at, now, gate)
     rolling = evaluate_rolling(res, now, gate, ROLLING_DAYS)
     current = f.ladder or "PAPER"
-    new = next_ladder(current, full, rolling)  # type: ignore[arg-type]
+    # I1 hysteresis: no promotion while cooling down after a demotion
+    cool = cooldown_until(session, addr) if current == "PAPER" else None
+    cooling = cool is not None and now < cool
+    new = next_ladder(current, full, rolling, cooling_down=cooling)  # type: ignore[arg-type]
     gate_snap = {"full": _gate_dict(full), "rolling": _gate_dict(rolling),
                  "config": gate_config(gate)}
     change = None
@@ -440,6 +477,8 @@ def run_paper(session: Session, addr: str, now: datetime, *,
     alerts.emit_alerts(session, addr, new_events, change, ladder=current, now=now)
 
     curve = [(t, eq) for t, eq in res.equity_curve if t <= now]
+    if res.display_point is not None and (not curve or res.display_point[0] > curve[-1][0]):
+        curve.append(res.display_point)  # shown, never stored as history (P54)
     equity = curve[-1][1] if curve else cfg.bankroll
     net = equity - cfg.bankroll
     closed = [c for c in res.closed_trades if c.closed_at <= now]
@@ -467,6 +506,7 @@ def run_paper(session: Session, addr: str, now: datetime, *,
         "n": len(closed),
         "gate": _gate_dict(full),
         "rolling": _gate_dict(rolling),
+        "ladder_cooldown_until": cool.isoformat() if cooling and cool is not None else None,
         "gap_usd": str(gap_usd),
         "leader_realized_usd": str(lead),
         "equity_curve": _downsample(curve, CURVE_MAX_POINTS),
@@ -508,18 +548,55 @@ async def run_paper_live(session: Session, client: Any, addr: str, now: datetime
 
 # -- P11 reconcile ---------------------------------------------------------------------
 
-def _leader_positions(state: Any) -> dict[str, Decimal]:
+def _leader_positions(state: Any) -> dict[str, Decimal] | None:
+    """``{coin: signed size}`` of a COMPLETE ``clearinghouseState`` answer, else None
+    (unknown; final review I4). Unknown: not the documented shape, any position entry
+    without a coin or a parseable size, or no positions at all while the margin
+    summary still reports a position notional (a partial answer)."""
+    try:
+        state = check_clearinghouse_state(state)
+    except Exception:
+        return None
     out: dict[str, Decimal] = {}
-    for ap in (state or {}).get("assetPositions") or []:
-        pos = (ap or {}).get("position") or {}
-        coin, szi = pos.get("coin"), pos.get("szi")
-        if coin is None or szi is None:
-            continue
+    for ap in state["assetPositions"]:
+        pos = ap.get("position") if isinstance(ap, dict) else None
+        coin, szi = (pos.get("coin"), pos.get("szi")) if isinstance(pos, dict) else (None, None)
+        if not isinstance(coin, str) or szi is None:
+            return None
         try:
-            out[str(coin)] = Decimal(str(szi))
+            out[coin] = Decimal(str(szi))
         except Exception:
-            continue
+            return None
+    if not out:
+        try:
+            ntl = Decimal(str(state["marginSummary"].get("totalNtlPos") or "0"))
+        except Exception:
+            return None
+        if ntl != 0:
+            return None
     return out
+
+
+def _dex(coin: str) -> str | None:
+    """The HIP-3 dex of ``dex:COIN``; None for a main-dex coin."""
+    return coin.split(":", 1)[0] if ":" in coin else None
+
+
+async def _leader_state(client: Any, addr: str, dex: str | None) -> dict[str, Decimal] | None:
+    """The leader's positions on one dex, or None when unknown (logged)."""
+    try:
+        state = await (client.clearinghouse_state(addr) if dex is None
+                       else client.clearinghouse_state(addr, dex=dex))
+    except Exception as e:
+        log.warning("hl reconcile %s: clearinghouseState%s failed (%s: %s); skipped", addr,
+                    "" if dex is None else f" (dex {dex})", type(e).__name__, e)
+        return None
+    leader = _leader_positions(state)
+    if leader is None:
+        log.warning("hl reconcile %s: clearinghouseState%s is empty, malformed or partial; "
+                    "treated as unknown, nothing closed", addr,
+                    "" if dex is None else f" (dex {dex})")
+    return leader
 
 
 def _busy_coins(session: Session, addr: str, last_seq: int) -> set[str]:
@@ -539,7 +616,8 @@ async def reconcile(session: Session, client: Any, addr: str, now: datetime, *,
                     pending: Pending | None = None) -> list[TradeEvent]:
     """P11: emit a synthetic close for every open paper position whose leader is flat
     (or flipped) in that coin per ``clearinghouseState``. Skipped while the watcher
-    has a pending recovery for ``addr`` (``pending``): the missing fills are coming."""
+    has a pending recovery for ``addr`` (``pending``): the missing fills are coming.
+    Never closes on a failed, empty, malformed or partial answer (I4)."""
     snap = snapshot(session, addr)
     opens = (snap or {}).get("open_positions") or []
     if not opens or (pending is not None and pending(addr)):
@@ -548,20 +626,23 @@ async def reconcile(session: Session, client: Any, addr: str, now: datetime, *,
     todo = [p for p in opens if p["market_id"] not in busy]
     if not todo:
         return []
-    try:
-        state = await client.clearinghouse_state(addr)
-    except Exception as e:
-        log.warning("hl reconcile %s: clearinghouseState failed (%s: %s)", addr,
-                    type(e).__name__, e)
+    # one state per dex involved (main dex: None); an unknown state closes nothing
+    leaders: dict[str | None, dict[str, Decimal] | None] = {}
+    for dex in sorted({_dex(p["market_id"]) for p in todo}, key=lambda d: d or ""):
+        leaders[dex] = await _leader_state(client, addr, dex)
+    # an event that arrived during the calls above makes its coin busy (I2)
+    busy = _busy_coins(session, addr, int(snap.get("last_seq") or 0))
+    todo = [p for p in todo if leaders[_dex(p["market_id"])] is not None
+            and p["market_id"] not in busy]
+    if not todo:
         return []
-    leader = _leader_positions(state)
     # no await below: the seq counter is read and bumped atomically w.r.t. the watcher
     key = KV_SEQ.format(addr)
     seq = int(pipeline.kv_get_json(session, key) or 0)
     prices = RecordedPrices(session)
     out: list[TradeEvent] = []
     for p in todo:
-        szi = leader.get(p["market_id"], ZERO)
+        szi = leaders[_dex(p["market_id"])].get(p["market_id"], ZERO)  # type: ignore[union-attr]
         holds = (szi > 0 and p["direction"] == "long") or (szi < 0 and p["direction"] == "short")
         if holds:
             continue

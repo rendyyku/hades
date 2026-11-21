@@ -527,3 +527,44 @@ def test_mark_times_before_follow_ignored_and_none_unchanged():
     assert base.fills == same.fills and base.closed_trades == same.closed_trades
     early = simulate(events, model, CFG, FOLLOW, mark_times=[T0 - timedelta(hours=1)])
     assert early.equity_curve == base.equity_curve
+
+
+# -- final review I3 / P54: the display-only point never liquidates ---------------------
+
+def test_display_point_never_liquidates_or_enters_history():
+    events = [ev("o", "open", 1, leverage="10")]
+    model = FakeModel({"o": Decimal("100")})
+    m1, now = T0 + timedelta(minutes=30), T0 + timedelta(minutes=90)
+    px = {m1: Decimal("97"), now: Decimal("85")}  # 85 is past the liquidation level
+
+    def mark(m, t):
+        return px.get(t)
+
+    res = simulate(events, model, CFG, FOLLOW, mark=mark, mark_times=[m1], display_time=now)
+    # shown at the capped loss (margin 500), but the copy is still open
+    assert res.display_point == (now, Decimal("9500"))
+    assert list(res.open_positions) == ["p1"] and res.closed_trades == []
+    assert not any(f.ev_ref.startswith("liquidation") for f in res.fills)
+    assert res.equity_curve[-1] == (m1, Decimal("9850"))  # history ends at the last mark
+    assert now not in dict(res.equity_curve)
+    # the same history as a run without the display point
+    plain = simulate(events, model, CFG, FOLLOW, mark=mark, mark_times=[m1])
+    assert plain.display_point is None
+    assert (plain.equity_curve, plain.fills, plain.closed_trades, plain.open_positions) == (
+        res.equity_curve, res.fills, res.closed_trades, res.open_positions)
+
+
+def test_display_point_uses_last_price_without_a_mark_and_counts_holding_cost():
+    events = [ev("o", "open", 0)]
+    model = HourlyCostModel({"o": Decimal("100")}, rate=Decimal("5"))
+    now = T0 + timedelta(hours=2, seconds=1)
+    res = simulate(events, model, CFG, FOLLOW, display_time=now)
+    # 2 h held since the open at T0 + 1 s, at 5 per hour, not yet charged to the book
+    assert res.display_point == (now, Decimal("10000") - Decimal("10"))
+    again = simulate(events, model, CFG, FOLLOW, display_time=now)
+    assert again.display_point == res.display_point  # pure: nothing accrued by the display
+
+
+def test_display_point_before_follow_is_ignored():
+    res = simulate([], FakeModel({}), CFG, FOLLOW, display_time=T0 - timedelta(hours=1))
+    assert res.display_point is None
