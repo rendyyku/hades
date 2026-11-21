@@ -287,7 +287,7 @@ def probe_verdict(addr: str, sample: list[dict], now: datetime,
     - ``n<30`` (ruling P62): fewer than MIN_CLOSED_POSITIONS closed positions in the
       last SCORE_WINDOW_DAYS days, i.e. rescore would leave it unscored. The count
       (``closed_30d``) is the scoring stat itself: ``wallet_stats(...)['n']`` over the
-      sample with the rescore window. It only rejects when the sample covers that
+      sample's fills inside the rescore window. It only rejects when the sample covers that
       window (``closed_window_complete``): fewer than PROBE_SAMPLE_CAP fills (the
       whole history) or an oldest fill >= 30 days back. A capped sample spanning
       less than the window is undecided and passes (>= 30 is decisive either way,
@@ -319,10 +319,10 @@ def probe_verdict(addr: str, sample: list[dict], now: datetime,
             oldest_fill_time=oldest_dt, sz_decimals=sz_decimals)
         res.update(median_fills_per_day=st["median_fills_per_day"],
                    median_hold_s=st["median_hold_s"], maker_share=st["maker_share"])
-        scored = wallet_stats(  # the stat rescore thresholds on, over its window
-            addr, sample, [], now, SCORE_WINDOW_DAYS, history_partial=not complete,
-            oldest_fill_time=oldest_dt, sz_decimals=sz_decimals)
-        res.update(closed_30d=scored["n"], closed_window_complete=complete)
+        if oldest < now_ms - SCORE_WINDOW_DAYS * DAY_MS:  # sample reaches past the window:
+            st = wallet_stats(  # recount over the rescore window only
+                addr, sample, [], now, SCORE_WINDOW_DAYS, sz_decimals=sz_decimals)
+        res.update(closed_30d=st["n"], closed_window_complete=complete)
     except Exception as e:  # noqa: BLE001 - odd sample: fall back to fills/day + maker
         log.warning("probe %s: stats over the sample failed (%s); using fills/day and "
                     "maker share only", addr, type(e).__name__)
