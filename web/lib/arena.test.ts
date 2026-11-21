@@ -5,6 +5,8 @@ import {
   followsToEntries,
   formatDelayMs,
   gateRows,
+  readPaperFills,
+  readPaperPositions,
   sparklinePath,
   type ArenaEntry,
   type GateConfig,
@@ -83,6 +85,14 @@ describe("followsToEntries", () => {
 
   it("returns [] for a non-array body", () => {
     expect(followsToEntries({ detail: "x" })).toEqual([]);
+  });
+
+  it("takes the ladder from the follow row (authoritative), not the older snapshot", () => {
+    const out = followsToEntries([
+      { address: A, origin: "auto", ladder: "NOTIF", summary: entry(A, "5", { ladder: "PAPER" }), sparkline: [] },
+      { address: B, origin: "auto", ladder: null, summary: entry(B, "1", { ladder: "PAPER" }), sparkline: [] },
+    ]);
+    expect(out.map((e) => e.ladder)).toEqual(["NOTIF", "PAPER"]);
   });
 });
 
@@ -175,5 +185,55 @@ describe("formatDelayMs", () => {
     expect(formatDelayMs(2400)).toBe("2.4 s");
     expect(formatDelayMs(185_000)).toBe("3m 5s");
     expect(formatDelayMs(null)).toBe("—");
+  });
+});
+
+const HASH = "0x" + "9f".repeat(32);
+
+describe("readPaperFills", () => {
+  const raw = [
+    { ref: `${HASH}:11`, market_id: "BTC", side: "open", direction: "long", size: "0.05", price: "100000.5", fee: "2.25", realized_pnl: "0", missed: false, position_id: "BTC:1", at: "2026-11-20T10:00:00+00:00" },
+    { ref: `${HASH}:12:close`, market_id: "ETH", side: "close", direction: "short", size: "0", price: null, fee: "0", realized_pnl: "0", missed: true, position_id: "ETH:3", at: "2026-11-20T11:00:00+00:00" },
+    { ref: `liquidation:mark:2026-11-20T12:00:00+00:00`, market_id: "BTC", side: "close", direction: "long", size: "0.05", price: "90000", fee: "0", realized_pnl: "-500", missed: false, position_id: "BTC:1", at: "2026-11-20T12:00:00+00:00" },
+    { ref: `reconcile:${A}:SOL:2:1795000000000`, market_id: "SOL", side: "close", direction: "long", size: "3", price: "150", fee: "0.2", realized_pnl: "12.5", missed: false, position_id: "SOL:2", at: "2026-11-20T13:00:00+00:00" },
+    "junk",
+    { market_id: "BTC" },
+  ];
+
+  it("reads the snapshot fills newest first, with numbers parsed and junk dropped", () => {
+    const rows = readPaperFills(raw);
+    expect(rows.map((r) => r.coin)).toEqual(["SOL", "BTC", "ETH", "BTC"]);
+    expect(rows[3]).toMatchObject({ side: "open", direction: "long", size: 0.05, price: 100000.5, fee: 2.25, realizedPnl: 0, missed: false, positionId: "BTC:1" });
+  });
+
+  it("traces a leader fill to its transaction hash, flip suffix or not", () => {
+    const rows = readPaperFills(raw);
+    expect(rows[3]).toMatchObject({ source: "fill", hash: HASH });
+    expect(rows[2]).toMatchObject({ source: "fill", hash: HASH, missed: true, price: null });
+  });
+
+  it("labels our own liquidation and a reconcile close: neither is a leader transaction", () => {
+    const rows = readPaperFills(raw);
+    expect(rows[1]).toMatchObject({ source: "liquidation", hash: null, realizedPnl: -500 });
+    expect(rows[0]).toMatchObject({ source: "reconcile", hash: null, realizedPnl: 12.5 });
+  });
+
+  it("returns [] for a non-array", () => {
+    expect(readPaperFills(null)).toEqual([]);
+    expect(readPaperFills({})).toEqual([]);
+  });
+});
+
+describe("readPaperPositions", () => {
+  it("reads open paper positions and drops junk", () => {
+    const rows = readPaperPositions([
+      { position_id: "BTC:4", market_id: "BTC", direction: "short", qty: "0.05", entry_price: "100000", margin: "500", leverage: "10", leader_size: "2.5" },
+      null,
+      { market_id: 3 },
+    ]);
+    expect(rows).toEqual([
+      { positionId: "BTC:4", coin: "BTC", direction: "short", qty: 0.05, entryPrice: 100000, margin: 500, leverage: 10, leaderSize: 2.5 },
+    ]);
+    expect(readPaperPositions(undefined)).toEqual([]);
   });
 });

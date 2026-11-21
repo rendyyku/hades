@@ -15,6 +15,8 @@ build/
 core/uv.lock
 hyperliquid/uv.lock
 .superpowers/
+# smoke databases and logs
+scratch/
 # Archify receipts and review scratch (the diagram JSON + HTML are committed)
 .archify/
 review-*/

@@ -3,11 +3,13 @@ import { notFound } from "next/navigation";
 import { FollowButton } from "@/components/FollowButton";
 import { HeadOffline } from "@/components/HeadOffline";
 import { HlAddress } from "@/components/HlAddress";
+import { PaperFollowCard } from "@/components/PaperFollowCard";
 import { PnlChart } from "@/components/PnlChart";
 import { Section } from "@/components/Section";
 import { StatCard } from "@/components/StatCard";
 import { TagBadge } from "@/components/TagBadge";
 import { UsdPnl } from "@/components/UsdPnl";
+import type { PaperDetail } from "@/lib/arena";
 import { formatDuration, formatPct, formatScore, formatUsd, formatWinrate, relTime, shortAddr } from "@/lib/format";
 import { headFetch } from "@/lib/headProxy";
 import { getHead } from "@/lib/heads";
@@ -99,6 +101,9 @@ export default async function HlWalletPage({ params }: { params: Params }) {
   const liq = num(extra.liquidations);
   const holdS = num(extra.median_hold_s);
   const maxDd = num(extra.max_dd);
+  // A wallet we follow (or followed): what our paper copy captured, next to its own stats.
+  const paperRes = follow ? await headFetch<PaperDetail>("hyperliquid", `/api/paper/${address}`) : null;
+  const paper = paperRes?.ok && paperRes.data && typeof paperRes.data === "object" ? paperRes.data : null;
 
   return (
     <div className="flex flex-col gap-14 pt-14 sm:gap-16 sm:pt-20">
@@ -153,7 +158,13 @@ export default async function HlWalletPage({ params }: { params: Params }) {
             <PnlChart curve={hlCurve(extra.pnl_curve)} unit="usd" />
           </Section>
 
-          <Section index="#3" title="Tartarus · Tags">
+          {follow ? (
+            <Section index="#3" title="Our paper copy">
+              <PaperFollowCard address={address} follow={follow} paper={paper} />
+            </Section>
+          ) : null}
+
+          <Section index={follow ? "#4" : "#3"} title="Tartarus · Tags">
             {tags.length === 0 ? (
               <p className="rounded-lg border border-border bg-surface p-5 text-sm text-muted">
                 No insider tags for this wallet.

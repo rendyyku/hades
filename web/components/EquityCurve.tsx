@@ -90,7 +90,7 @@ export function EquityCurve({ curve }: { curve: PnlPoint[] }) {
     <figure aria-labelledby={captionId} className="m-0 rounded-lg border border-border bg-surface p-3 sm:p-4">
       <figcaption id={captionId} className="mb-2 text-xs text-muted">
         Paper equity over {points.length} {points.length === 1 ? "point" : "points"}, from{" "}
-        {formatUsd(first, { signed: false })} to {formatUsd(last, { signed: false })}; drawdown shaded below (worst{" "}
+        {formatUsd(first, { signed: false })} to {formatUsd(last, { signed: false })}; drawdown shaded below (worst of the plotted points{" "}
         {formatPct(worst / 100)}). The last point is the live mark (display only).
       </figcaption>
       <div ref={ref} className="w-full font-mono" style={{ height: CHART_HEIGHT_PX }} />

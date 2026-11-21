@@ -126,7 +126,9 @@ export function followsToEntries(data: unknown): ArenaEntry[] {
     const origin = typeof f.origin === "string" ? f.origin : "manual";
     const sparkline = Array.isArray(f.sparkline) ? f.sparkline : [];
     if (s) {
-      out.push({ ...(s as unknown as PaperSummary), address: f.address, origin, sparkline });
+      // The follow row's ladder is authoritative; the summary is the last snapshot's.
+      const ladder = typeof f.ladder === "string" ? f.ladder : (s as unknown as PaperSummary).ladder;
+      out.push({ ...(s as unknown as PaperSummary), ladder, address: f.address, origin, sparkline });
     } else {
       out.push({
         address: f.address,
@@ -257,9 +259,15 @@ export interface PaperDetail {
   summary: PaperSummary | null;
   winrate: number | null;
   n: number;
+  /** The latest paper fills (paper_runtime `_fill_json`); read with readPaperFills. */
+  fills?: unknown;
+  /** Our open paper positions; read with readPaperPositions. */
+  open_positions?: unknown;
   equity_curve: unknown;
   gate: GateStatus | null;
   ladder_history: LadderStep[];
+  /** ISO time until which a promotion is held back after a demotion; null otherwise. */
+  ladder_cooldown_until?: string | null;
   gap_usd: Dec;
   /** The leader's own realized PnL, raw (P49): shown separately from the gap. */
   leader_realized_usd: Dec;
@@ -274,6 +282,98 @@ export function formatDelayMs(ms: number | null | undefined): string {
   if (ms < 1000) return `${Math.round(ms)} ms`;
   if (ms < 60_000) return `${(ms / 1000).toFixed(1)} s`;
   return formatDuration(ms / 1000);
+}
+
+// -- paper fills and open positions -------------------------------------------------------
+
+/** The head keeps the latest 200 fills in the snapshot (paper_runtime FILLS_KEEP). */
+export const PAPER_FILLS_KEEP = 200;
+
+export interface PaperFillRow {
+  ref: string;
+  /**
+   * "fill": a copy of a leader fill (`hash:tid[:open|:close]`); "liquidation": our own
+   * simulated liquidation; "reconcile": a synthetic close (the leader was flat, P11).
+   */
+  source: "fill" | "liquidation" | "reconcile";
+  /** The leader's transaction hash, when the ref carries one. */
+  hash: string | null;
+  coin: string;
+  side: string;
+  direction: string;
+  /** Our size (0 when missed). */
+  size: number | null;
+  /** Our modelled fill price; null when the event was missed. */
+  price: number | null;
+  fee: number | null;
+  realizedPnl: number | null;
+  missed: boolean;
+  positionId: string | null;
+  at: string | null;
+}
+
+const TX_HASH = /^0x[0-9a-fA-F]{64}$/;
+const text = (v: unknown) => (typeof v === "string" ? v : null);
+
+/** `fills` of GET /api/paper/{address}, newest first. Every row traces to its `ref`. */
+export function readPaperFills(v: unknown): PaperFillRow[] {
+  if (!Array.isArray(v)) return [];
+  const out: PaperFillRow[] = [];
+  for (const raw of v) {
+    const f = obj(raw);
+    if (!f || typeof f.ref !== "string" || typeof f.market_id !== "string") continue;
+    const source = f.ref.startsWith("liquidation:") ? "liquidation" : f.ref.startsWith("reconcile:") ? "reconcile" : "fill";
+    const head = f.ref.split(":")[0];
+    out.push({
+      ref: f.ref,
+      source,
+      hash: source === "fill" && TX_HASH.test(head) ? head : null,
+      coin: f.market_id,
+      side: text(f.side) ?? "",
+      direction: text(f.direction) ?? "",
+      size: num(f.size),
+      price: num(f.price),
+      fee: num(f.fee),
+      realizedPnl: num(f.realized_pnl),
+      missed: f.missed === true,
+      positionId: text(f.position_id),
+      at: text(f.at),
+    });
+  }
+  return out.reverse();
+}
+
+export interface PaperPositionRow {
+  positionId: string;
+  coin: string;
+  direction: string;
+  qty: number | null;
+  entryPrice: number | null;
+  margin: number | null;
+  leverage: number | null;
+  /** The leader's size in this position (their units), for scale. */
+  leaderSize: number | null;
+}
+
+/** `open_positions` of GET /api/paper/{address}. */
+export function readPaperPositions(v: unknown): PaperPositionRow[] {
+  if (!Array.isArray(v)) return [];
+  const out: PaperPositionRow[] = [];
+  for (const raw of v) {
+    const p = obj(raw);
+    if (!p || typeof p.market_id !== "string") continue;
+    out.push({
+      positionId: text(p.position_id) ?? p.market_id,
+      coin: p.market_id,
+      direction: text(p.direction) ?? "",
+      qty: num(p.qty),
+      entryPrice: num(p.entry_price),
+      margin: num(p.margin),
+      leverage: num(p.leverage),
+      leaderSize: num(p.leader_size),
+    });
+  }
+  return out;
 }
 
 // -- equity curve -----------------------------------------------------------------------

@@ -5,10 +5,19 @@ import { HeadLabel } from "@/components/HeadLabel";
 import { HeadOffline } from "@/components/HeadOffline";
 import { HlAddress } from "@/components/HlAddress";
 import { LadderBadge } from "@/components/LadderBadge";
+import { PaperFillsTable } from "@/components/PaperFillsTable";
+import { PaperPositionsTable } from "@/components/PaperPositionsTable";
 import { Section } from "@/components/Section";
 import { StatCard } from "@/components/StatCard";
 import { UsdPnl } from "@/components/UsdPnl";
-import { ARENA_MIN_CLOSED, equityPoints, formatDelayMs, type PaperDetail } from "@/lib/arena";
+import {
+  ARENA_MIN_CLOSED,
+  equityPoints,
+  formatDelayMs,
+  readPaperFills,
+  readPaperPositions,
+  type PaperDetail,
+} from "@/lib/arena";
 import { formatPct, formatUsd, formatWinrate, relTime, shortAddr } from "@/lib/format";
 import { headFetch } from "@/lib/headProxy";
 import { getHead, isHeadId } from "@/lib/heads";
@@ -95,6 +104,17 @@ export default async function PaperDetailPage({ params }: { params: Params }) {
 
           <Section index="#3" title="Gate">
             <GateChecklist gate={d.gate ?? null} />
+            <p className="mt-4 text-sm text-muted">
+              The gates read the persisted points only (events and hourly marks). The headline equity and the last
+              curve point include the live mark, which is display-only, so they can differ by up to an hour.
+            </p>
+            {d.ladder_cooldown_until ? (
+              <p className="mt-2 text-sm text-muted">
+                Promotion cool-down: this wallet was demoted recently, so it cannot be promoted before{" "}
+                <time dateTime={d.ladder_cooldown_until}>{d.ladder_cooldown_until.replace("T", " ").slice(0, 16)} UTC</time>
+                , even if both gates pass.
+              </p>
+            ) : null}
           </Section>
 
           <Section index="#4" title="Leader vs paper">
@@ -112,7 +132,15 @@ export default async function PaperDetailPage({ params }: { params: Params }) {
             ) : null}
           </Section>
 
-          <Section index="#5" title="Ladder history">
+          <Section index="#5" title="Open paper positions">
+            <PaperPositionsTable positions={readPaperPositions(d.open_positions)} />
+          </Section>
+
+          <Section index="#6" title="Paper fills">
+            <PaperFillsTable fills={readPaperFills(d.fills)} missedCount={num(d.missed_count) ?? 0} />
+          </Section>
+
+          <Section index="#7" title="Ladder history">
             {history.length === 0 ? (
               <p className="rounded-lg border border-border bg-surface p-5 text-sm text-muted">No ladder changes yet.</p>
             ) : (
