@@ -79,6 +79,8 @@ PRICE_KEEP_DAYS = 2  # P52: raw prices are pruned after 2 days (marks are kept)
 MARK_FINAL_S = 60  # an hourly mark is computed once the hour is 60 s past
 HOUR = timedelta(hours=1)
 HOUR_MS = 3_600_000
+KV_MARKS_EMPTY = "hl:marks_empty:{}"  # per coin: final hours scanned with no price
+EMPTY_MARKS_KEEP_MS = (PRICE_KEEP_DAYS + 2) * 24 * HOUR_MS  # beyond: no raw prices anyway
 RERUN_AFTER_S = 3600  # re-evaluate at least hourly (the gate depends on time too)
 RECONCILE_INTERVAL_S = 300  # P11: at most once per 5 min per wallet
 CURVE_MAX_POINTS = 500
@@ -194,15 +196,25 @@ def record_marks(session: Session, coins: set[str] | list[str], since: datetime,
         return 0
     prices = RecordedPrices(session)
     rows: list[dict] = []
+    keep_from = _ms(now) - EMPTY_MARKS_KEEP_MS
     for coin in sorted(coins):
         have = set(session.scalars(select(Mark.hour_ts).where(
             Mark.coin == coin, Mark.hour_ts >= lo, Mark.hour_ts <= hi)))
+        key = KV_MARKS_EMPTY.format(coin)
+        raw = pipeline.kv_get_json(session, key)
+        empty = {int(h) for h in raw if isinstance(h, int)} if isinstance(raw, list) else set()
+        before = set(empty)
         for h in range(lo, hi + 1, HOUR_MS):
-            if h in have:
+            if h in have or h in empty:
                 continue
             mid = prices.mark(coin, _dt(h))
             if mid is not None:
                 rows.append({"coin": coin, "hour_ts": h, "mid": str(mid)})
+            else:
+                empty.add(h)  # final hour with no price: never re-scanned (minor)
+        empty = {h for h in empty if h >= keep_from}
+        if empty != before:
+            pipeline.kv_set_json(session, key, sorted(empty))
     if rows:
         _insert_ignore(session, Mark.__table__, rows)
         session.flush()
@@ -219,28 +231,43 @@ def event_coins(session: Session, addr: str) -> set[str]:
 
 
 class Marks:
-    """The simulator's ``mark``: persisted hourly marks (``marks``) for past times, the
-    live recorded price at ``now`` (the final point only)."""
+    """The simulator's ``mark``.
+
+    - At a final hour boundary ``h`` (``h <= now - MARK_FINAL_S``): the persisted hourly
+      mark of ``h`` (or None).
+    - At ``now``: the live recorded price (the display-only final point, P54).
+    - Any other time (event times): None, so the simulator keeps each market's last
+      known price - the fill price or a mark at/after it. A persisted mark is never
+      re-applied after its own hour (N1: it can predate a fresher fill).
+    """
 
     def __init__(self, session: Session, coins: set[str], start: datetime,
                  now: datetime) -> None:
         self.now = now
+        self.final_ms = _ms(now) - MARK_FINAL_S * 1000  # hours up to here are persisted
         self.live = RecordedPrices(session)
         self.hourly: dict[tuple[str, int], Decimal] = {}
         if coins:
             for coin, h, mid in session.execute(select(Mark.coin, Mark.hour_ts, Mark.mid).where(
                     Mark.coin.in_(sorted(coins)), Mark.hour_ts >= _ms(start) - HOUR_MS,
-                    Mark.hour_ts <= _ms(now))):
+                    Mark.hour_ts <= self.final_ms)):
                 self.hourly[(coin, h)] = mid
 
     def __call__(self, coin: str, at: datetime) -> Decimal | None:
         if at >= self.now:
             return self.live.mark(coin, at)
         t = _ms(at)
-        return self.hourly.get((coin, t // HOUR_MS * HOUR_MS))  # the hour's mark (<= at)
+        if t % HOUR_MS or t > self.final_ms:
+            return None  # an event time (or an hour not final yet): keep the last price
+        return self.hourly.get((coin, t))
 
     def times(self, start: datetime) -> list[datetime]:
-        return [_dt(h) for h in range(_hour_ceil(start), _ms(self.now), HOUR_MS)] + [self.now]
+        """Final hour boundaries strictly after ``start`` (the start point is the
+        simulator's own), then ``now``. An hour less than ``MARK_FINAL_S`` old is not a
+        point yet, so a run never shows an unmarked point a later run would re-mark."""
+        first = _ms(start) // HOUR_MS * HOUR_MS + HOUR_MS
+        hours = range(first, min(self.final_ms, _ms(self.now) - 1) + 1, HOUR_MS)
+        return [_dt(h) for h in hours] + [self.now]
 
 
 def _leader_cpnl(session: Session, addr: str, r: PaperEvent) -> Decimal:

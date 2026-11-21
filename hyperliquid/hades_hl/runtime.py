@@ -35,7 +35,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, tuple_
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
@@ -52,6 +52,7 @@ log = logging.getLogger(__name__)
 ALWAYS_COINS = frozenset({"BTC", "ETH"})
 WATCH_DAYS = 30
 PRICE_KEEP_DAYS = pr.PRICE_KEEP_DAYS  # P52: raw prices only; marks are kept
+PRUNE_BATCH = 50_000  # P55: rows per prune DELETE (one commit each)
 BACKFILL_CANDIDATES = 50  # P50: top candidates backfilled daily (besides the follows)
 BACKFILL_DAYS = 90
 BACKFILL_PAUSE_S = 1.0
@@ -101,10 +102,25 @@ def record_follow_marks(session: Session, now: datetime, since: datetime | None 
     return n
 
 
-def prune_prices(session: Session, now: datetime, keep_days: int = PRICE_KEEP_DAYS) -> int:
-    res = session.execute(delete(Price).where(
-        Price.time < _ms(now - timedelta(days=keep_days))))
-    return int(res.rowcount or 0)
+def prune_prices(session: Session, now: datetime, keep_days: int = PRICE_KEEP_DAYS,
+                 batch_size: int = PRUNE_BATCH) -> int:
+    """Delete raw prices older than ``keep_days`` in batches of ``batch_size`` rows,
+    committing each batch (P55): a single multi-million-row DELETE would hold the
+    SQLite write lock long enough for the watcher's writes to fail. Returns rows
+    deleted. Commits (also any pending work in ``session``)."""
+    cutoff = _ms(now - timedelta(days=keep_days))
+    total = 0
+    while True:
+        batch = select(Price.coin, Price.time).where(Price.time < cutoff).limit(batch_size)
+        res = session.execute(delete(Price).where(
+            tuple_(Price.coin, Price.time).in_(batch)), execution_options={
+                "synchronize_session": False})
+        n = int(res.rowcount or 0)
+        total += n
+        session.commit()
+        if n < batch_size:
+            break
+    return total
 
 
 WatcherFactory = Callable[[Mapping[str, datetime], Callable[[TradeEvent], Any]], Any]
