@@ -57,6 +57,12 @@ describe("design token contrast (WCAG)", () => {
     expect(contrastRatio(c, BG)).toBeGreaterThanOrEqual(4.5);
     expect(contrastRatio(c, HOVER)).toBeGreaterThanOrEqual(4.5);
   });
+  it("--hl (Hyperliquid accent) on --bg and on the row hover ≥ 4.5", () => {
+    const HL = token("hl");
+    expect(contrastRatio(HL, BG)).toBeGreaterThanOrEqual(4.5);
+    expect(contrastRatio(HL, HOVER)).toBeGreaterThanOrEqual(4.5);
+    expect(css).toMatch(/--color-hl:\s*var\(--hl\)/);
+  });
   it("focus ring outer color (--fg) vs --bg ≥ 3", () => {
     expect(css).toMatch(/:focus-visible\s*{[^}]*outline:\s*2px solid var\(--fg\)/);
     expect(contrastRatio(FG, BG)).toBeGreaterThanOrEqual(3);

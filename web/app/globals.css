@@ -9,6 +9,8 @@
   --muted: #9a9ab5;
   --primary: #3d3dff;
   --ember: #ff5a1f;
+  /* Hyperliquid head accent (electric blue): 6.67:1 on --bg, checked in lib/contrast.test.ts. */
+  --hl: #3b9eff;
   --gain: #22c55e;
   --loss: #ef4444;
 }
@@ -26,6 +28,7 @@
   --color-muted: var(--muted);
   --color-primary: var(--primary);
   --color-ember: var(--ember);
+  --color-hl: var(--hl);
   --color-gain: var(--gain);
   --color-loss: var(--loss);
 

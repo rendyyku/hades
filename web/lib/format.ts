@@ -68,3 +68,24 @@ export function formatDuration(sec: number | null | undefined): string {
   if (s < 86400) return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
   return `${Math.floor(s / 86400)}d ${Math.floor((s % 86400) / 3600)}h`;
 }
+
+const usd = new Intl.NumberFormat("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+/** `+$1,234.50` / `−$3.10` (U+2212); `$0.00`. `signed: false` drops the + (negatives keep −). */
+export function formatUsd(n: number | null | undefined, opts: { signed?: boolean } = {}): string {
+  if (!isNum(n)) return DASH;
+  const body = `$${usd.format(Math.abs(n))}`;
+  if (n < 0) return `${MINUS}${body}`;
+  return n === 0 || opts.signed === false ? body : `+${body}`;
+}
+
+/**
+ * Winrate with its sample size, `64% (n=42)`. Never a bare percentage: without a
+ * valid n (a positive integer) there is no percent at all.
+ */
+export function formatWinrate(w: number | null | undefined, n: number | null | undefined): string {
+  const validN = isNum(n) && Number.isInteger(n) && n >= 0;
+  if (!validN) return DASH;
+  if (!isNum(w) || n === 0) return `${DASH} (n=${n})`;
+  return `${Math.round(w * 100)}% (n=${n})`;
+}

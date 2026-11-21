@@ -10,15 +10,20 @@ import {
 import { useEffect, useId, useMemo, useRef } from "react";
 import type { PnlPoint } from "@/lib/api";
 import { buildChartOptions, CHART_HEIGHT_PX } from "@/lib/chartOptions";
-import { formatSol } from "@/lib/format";
+import { formatSol, formatUsd } from "@/lib/format";
+import { HL_PNL_EMPTY_TEXT, hlPnlCaption } from "@/lib/hlView";
 import { PNL_EMPTY_TEXT, pnlCaption, toChartPoints } from "@/lib/pnl";
 
 function cssVar(name: string): string {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 }
 
-/** Cumulative realized PnL (lightweight-charts v5). Colors come from the CSS tokens at runtime. */
-export function PnlChart({ curve }: { curve: PnlPoint[] }) {
+/**
+ * Cumulative PnL (lightweight-charts v5). Colors come from the CSS tokens at runtime.
+ * unit "sol" (default): Solana realized PnL per position; "usd": a head's daily net PnL
+ * (points carry USD in `cum_pnl_sol`, see lib/hlView.hlCurve).
+ */
+export function PnlChart({ curve, unit = "sol" }: { curve: PnlPoint[]; unit?: "sol" | "usd" }) {
   const ref = useRef<HTMLDivElement>(null);
   const captionId = useId();
   const points = useMemo(() => toChartPoints(curve), [curve]);
@@ -40,7 +45,10 @@ export function PnlChart({ curve }: { curve: PnlPoint[] }) {
       color: line,
       lineWidth: 2,
       lastPriceAnimation: LastPriceAnimationMode.Disabled,
-      priceFormat: { type: "price", precision: 4, minMove: 0.0001 },
+      priceFormat:
+        unit === "usd"
+          ? { type: "price", precision: 2, minMove: 0.01 }
+          : { type: "price", precision: 4, minMove: 0.0001 },
     });
     series.setData(points.map((p) => ({ time: p.time as UTCTimestamp, value: p.value }) satisfies LineData));
 
@@ -48,18 +56,18 @@ export function PnlChart({ curve }: { curve: PnlPoint[] }) {
     return () => {
       chart.remove();
     };
-  }, [points, final]);
+  }, [points, final, unit]);
 
   if (points.length === 0) {
     return (
-      <p className="rounded-lg border border-border bg-surface p-5 text-sm text-muted">{PNL_EMPTY_TEXT}</p>
+      <p className="rounded-lg border border-border bg-surface p-5 text-sm text-muted">{unit === "usd" ? HL_PNL_EMPTY_TEXT : PNL_EMPTY_TEXT}</p>
     );
   }
 
   return (
     <figure aria-labelledby={captionId} className="m-0 rounded-lg border border-border bg-surface p-3 sm:p-4">
       <figcaption id={captionId} className="sr-only">
-        {pnlCaption(points.length, formatSol(final))}
+        {unit === "usd" ? hlPnlCaption(points.length, formatUsd(final)) : pnlCaption(points.length, formatSol(final))}
       </figcaption>
       {/* Canvas host: no role, so the TradingView attribution link inside stays a normal link. */}
       <div ref={ref} className="w-full font-mono" style={{ height: CHART_HEIGHT_PX }} />

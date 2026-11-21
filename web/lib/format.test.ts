@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { formatDuration, formatPct, formatScore, formatSol, relTime, shortAddr } from "./format";
+import {
+  formatDuration,
+  formatPct,
+  formatScore,
+  formatSol,
+  formatUsd,
+  formatWinrate,
+  relTime,
+  shortAddr,
+} from "./format";
 
 const MINUS = "\u2212";
 
@@ -100,5 +109,41 @@ describe("formatDuration", () => {
     expect(formatDuration(undefined)).toBe("—");
     expect(formatDuration(Number.NaN)).toBe("—");
     expect(formatDuration(-5)).toBe("—");
+  });
+});
+
+describe("formatWinrate", () => {
+  it("renders the winrate with its n", () => {
+    expect(formatWinrate(0.64, 42)).toBe("64% (n=42)");
+    expect(formatWinrate(0.6449, 42)).toBe("64% (n=42)");
+    expect(formatWinrate(1, 3)).toBe("100% (n=3)");
+  });
+  it("never renders a bare percentage", () => {
+    for (const [w, n] of [
+      [0.5, null],
+      [0.5, undefined],
+      [0.5, 0],
+      [0.5, -1],
+      [0.5, Number.NaN],
+      [0.5, 1.5],
+    ] as const) {
+      expect(formatWinrate(w, n)).not.toMatch(/%/);
+    }
+  });
+  it("shows the dash with n when there is no winrate", () => {
+    expect(formatWinrate(null, 0)).toBe("— (n=0)");
+    expect(formatWinrate(null, null)).toBe("—");
+  });
+});
+
+describe("formatUsd", () => {
+  it("signs and groups USD", () => {
+    expect(formatUsd(1234.5)).toBe("+$1,234.50");
+    expect(formatUsd(-3.1)).toBe("\u2212$3.10");
+    expect(formatUsd(0)).toBe("$0.00");
+    expect(formatUsd(null)).toBe("—");
+  });
+  it("unsigned when asked", () => {
+    expect(formatUsd(1234.5, { signed: false })).toBe("$1,234.50");
   });
 });
