@@ -20,6 +20,12 @@ No hindsight (spec section 7, 12a):
   retried on a timer (RECOVERY_RETRY_S, doubling up to RECOVERY_RETRY_MAX_S) and on
   every reconnect; the successful retry emits every not-yet-emitted fill since the floor
   (source_ref dedupe) with the retry response time as ``observed_time`` (P44).
+- While a recovery is pending (floor set), live fills (WS or poll) of that address are
+  stored but HELD, not emitted (P46): an emitted close could otherwise precede the
+  open the recovery returns later. The successful recovery emits the gap fills and the
+  held fills as ONE chain-ordered batch (seq in that order), every event with the
+  recovery response time as ``observed_time``; then the floor clears and ``last_seen``
+  advances. Held fills are not emitted if the watcher stops first.
 
 Limits (verified 2026-11-21 against
 https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/rate-limits-and-user-limits):
@@ -348,6 +354,10 @@ class FillWatcher:
         # recovery succeeds (fills after it may be missing)
         self.recovery_floor_ms: dict[str, int] = {}
         self._newest_ms: dict[str, int] = {}  # newest committed fill time (any path)
+        # P46: live fills (ws/poll) stored but held while a recovery is pending,
+        # addr -> {tid: (fill, via)}; released by the next successful recovery. Lost
+        # (not emitted) if the watcher stops first.
+        self._held: dict[str, dict[int, tuple[dict, str]]] = {}
         self.recovery_retry_s = recovery_retry_s
         self.recovery_retry_max_s = recovery_retry_max_s
         self._retry_delay: dict[str, float] = {}
@@ -372,16 +382,40 @@ class FillWatcher:
         the live start with ``observed_time = observed``. ``via``: ws | poll | recovery."""
         addr = addr.lower()
         fills = [dict(f) for f in fills]
-        if not fills:
+        release = via == "recovery"  # a successful recovery releases the held fills
+        if not fills and not (release and addr in self.recovery_floor_ms):
             return []
-        newest = max(int(f["time"]) for f in fills)
+        newest = max((int(f["time"]) for f in fills), default=0)
         live_from = self.live_from_ms.get(addr, _ms(self.start_time))
         cand = [] if snapshot else [
             f for f in fills if int(f["time"]) >= live_from and not is_spot(f)]
+        if cand and not release and addr in self.recovery_floor_ms:
+            # P46: a recovery is pending -> store but hold; emitted with the gap fills.
+            # Buffered before any await, so the release cannot miss it.
+            held = self._held.setdefault(addr, {})
+            for f in cand:
+                held.setdefault(int(f["tid"]), (f, via))
+            cand = []
+        vias: dict[int, str] = {int(f["tid"]): via for f in cand}
+        need_lev = bool(cand) or (release and bool(self._held.get(addr)))
         # leverage BEFORE any DB session: no session is held across the network call
-        lev = await self._leverage_for(addr) if cand and self.fetch_leverage else {}
-        out = self._store_and_emit(addr, fills, cand, lev, observed, via)
+        lev = await self._leverage_for(addr) if need_lev and self.fetch_leverage else {}
+        if release:  # no await from here to the floor clear: nothing can slip between
+            for tid, (f, v) in self._held.get(addr, {}).items():
+                if tid not in vias:
+                    cand.append(f)
+                    vias[tid] = f"{v}:held"
+                    if tid not in {int(x["tid"]) for x in fills}:
+                        fills.append(f)  # re-store (insert dedupes) for the chain context
+        out = self._store_and_emit(addr, fills, cand, lev, observed, vias)
         # only now is everything up to ``newest`` committed
+        if release:
+            self._held.pop(addr, None)
+            if self.recovery_floor_ms.pop(addr, None) is not None:
+                log.info("hl watcher %s: recovery succeeded; floor cleared, %d event(s) "
+                         "released", addr, len(out))
+            self._retry_delay.pop(addr, None)
+            self._retry_due.pop(addr, None)
         if not snapshot:
             self._advance(addr, newest)
         for ev in out:
@@ -400,13 +434,16 @@ class FillWatcher:
             self._newest_ms[addr] = newest
         if addr in self.recovery_floor_ms:
             return  # held at the floor until a recovery succeeds
+        # after a release this jumps past the held fills too (all committed)
+        newest = self._newest_ms.get(addr, 0)
         if newest > self.last_seen_ms.get(addr, 0):
             self.last_seen_ms[addr] = newest
 
     def _store_and_emit(self, addr: str, fills: list[dict], cand: list[dict],
                         lev: Mapping[str, Decimal], observed: datetime,
-                        via: str) -> list[TradeEvent]:
-        """Synchronous (no await): store fills, persist the new legs' events, commit."""
+                        vias: Mapping[int, str]) -> list[TradeEvent]:
+        """Synchronous (no await): store fills, persist the new legs' events (one
+        chain-ordered batch, all ``observed``), commit. ``vias``: tid -> via."""
         with Session(self.engine) as s:
             insert_fills(s, addr, fills)
             s.commit()
@@ -429,7 +466,8 @@ class FillWatcher:
                     position_id=lg.position_id, group_id=None, seq=seq)
                 delay = _ms(observed) - lg.time_ms
                 s.add(PaperEvent(source_ref=ev.source_ref, address=addr,
-                                 json={**event_to_json(ev), "via": via},
+                                 json={**event_to_json(ev),
+                                       "via": vias.get(int(lg.fill["tid"]), "")},
                                  observed_time=observed, delay_ms=delay, seq=seq))
                 out.append(ev)
             pipeline.kv_set_json(s, key, seq)
@@ -522,13 +560,7 @@ class FillWatcher:
                 log.warning("hl watcher %s: recovery since %d failed (%s: %s); retry in %.0f s",
                             a, since, type(e).__name__, e, delay)
                 continue
-            if self.recovery_floor_ms.pop(a, None) is not None:
-                log.info("hl watcher %s: recovery succeeded; floor cleared", a)
-            self._retry_delay.pop(a, None)
-            self._retry_due.pop(a, None)
-            newest = self._newest_ms.get(a, 0)
-            if newest > self.last_seen_ms.get(a, 0):
-                self.last_seen_ms[a] = newest
+            # success: ingest released the held fills, cleared the floor, advanced
 
     async def _retry_loop(self) -> None:
         """Re-run failed recoveries when due (without waiting for a reconnect)."""

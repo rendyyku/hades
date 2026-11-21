@@ -809,3 +809,96 @@ async def test_ws_redelivery_of_recovered_fill_not_reemitted(engine):
     assert len(got) == 1
     with Session(engine) as s:
         assert len(s.scalars(select(PaperEvent)).all()) == 1
+
+
+# -- P46: live fills are held while a recovery is pending -------------------------------
+
+class StubModel:
+    """Always fills at 100, no fee."""
+
+    max_leverage = Decimal("10")
+
+    def fill_price(self, ev):
+        return Decimal("100")
+
+    def fee(self, notional):
+        return Decimal(0)
+
+
+def _pending_watcher(engine, **kw):
+    start = datetime.now(UTC) - timedelta(hours=1)
+    c = FailRecovery()
+    got: list[TradeEvent] = []
+    w = FillWatcher(engine, c, {A: None}, start_time=start, fetch_leverage=False,
+                    sz_decimals={}, on_fill=got.append, **kw)
+    return start, c, w, got
+
+
+async def test_live_close_held_until_recovery_releases_open_first(engine):
+    """P46: a live close during a pending recovery is stored, not emitted; the recovery
+    then emits the gap open and the held close in ONE chain-ordered batch."""
+    start, c, w, got = _pending_watcher(engine)
+    open_ = mk("BTC", "B", "1", "100", "0", ms(start) + 60_000, tid=100)
+    close = mk("BTC", "A", "1", "101", "1", ms(start) + 120_000, tid=101)
+    c.fills[A] = [open_]
+    await w._recover([A])  # fails: floor set
+    assert A in w.recovery_floor_ms
+    c.fills[A] = [open_, close]
+    live_obs = datetime.now(UTC)
+    assert await w.ingest(A, [close], observed=live_obs, via="ws") == []
+    assert got == []  # held
+    with Session(engine) as s:
+        assert s.scalar(select(Fill.tid).where(Fill.tid == 101)) == 101  # stored
+        assert s.scalars(select(PaperEvent)).all() == []
+    await w._recover([A])  # retry succeeds: release
+    assert [e.source_ref for e in got] == ["0xh100:100", "0xh101:101"]
+    o, cl = got
+    assert o.side == "open" and cl.side == "close"
+    assert o.seq < cl.seq
+    assert o.observed_time == cl.observed_time
+    assert o.observed_time >= live_obs  # the release time, never the earlier live time
+    assert A not in w.recovery_floor_ms
+    assert w.last_seen_ms[A] == ms(start) + 120_000
+    with Session(engine) as s:
+        rows = {r.source_ref: r for r in s.scalars(select(PaperEvent))}
+        assert event_from_json(rows["0xh101:101"].json) == cl
+        assert rows["0xh101:101"].json["via"] == "recovery"  # the response re-delivered it
+        assert rows["0xh100:100"].json["via"] == "recovery"
+    res = simulate(got, StubModel(), PaperConfig(), start)
+    assert res.open_positions == {}  # no phantom position
+    assert len(res.closed_trades) == 1
+    assert [f.missed for f in res.fills] == [False, False]
+    # control: the pre-P46 order (close emitted live first, open recovered later) is
+    # exactly what produced the phantom open
+    from dataclasses import replace
+    bad = [replace(cl, observed_time=live_obs, seq=1), replace(o, seq=2)]
+    assert simulate(bad, StubModel(), PaperConfig(), start).open_positions != {}
+
+
+async def test_held_live_fills_released_when_recovery_finds_no_gap(engine):
+    """P46: a recovery that returns nothing new still releases the held live fills."""
+    start, c, w, got = _pending_watcher(engine)
+    await w._recover([A])  # fails: floor set
+    live_fill = mk("BTC", "B", "1", "100", "0", ms(start) + 60_000, tid=110)
+    assert await w.ingest(A, [live_fill], observed=datetime.now(UTC), via="ws") == []
+    c.fills[A] = []  # the recovery response has no fills at all
+    await w._recover([A])
+    assert [e.source_ref for e in got] == ["0xh110:110"]
+    assert A not in w.recovery_floor_ms
+    assert w.last_seen_ms[A] == ms(start) + 60_000
+    with Session(engine) as s:
+        assert s.get(PaperEvent, "0xh110:110").json["via"] == "ws:held"
+
+
+async def test_held_poll_fills_also_buffered(engine):
+    """P46 applies to polled fills too, and nothing is emitted while still pending."""
+    start, c, w, got = _pending_watcher(engine)
+    c.n = 2
+    await w._recover([A])  # fails
+    f = mk("BTC", "B", "1", "100", "0", ms(start) + 60_000, tid=120)
+    assert await w.ingest(A, [f], observed=datetime.now(UTC), via="poll") == []
+    await w._recover([A])  # fails again: still held
+    assert got == [] and A in w.recovery_floor_ms
+    c.fills[A] = [f]
+    await w._recover([A])
+    assert [e.source_ref for e in got] == ["0xh120:120"]
