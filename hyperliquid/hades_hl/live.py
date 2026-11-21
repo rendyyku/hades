@@ -62,8 +62,8 @@ from websockets.asyncio.client import connect
 from hades_core.events import TradeEvent
 from hades_core.paper import OpenPosition
 from hades_hl import pipeline
-from hades_hl.client import INFO_WEIGHT_DEFAULT, WEIGHT_PER_MIN, HLError
-from hades_hl.db import Fill, PaperEvent, Price, _insert_ignore, insert_fills, utcnow
+from hades_hl.client import INFO_WEIGHT_DEFAULT, WEIGHT_PER_MIN, HLError, info_weight, item_weight
+from hades_hl.db import Fill, Kv, PaperEvent, Price, _insert_ignore, insert_fills, utcnow
 from hades_hl.normalize import fill_legs, is_spot, leverage_by_coin, ms_to_dt
 from hades_hl.normalize import HEAD
 
@@ -85,6 +85,8 @@ RECONNECT_MAX_S = 60.0
 LEVERAGE_TTL_S = 60.0
 RECOVERY_RETRY_S = 10.0  # failed recovery: retry after 10 s, doubling ...
 RECOVERY_RETRY_MAX_S = 60.0  # ... up to 60 s
+FEED_FALLBACK_AFTER = 3  # P41: consecutive failed price-feed connections before fallback
+FEED_PRIMARY_RETRY_S = 3600.0  # ... and the primary is retried after an hour
 
 # -- execution model constants ---------------------------------------------------------
 PRICE_WINDOW_S = 30  # spec 12a: no live price within 30 s -> missed
@@ -100,6 +102,8 @@ MAX_LEVERAGE = Decimal("10")
 DEFAULT_STAKE_USD = Decimal("500")  # PaperConfig default: 5% of a 10,000 bankroll
 
 KV_SEQ = "hl:seq:{}"  # per-address monotonic event counter (ruling P26)
+KV_LAST_SEEN = "hl:last_seen:{}"  # M6: per-address watcher cursor (epoch ms)
+KV_FLOOR = "hl:floor:{}"  # M6: per-address pending recovery floor (epoch ms)
 KV_FUNDING = "hl:funding:{}:{}"  # coin, UTC day start ms -> hourly funding rates
 HOUR_MS = 3_600_000
 DAY_MS = 86_400_000
@@ -164,12 +168,24 @@ class PriceRecorder:
                  reconnect_base_s: float = RECONNECT_BASE_S,
                  reconnect_max_s: float = RECONNECT_MAX_S,
                  ping_interval_s: float = PING_INTERVAL_S,
-                 feed: str = "allMids") -> None:
+                 feed: str = "allMids", fallback_feed: str | None = None,
+                 fallback_after: int = FEED_FALLBACK_AFTER,
+                 primary_retry_s: float = FEED_PRIMARY_RETRY_S) -> None:
         if feed not in PRICE_FEEDS:
             raise ValueError(f"feed must be one of {PRICE_FEEDS}")
+        if fallback_feed is not None and fallback_feed not in PRICE_FEEDS:
+            raise ValueError(f"fallback_feed must be one of {PRICE_FEEDS}")
         self.engine = engine
         self.ws_url = ws_url
         self.feed = feed
+        # P41: the primary feed; after ``fallback_after`` consecutive failed connections
+        # (errors before any usable message) switch to ``fallback_feed``, and try the
+        # primary again after ``primary_retry_s``
+        self.primary_feed = feed
+        self.fallback_feed = fallback_feed
+        self.fallback_after = fallback_after
+        self.primary_retry_s = primary_retry_s
+        self._fell_back_at: float | None = None
         self._mids: dict[str, str] = {}  # fastAssetCtxs: latest midPx per coin
         self._now = now
         self.min_interval_ms = int(min_interval_s * 1000)
@@ -234,9 +250,31 @@ class PriceRecorder:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
+    def _choose_feed(self, failures: int, now: float) -> bool:
+        """P41 feed switching, before each (re)connect. True when the feed changed."""
+        if self.fallback_feed is None or self.fallback_feed == self.primary_feed:
+            return False
+        if self.feed == self.primary_feed and failures >= self.fallback_after:
+            log.warning("hl %s feed failed %d time(s) in a row; falling back to %s",
+                        self.primary_feed, failures, self.fallback_feed)
+            self.feed = self.fallback_feed
+            self._fell_back_at = now
+            return True
+        if (self.feed == self.fallback_feed and self._fell_back_at is not None
+                and now - self._fell_back_at >= self.primary_retry_s):
+            log.info("hl price feed: retrying the primary %s", self.primary_feed)
+            self.feed = self.primary_feed
+            self._fell_back_at = None
+            return True
+        return False
+
     async def _loop(self) -> None:
         attempt = 0
+        failures = 0  # consecutive connections that ended in an error, no usable message
+        loop = asyncio.get_running_loop()
         while True:
+            if self._choose_feed(failures, loop.time()):
+                failures = 0
             try:
                 async with connect(self.ws_url, ping_interval=None, max_size=None) as ws:
                     await ws.send(json.dumps({"method": "subscribe",
@@ -256,6 +294,7 @@ class PriceRecorder:
                             else:
                                 continue
                             attempt = 0
+                            failures = 0
                             self.messages += 1
                             self.record(mids, at)
                     finally:
@@ -264,6 +303,7 @@ class PriceRecorder:
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # network, protocol, DB: keep recording
+                failures += 1
                 log.warning("hl %s WS error: %s: %s", self.feed, type(e).__name__, e)
             await asyncio.sleep(min(self.reconnect_max_s, self.reconnect_base_s * 2 ** attempt))
             attempt += 1
@@ -333,7 +373,8 @@ class FillWatcher:
                  fetch_leverage: bool = True,
                  sz_decimals: Mapping[str, int] | None = None,
                  recovery_retry_s: float = RECOVERY_RETRY_S,
-                 recovery_retry_max_s: float = RECOVERY_RETRY_MAX_S) -> None:
+                 recovery_retry_max_s: float = RECOVERY_RETRY_MAX_S,
+                 extra_weight_per_min: float = 0.0) -> None:
         self.engine = engine
         self.client = client
         self.ws_url = ws_url
@@ -373,6 +414,58 @@ class FillWatcher:
         self._leverage: dict[str, tuple[float, dict[str, Decimal]]] = {}
         self.connects: list[datetime] = []  # WS (re)connect times
         self.events: list[TradeEvent] = []  # emitted in this run (debug / smoke)
+        # M7: other REST weight per minute spent by the process (e.g. the runtime's
+        # reconcile clearinghouseState calls), reserved out of the polling share
+        self.extra_weight_per_min = extra_weight_per_min
+        self._item_weight: dict[str, int] = {}  # last poll's per-item weight per address
+        # one recovery (fetch + ingest) per address at a time; ``since`` is read under it
+        self._recover_locks: dict[str, asyncio.Lock] = {}
+        self._persisted: dict[str, tuple[int | None, int | None]] = {}
+        self._restore_cursors()
+
+    # -- persisted cursors (M6) --------------------------------------------------------
+
+    def _restore_cursors(self) -> None:
+        """Resume from the persisted per-address cursor (kv ``hl:last_seen:{addr}`` /
+        ``hl:floor:{addr}``) so fills made while the process was down are recovered
+        and emitted (observed_time = the recovery response time). Never before the
+        follow start. A pending floor is restored for WS addresses (their recovery
+        retries it); a polled address simply polls from it."""
+        with Session(self.engine) as s:
+            for a, fs in self.follow_start.items():
+                fs_ms = _ms(fs)
+                seen = pipeline.kv_get_json(s, KV_LAST_SEEN.format(a))
+                floor = pipeline.kv_get_json(s, KV_FLOOR.format(a))
+                seen = seen if isinstance(seen, int) else None
+                floor = floor if isinstance(floor, int) and floor >= fs_ms else None
+                cursor = floor if floor is not None else seen
+                if cursor is None:
+                    # first watch of this follow: persist the live start, so a restart
+                    # recovers fills made while down even if none was seen before
+                    self._persist_cursor(a)
+                    continue
+                start = max(fs_ms, cursor)
+                self.live_from_ms[a] = start
+                self.last_seen_ms[a] = start
+                if floor is not None and a in self.ws_addresses:
+                    self.recovery_floor_ms[a] = start
+                    self._retry_due[a] = 0.0  # due at once
+                self._persisted[a] = (seen, floor)
+
+    def _persist_cursor(self, addr: str) -> None:
+        cur = (self.last_seen_ms.get(addr), self.recovery_floor_ms.get(addr))
+        if self._persisted.get(addr) == cur:
+            return
+        with Session(self.engine) as s:
+            pipeline.kv_set_json(s, KV_LAST_SEEN.format(addr), cur[0])
+            if cur[1] is None:
+                row = s.get(Kv, KV_FLOOR.format(addr))
+                if row is not None:
+                    s.delete(row)
+            else:
+                pipeline.kv_set_json(s, KV_FLOOR.format(addr), cur[1])
+            s.commit()
+        self._persisted[addr] = cur
 
     # -- ingest ----------------------------------------------------------------------
 
@@ -432,12 +525,12 @@ class FillWatcher:
     def _advance(self, addr: str, newest: int) -> None:
         if newest > self._newest_ms.get(addr, 0):
             self._newest_ms[addr] = newest
-        if addr in self.recovery_floor_ms:
-            return  # held at the floor until a recovery succeeds
-        # after a release this jumps past the held fills too (all committed)
-        newest = self._newest_ms.get(addr, 0)
-        if newest > self.last_seen_ms.get(addr, 0):
-            self.last_seen_ms[addr] = newest
+        if addr not in self.recovery_floor_ms:  # else held at the floor until recovery
+            # after a release this jumps past the held fills too (all committed)
+            newest = self._newest_ms.get(addr, 0)
+            if newest > self.last_seen_ms.get(addr, 0):
+                self.last_seen_ms[addr] = newest
+        self._persist_cursor(addr)
 
     def _store_and_emit(self, addr: str, fills: list[dict], cand: list[dict],
                         lev: Mapping[str, Decimal], observed: datetime,
@@ -467,7 +560,11 @@ class FillWatcher:
                 delay = _ms(observed) - lg.time_ms
                 s.add(PaperEvent(source_ref=ev.source_ref, address=addr,
                                  json={**event_to_json(ev),
-                                       "via": vias.get(int(lg.fill["tid"]), "")},
+                                       "via": vias.get(int(lg.fill["tid"]), ""),
+                                       # the leader's signed position around this leg
+                                       # (alerts: size change vs previous size)
+                                       "leader_start": str(lg.start),
+                                       "leader_end": str(lg.end)},
                                  observed_time=observed, delay_ms=delay, seq=seq))
                 out.append(ev)
             pipeline.kv_set_json(s, key, seq)
@@ -513,9 +610,22 @@ class FillWatcher:
     def poll_interval(self) -> float:
         """Seconds between poll cycles: POLL_INTERVAL_S, or slower when the polled
         wallets would use more than ``poll_weight_share`` of the weight budget."""
-        n = len(self.poll_addresses)
-        budget = self.weight_per_min * self.poll_weight_share
-        return max(self.poll_interval_s, n * INFO_WEIGHT_DEFAULT * 60.0 / budget if n else 0.0)
+        if not self.poll_addresses:
+            return self.poll_interval_s
+        # M7: base weight plus the last-seen per-item weight of every polled address ...
+        per_cycle = sum(INFO_WEIGHT_DEFAULT + self._item_weight.get(a, 0)
+                        for a in self.poll_addresses)
+        # ... and the weight spent outside polling: leverage lookups (clearinghouseState,
+        # at most once per LEVERAGE_TTL_S per follow) plus the caller's extra
+        other = self.extra_weight_per_min
+        if self.fetch_leverage:
+            other += (len(self.follow_start) * info_weight("clearinghouseState")
+                      * 60.0 / LEVERAGE_TTL_S)
+        budget = max(self.weight_per_min * self.poll_weight_share - other, 1.0)
+        return max(self.poll_interval_s, per_cycle * 60.0 / budget)
+
+    def _note_poll(self, addr: str, n_fills: int) -> None:
+        self._item_weight[addr] = item_weight("userFillsByTime", n_fills)
 
     async def run(self, stop: asyncio.Event) -> None:
         if self.sz_decimals is None:
@@ -538,29 +648,41 @@ class FillWatcher:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _recover(self, addrs: Iterable[str]) -> None:
+    async def _recover(self, addrs: Iterable[str], *, retry: bool = False) -> None:
         """REST backfill since the last seen fill (the floor after a failed recovery);
         observed = when the response arrived (the recovery time: never before the fill,
-        never the leader time). A failure keeps the floor and schedules a retry."""
+        never the leader time). A failure keeps the floor and schedules a retry.
+
+        One recovery per address at a time (a per-address lock around fetch + ingest);
+        ``since`` is read under the lock, so a late failure can never re-set a stale
+        floor. ``retry=True`` (the retry timer) skips an address whose floor another
+        recovery has cleared meanwhile."""
         loop = asyncio.get_running_loop()
         for a in addrs:
-            since = self.recovery_floor_ms.get(a, self.last_seen_ms[a])
-            try:
-                page = await self.client.user_fills_by_time(a, since)
-                await self.ingest(a, page.fills, observed=self._now(), via="recovery")
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                self.recovery_floor_ms.setdefault(a, since)
-                prev = self._retry_delay.get(a)
-                delay = self.recovery_retry_s if prev is None else \
-                    min(self.recovery_retry_max_s, prev * 2)
-                self._retry_delay[a] = delay
-                self._retry_due[a] = loop.time() + delay
-                log.warning("hl watcher %s: recovery since %d failed (%s: %s); retry in %.0f s",
-                            a, since, type(e).__name__, e, delay)
-                continue
-            # success: ingest released the held fills, cleared the floor, advanced
+            lock = self._recover_locks.setdefault(a, asyncio.Lock())
+            async with lock:
+                if retry and a not in self.recovery_floor_ms:
+                    self._retry_due.pop(a, None)
+                    self._retry_delay.pop(a, None)
+                    continue
+                since = self.recovery_floor_ms.get(a, self.last_seen_ms[a])
+                try:
+                    page = await self.client.user_fills_by_time(a, since)
+                    await self.ingest(a, page.fills, observed=self._now(), via="recovery")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    self.recovery_floor_ms.setdefault(a, since)
+                    self._persist_cursor(a)
+                    prev = self._retry_delay.get(a)
+                    delay = self.recovery_retry_s if prev is None else \
+                        min(self.recovery_retry_max_s, prev * 2)
+                    self._retry_delay[a] = delay
+                    self._retry_due[a] = loop.time() + delay
+                    log.warning("hl watcher %s: recovery since %d failed (%s: %s); "
+                                "retry in %.0f s", a, since, type(e).__name__, e, delay)
+                    continue
+                # success: ingest released the held fills, cleared the floor, advanced
 
     async def _retry_loop(self) -> None:
         """Re-run failed recoveries when due (without waiting for a reconnect)."""
@@ -571,7 +693,7 @@ class FillWatcher:
             now = loop.time()
             due = [a for a, t in self._retry_due.items() if t <= now]
             if due:
-                await self._recover(due)
+                await self._recover(due, retry=True)
 
     async def _ws_loop(self) -> None:
         attempt = 0
@@ -624,6 +746,7 @@ class FillWatcher:
             for a in self.poll_addresses:
                 try:
                     page = await self.client.user_fills_by_time(a, self.last_seen_ms[a])
+                    self._note_poll(a, len(page.fills))
                     await self.ingest(a, page.fills, observed=self._now(), via="poll")
                 except asyncio.CancelledError:
                     raise

@@ -185,17 +185,74 @@ def test_backfill_requires_address_or_all(env):
     assert r.exit_code != 0
 
 
-@pytest.mark.parametrize("cmd", ["serve", "follow-sync", "paper-run"])
-def test_later_task_commands_are_stubs(env, cmd):
-    r = invoke(cmd)
-    assert r.exit_code == 2
-    assert "not implemented in Task 6" in r.output
-
-
 def test_serve_defaults_localhost_8010(env):
     r = invoke("serve", "--help")
     assert r.exit_code == 0
     assert "127.0.0.1" in r.output and "8010" in r.output
+    assert "--no-api" in r.output and "--seconds" in r.output
+
+
+# -- Task 9: follows + paper-run -------------------------------------------------------
+
+def _seed_scored(url, n=12, bots=()):
+    from hades_hl.db import init_db as _init
+    eng = make_engine(url)
+    _init(eng)
+    with Session(eng) as s:
+        for i in range(1, n + 1):
+            s.add(Wallet(address=f"0x{i:040x}", score=float(i), is_bot=i in bots, stats_json={}))
+        s.commit()
+    return eng
+
+
+def test_follow_sync_reports_diff(env):
+    _seed_scored(env, 12, bots=(12,))
+    r = invoke("follow-sync")
+    assert r.exit_code == 0, r.output
+    assert "follow-sync: +10 added, -0 removed" in r.output
+    assert "active follows: 10" in r.output
+    r = invoke("follow-sync")
+    assert "+0 added" in r.output
+
+
+def test_follow_sync_empty_db(env):
+    r = invoke("follow-sync")
+    assert r.exit_code == 0 and "+0 added" in r.output and "active follows: 0" in r.output
+
+
+def test_follow_add_remove_and_list(env):
+    r = invoke("follow-add", A, B)
+    assert r.exit_code == 0, r.output
+    assert "following 2" in r.output
+    r = invoke("follows")
+    assert A in r.output and "manual" in r.output and "PAPER" in r.output
+    r = invoke("follow-remove", A)
+    assert r.exit_code == 0 and "removed" in r.output
+    r = invoke("follows")
+    assert A not in r.output and B in r.output
+
+
+def test_follow_add_cap(env, monkeypatch):
+    monkeypatch.setenv("HL_MAX_FOLLOWS", "1")
+    get_settings.cache_clear()
+    r = invoke("follow-add", A, B)
+    assert r.exit_code == 1 and "cap" in r.output
+
+
+def test_paper_run_requires_address_or_all(env):
+    assert invoke("paper-run").exit_code != 0
+
+
+def test_paper_run_prints_summary(env):
+    invoke("follow-add", A)
+    r = invoke("paper-run", "--all", "--offline")
+    assert r.exit_code == 0, r.output
+    assert A in r.output
+    for word in ("ladder PAPER", "equity $10,000", "net $0", "dd 0.0%", "closed 0",
+                 "winrate - (n 0)"):
+        assert word in r.output
+    r = invoke("paper-run", "--address", B, "--offline")
+    assert r.exit_code == 1 and "not followed" in r.output
 
 
 def test_typer_hides_locals():

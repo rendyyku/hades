@@ -9,6 +9,10 @@ hades-hl init-db
 hades-hl discover --limit 200
 hades-hl backfill --all --days 30      # or --address 0x...
 hades-hl rescore
+hades-hl follow-sync                  # auto-follow the top 10 non-bot wallets
+hades-hl follow-add 0x... [0x...]     # manual follows (cap 25); follow-remove, follows
+hades-hl paper-run --all              # one paper run, prints the summaries
+hades-hl serve --no-api               # background runtime (Task 10 adds the API)
 ```
 
 `HL_DATABASE_URL` selects the SQLite database (default `sqlite:///hades_hl.db`).
@@ -42,3 +46,13 @@ hades-hl rescore
   fills), cached 24 h in kv `hl:probe:<address>`. It is rejected if it has no fill in
   30 days, or if fills/day > 300, median hold < 60 s or maker share > 70% (the bot
   rule). Probing stops at `--limit` accepted or 5 x `--limit` probe requests.
+- **Paper runtime (`serve`).** Daily: rescore, auto-follow sync, prune prices older
+  than 14 days. Every 60 s: a paper run for follows with new settled events (an event
+  is processed once its 30 s price window is over) or not run for an hour. Every
+  follow with open paper positions is checked against `clearinghouseState` at most
+  every 5 min; a copy the leader no longer holds gets a synthetic `reconcile:` close.
+  Prices are recorded from `fastAssetCtxs` (falls back to `allMids` after 3 failed
+  connections) for the watch set only: BTC, ETH, coins the follows traded in 30 days,
+  and open paper positions. The fill watcher persists its cursor per wallet (kv
+  `hl:last_seen:<address>`, `hl:floor:<address>`); after a restart, fills made while
+  it was down are recovered and copied with the recovery time as `observed_time`.

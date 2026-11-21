@@ -1,8 +1,9 @@
 """``hades-hl`` command line.
 
-``init-db | discover | backfill | rescore`` (Task 6), ``tag`` (Task 7) and the
-``watch`` debug command (Task 8) are implemented here; ``serve | follow-sync |
-paper-run`` are stubs filled in by later tasks.
+``init-db | discover | backfill | rescore`` (Task 6), ``tag`` (Task 7), the ``watch``
+debug command (Task 8), and ``serve`` (background runtime), ``follow-sync``,
+``follow-add``, ``follow-remove``, ``follows`` and ``paper-run`` (Task 9). Task 10 adds
+the API to ``serve``.
 Nothing here ever prints ``HL_API_KEY`` (Settings hides it from repr; tracebacks
 never show locals).
 """
@@ -20,7 +21,9 @@ from sqlalchemy import select
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 
-from hades_hl import __version__, insider, live, pipeline
+from hades_hl import __version__, follows, insider, live, pipeline
+from hades_hl import paper_runtime as pr
+from hades_hl import runtime as rt
 from hades_hl.client import HLClient, HLError, HLRateLimited
 from hades_hl.config import Settings, get_settings
 from hades_hl.db import Follow, PaperEvent, Wallet, init_db, make_engine
@@ -31,7 +34,6 @@ app = typer.Typer(
     pretty_exceptions_show_locals=False,
 )
 log = logging.getLogger("hades_hl.cli")
-NOT_IMPLEMENTED = "not implemented in Task 6"
 
 
 # -- wiring (patched in tests) -------------------------------------------------------
@@ -70,9 +72,9 @@ def masked_url(url: str) -> str:
     return u.render_as_string(hide_password=True) if u.password else url
 
 
-def _stub(name: str) -> None:
-    typer.echo(f"{name}: {NOT_IMPLEMENTED}")
-    raise typer.Exit(2)
+def _usd(x: Any) -> str:
+    v = float(x)
+    return f"-${-v:,.2f}" if v < 0 else f"${v:,.2f}"
 
 
 # -- commands ------------------------------------------------------------------------
@@ -217,9 +219,45 @@ def rescore(
 def serve(
     host: str = typer.Option("127.0.0.1", "--host"),
     port: int = typer.Option(8010, "--port"),
+    no_api: bool = typer.Option(False, "--no-api", help="background runtime only"),
+    seconds: Optional[float] = typer.Option(
+        None, "--seconds", min=0, help="stop after this long (default: run until Ctrl-C)"),
 ) -> None:
-    """Serve the head API (later task)."""
-    _stub("serve")
+    """Run the head: the background runtime (daily rescore + follow sync + price
+    pruning, paper runs every 60 s, P11 reconcile, price recorder, fill watcher) and
+    the API on --host/--port (Task 10; until then the runtime only)."""
+    _setup_logging()
+    settings = get_settings()
+    engine = make_engine(settings.DATABASE_URL)
+    init_db(engine)
+    if not no_api:
+        typer.echo(f"serve: the head API (Task 10) is not built yet; {host}:{port} is not "
+                   "bound. Running the background runtime only.")
+
+    async def main(client: HLClient) -> rt.HLRuntime:
+        r = rt.HLRuntime(engine, client, ws_url=settings.WS_URL,
+                         weight_per_min=settings.RATE_WEIGHT_PER_MIN,
+                         max_follows=settings.MAX_FOLLOWS,
+                         auto_follow_n=settings.AUTO_FOLLOW_N)
+        stop = asyncio.Event()
+        task = asyncio.create_task(r.run(stop))
+        try:
+            if seconds is None:
+                await task
+            else:
+                await asyncio.sleep(seconds)
+        finally:
+            stop.set()
+            await asyncio.gather(task, return_exceptions=True)
+        return r
+
+    typer.echo(f"serve: runtime starting on {masked_url(settings.DATABASE_URL)}")
+    r = asyncio.run(_with_client(settings, main))
+    rows = getattr(r.recorder, "rows_written", 0)
+    typer.echo(f"serve stopped: watch coins {sorted(r.watch_set)}; price rows {rows}; "
+               f"fills observed {r.fills_observed}; paper runs {r.paper_runs}; "
+               f"reconcile closes {r.reconcile_events}; alerts {r.alerts_emitted}; "
+               f"watcher starts {r.watcher_starts}")
 
 
 @app.command()
@@ -285,8 +323,74 @@ def tag(
 
 @app.command("follow-sync")
 def follow_sync() -> None:
-    """Sync auto-follows (later task)."""
-    _stub("follow-sync")
+    """Auto-follow the top HL_AUTO_FOLLOW_N non-bot wallets by score (manual removals
+    are never re-added; auto-follows with open paper positions are kept)."""
+    _setup_logging()
+    settings = get_settings()
+    with _session(settings) as s:
+        now = pipeline.utcnow()
+        diff = follows.sync_auto_follows(s, now, n=settings.AUTO_FOLLOW_N,
+                                         cap=settings.MAX_FOLLOWS)
+        s.commit()
+        n = follows.active_count(s)
+    typer.echo(f"follow-sync: +{len(diff.added)} added, -{len(diff.removed)} removed, "
+               f"{len(diff.kept_open)} kept (open positions), {len(diff.skipped_cap)} "
+               f"skipped (cap {settings.MAX_FOLLOWS}); active follows: {n}")
+    for a in diff.added:
+        typer.echo(f"  + {a}")
+    for a in diff.removed:
+        typer.echo(f"  - {a}")
+
+
+@app.command("follow-add")
+def follow_add(addresses: list[str] = typer.Argument(..., help="wallet address(es)")) -> None:
+    """Manually follow wallets (paper copying starts now; no history fill-in)."""
+    settings = get_settings()
+    added = 0
+    with _session(settings) as s:
+        for a in addresses:
+            try:
+                follows.add_follow(s, a, pipeline.utcnow(), cap=settings.MAX_FOLLOWS)
+            except ValueError as e:
+                typer.echo(f"follow-add: {e}")
+                raise typer.Exit(1)
+            except follows.FollowCapError:
+                s.commit()
+                typer.echo(f"follow-add: follow cap {settings.MAX_FOLLOWS} reached; "
+                           f"following {added} new wallet(s)")
+                raise typer.Exit(1)
+            added += 1
+        s.commit()
+        n = follows.active_count(s)
+    typer.echo(f"follow-add: following {added} wallet(s); active follows: {n}")
+
+
+@app.command("follow-remove")
+def follow_remove(addresses: list[str] = typer.Argument(..., help="wallet address(es)")) -> None:
+    """Manually stop following wallets; remembered (never re-auto-followed)."""
+    settings = get_settings()
+    with _session(settings) as s:
+        for a in addresses:
+            try:
+                was = follows.remove_follow(s, a, pipeline.utcnow())
+            except ValueError as e:
+                typer.echo(f"follow-remove: {e}")
+                raise typer.Exit(1)
+            typer.echo(f"removed {a.lower()}" if was else
+                       f"{a.lower()} was not followed (removal remembered)")
+        s.commit()
+
+
+@app.command("follows")
+def follows_cmd() -> None:
+    """List the active follows."""
+    settings = get_settings()
+    with _session(settings) as s:
+        rows = follows.active_follows(s)
+        typer.echo(f"{len(rows)} active follow(s) (cap {settings.MAX_FOLLOWS})")
+        for f in rows:
+            typer.echo(f"  {f.address}  {f.origin:<6}  {f.ladder or 'PAPER':<5}  "
+                       f"since {f.started_at.isoformat(timespec='seconds')}")
 
 
 @app.command()
@@ -343,6 +447,55 @@ def watch(
 
 
 @app.command("paper-run")
-def paper_run() -> None:
-    """Run the paper-copy loop (later task)."""
-    _stub("paper-run")
+def paper_run(
+    address: Optional[str] = typer.Option(None, "--address", help="one followed wallet"),
+    all_: bool = typer.Option(False, "--all", help="every active follow"),
+    offline: bool = typer.Option(False, "--offline",
+                                 help="no funding fetch (uncached funding hours count 0)"),
+) -> None:
+    """Run the paper copy once (simulate, gates, ladder) and print the summary."""
+    if bool(address) == bool(all_):
+        raise typer.BadParameter("pass exactly one of --address or --all")
+    _setup_logging()
+    settings = get_settings()
+    engine = make_engine(settings.DATABASE_URL)
+    init_db(engine)
+    with Session(engine) as s:
+        if address:
+            a = address.lower()
+            f = s.get(Follow, a)
+            if f is None or f.removed_at is not None:
+                typer.echo(f"paper-run: {a} is not followed")
+                raise typer.Exit(1)
+            addrs = [a]
+        else:
+            addrs = [f.address for f in follows.active_follows(s)]
+    now = pipeline.utcnow()
+    funding = live.FundingRates(engine)
+
+    async def run_all(client: HLClient | None) -> list[tuple[str, Any]]:
+        out = []
+        for a in addrs:
+            with Session(engine) as s:
+                if client is None:
+                    summ = pr.run_paper(s, a, now)
+                else:
+                    summ = await pr.run_paper_live(s, client, a, now, funding=funding)
+                s.commit()
+                out.append((summ, pr.snapshot(s, a) or {}))
+        return out
+
+    if offline:
+        results = asyncio.run(run_all(None))
+    else:
+        results = asyncio.run(_with_client(settings, run_all))
+    for summ, snap in results:
+        wr = snap.get("winrate")
+        typer.echo(f"{summ.address}  ladder {summ.ladder}  equity {_usd(summ.equity_usd)}  "
+                   f"net {_usd(summ.net_pnl_usd)}  dd {float(summ.max_dd):.1%}  "
+                   f"closed {summ.closed_trades}  "
+                   f"winrate {'-' if wr is None else f'{wr:.0%}'} (n {snap.get('n', 0)})  "
+                   f"days {summ.days_followed}  gap {_usd(summ.gap_usd)}  origin {summ.origin}  "
+                   f"events {snap.get('events', 0)} (missed {snap.get('missed', 0)})  "
+                   f"open {len(snap.get('open_positions') or [])}")
+    typer.echo(f"paper-run: {len(results)} wallet(s)")
