@@ -12,3 +12,10 @@ dist/
 build/
 *.egg-info/
 .superpowers/
+# Archify receipts and review scratch (the diagram JSON + HTML are committed)
+.archify/
+review-*/
+docs/architecture/*.finalize.json
+docs/architecture/*.finalize-summary.json
+docs/architecture/*.browser-check.json
+docs/architecture/*.delivery.json
