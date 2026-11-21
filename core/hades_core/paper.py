@@ -389,7 +389,8 @@ def simulate(
         total = base
         for key in sorted(book):
             p = book[key]
-            if holding_cost is not None and p.accrued_to is not None                     and display_time > p.accrued_to:
+            pending = holding_cost is not None and p.accrued_to is not None
+            if pending and display_time > p.accrued_to:
                 total -= Decimal(holding_cost(p.pos, p.accrued_to, display_time))
             px = mark(p.pos.market_id, display_time) if mark is not None else None
             if px is None:

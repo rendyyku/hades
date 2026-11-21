@@ -114,7 +114,8 @@ def check_clearinghouse_state(state: Any) -> dict:
     "no positions"."""
     if not isinstance(state, dict):
         raise HLError(f"info clearinghouseState: expected an object, got {type(state).__name__}")
-    if not isinstance(state.get("marginSummary"), dict)             or not isinstance(state.get("assetPositions"), list):
+    summary, positions = state.get("marginSummary"), state.get("assetPositions")
+    if not isinstance(summary, dict) or not isinstance(positions, list):
         raise HLError("info clearinghouseState: no marginSummary / assetPositions")
     return state
 
