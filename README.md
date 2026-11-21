@@ -9,7 +9,7 @@ Design: `docs/superpowers/specs/2026-11-19-hades-design.md` · Plan: `docs/super
 
 ## Three heads
 
-[Architecture diagram (Archify, interactive HTML)](docs/architecture/hades-phase2a.html) · source: `docs/architecture/hades-phase2a.architecture.json`.
+[Architecture diagram (Archify, interactive HTML)](docs/architecture/hades-phase2a.html) (download and open it locally in a browser; GitHub shows the HTML source instead of rendering it) · source: `docs/architecture/hades-phase2a.architecture.json`.
 
 | Part | Path | Runs as | Port |
 |---|---|---|---|
@@ -102,7 +102,7 @@ hades webhook-sync                  # push the watchlist to the Helius webhook o
 
 ```bash
 hades-hl init-db                      # create/migrate hades_hl.db (HL_DATABASE_URL; idempotent)
-hades-hl discover --limit 200         # leaderboard candidates (cached 24 h), vaults excluded, one-request activity probe each
+hades-hl discover --limit 200         # leaderboard candidates (cached 24 h), vaults excluded, one-request probe each (bot rule + ≥ 30 closed positions in 30 d)
 hades-hl backfill --all --days 30     # fills (newest first, coverage tracked) + funding; or --address 0x...
 hades-hl rescore                      # stats + scores from the stored fills
 hades-hl tag --all                    # insider tags with evidence: pre_listing, pre_move, fresh_whale (or --address)
@@ -120,7 +120,7 @@ hades-hl watch --seconds 60           # debug: fill watcher + price recorder, pr
 - **Copy price.** We copy at our own recorded mid (moved against us by half-spread and slippage), never at the leader's fill price.
 - **Missed.** A leader fill with no live price recorded within 30 s of its observation is a missed copy.
 - **Start.** Paper copying starts at `follow_started_at`. A position the leader opened before that is ignored until it ends; there is no history fill-in.
-- **Sizing.** Bankroll 10,000 USD. Each copy commits 5% of the current paper equity as margin, at the leader's leverage capped at 10x. Every position is isolated: its loss is capped at its margin, and it is liquidated when that is reached.
+- **Sizing.** Bankroll 10,000 USD. Each copy commits 5% of the current paper equity as margin, at the leader's leverage capped at 10x. Every position is isolated: its *price* loss is capped at its margin, and it is liquidated when that is reached. Funding is excluded from that cap.
 - **Funding** is charged as a holding cost on open copies.
 
 ### Gate and ladder
@@ -233,7 +233,7 @@ CI (`.github/workflows/ci.yml`) runs the same four jobs: `engine`, `core`, `hype
 - **Funding** is charged as an accrued cost and is not capped by the margin.
 - **Scaling-in traders** produce few opens, so the insider `pre_move` tag rarely fires for them.
 - **Outages.** After a watcher outage, recovered fills older than 10 min are counted as missed.
-- **Discovery bias.** The HL top-PnL leaderboard is dominated by bots. Discovery prefilters (account value, volume/equity, month PnL, vaults) and probes recent activity with the bot rule, so it can miss high-turnover human traders.
+- **Discovery bias.** The HL top-PnL leaderboard is dominated by bots. Discovery prefilters (account value, volume/equity, month PnL, vaults) and probes recent activity with the bot rule and a minimum of 30 closed positions in 30 days, so it can miss high-turnover human traders and ones who trade rarely.
 - **Unofficial feeds.** The leaderboard and vault list are the JSON the HL web app loads, not documented API.
 
 ## Known limitations (Solana head, Phase 1)

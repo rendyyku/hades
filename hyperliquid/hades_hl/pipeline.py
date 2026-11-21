@@ -39,6 +39,8 @@ from hades_hl.scoring import (
     BOT_MAX_FILLS_PER_DAY,
     BOT_MAX_MAKER_SHARE,
     BOT_MIN_HOLD_S,
+    MIN_CLOSED_POSITIONS,
+    REASON_FEW,
     is_bot,
     score_detailed,
 )
@@ -64,6 +66,9 @@ KV_PROBE = "hl:probe:{}"  # per-address probe verdict, 24 h TTL
 PROBE_BUDGET_PER_LIMIT = 10  # at most 10 x limit probe requests per discover run (P33)
 PROBE_ACTIVE_DAYS = 30  # a sample with no fill in the last 30 days is inactive
 PROBE_OK = "ok"
+PROBE_SAMPLE_CAP = 2000  # ``userFills`` returns the latest <= 2000 fills
+PROBE_VERSION = 2  # 2: closed-trade check (ruling P62); older cached verdicts are re-probed
+SCORE_WINDOW_DAYS = 30  # the rescore stats window; the probe counts closed trades over it
 
 # stats_json keys that are metadata, not stats: kept across rescore
 META_KEYS = ("backfill", "leaderboard")
@@ -279,29 +284,45 @@ def probe_verdict(addr: str, sample: list[dict], now: datetime,
       does not read as hyperactive) and the median the fills per *active* day;
     - ``hold``: median hold of the closed positions seen in the sample < 60 s;
     - ``maker_share``: share of perp fills with ``crossed == False`` > 70%;
+    - ``n<30`` (ruling P62): fewer than MIN_CLOSED_POSITIONS closed positions in the
+      last SCORE_WINDOW_DAYS days, i.e. rescore would leave it unscored. The count
+      (``closed_30d``) is the scoring stat itself: ``wallet_stats(...)['n']`` over the
+      sample with the rescore window. It only rejects when the sample covers that
+      window (``closed_window_complete``): fewer than PROBE_SAMPLE_CAP fills (the
+      whole history) or an oldest fill >= 30 days back. A capped sample spanning
+      less than the window is undecided and passes (>= 30 is decisive either way,
+      since unseen older fills cannot remove a closed position);
     - else ``ok``.
 
-    Hold and maker share come from :func:`wallet_stats` over the sample; if that
-    fails, only fills/day and a direct maker share are used.
+    Hold, maker share and the closed count come from :func:`wallet_stats` over the
+    sample; if that fails, only fills/day and a direct maker share are used (and
+    the closed-trade check is skipped).
     """
     now_ms = _ms(now)
     times = [int(f["time"]) for f in sample if f.get("time") is not None]
     res: dict[str, Any] = {"n": len(times), "newest": max(times) if times else None,
                            "oldest": min(times) if times else None, "fills_per_day": None,
                            "median_fills_per_day": None, "median_hold_s": None,
-                           "maker_share": None}
+                           "maker_share": None, "closed_30d": None,
+                           "closed_window_complete": None}
     if not times or max(times) < now_ms - PROBE_ACTIVE_DAYS * DAY_MS:
         return {**res, "verdict": "inactive"}
     oldest = min(times)
     span_days = max(now_ms - oldest, DAY_MS) / DAY_MS
     res["fills_per_day"] = len(times) / span_days
+    oldest_dt = datetime.fromtimestamp(oldest / 1000, tz=timezone.utc)
+    complete = (len(sample) < PROBE_SAMPLE_CAP
+                or oldest <= now_ms - SCORE_WINDOW_DAYS * DAY_MS)
     try:
         st = wallet_stats(
             addr, sample, [], now, span_days + 1, history_partial=True,
-            oldest_fill_time=datetime.fromtimestamp(oldest / 1000, tz=timezone.utc),
-            sz_decimals=sz_decimals)
+            oldest_fill_time=oldest_dt, sz_decimals=sz_decimals)
         res.update(median_fills_per_day=st["median_fills_per_day"],
                    median_hold_s=st["median_hold_s"], maker_share=st["maker_share"])
+        scored = wallet_stats(  # the stat rescore thresholds on, over its window
+            addr, sample, [], now, SCORE_WINDOW_DAYS, history_partial=not complete,
+            oldest_fill_time=oldest_dt, sz_decimals=sz_decimals)
+        res.update(closed_30d=scored["n"], closed_window_complete=complete)
     except Exception as e:  # noqa: BLE001 - odd sample: fall back to fills/day + maker
         log.warning("probe %s: stats over the sample failed (%s); using fills/day and "
                     "maker share only", addr, type(e).__name__)
@@ -313,15 +334,20 @@ def probe_verdict(addr: str, sample: list[dict], now: datetime,
         verdict = "hold"
     elif res["maker_share"] is not None and res["maker_share"] > BOT_MAX_MAKER_SHARE:
         verdict = "maker_share"
+    elif (res["closed_30d"] is not None and complete
+          and res["closed_30d"] < MIN_CLOSED_POSITIONS):
+        verdict = REASON_FEW
     else:
         verdict = PROBE_OK
     return {**res, "verdict": verdict}
 
 
 def cached_probe(session: Session, addr: str, now: datetime | None = None) -> dict | None:
-    """The kv probe verdict of ``addr`` if < 24 h old, else None."""
+    """The kv probe verdict of ``addr`` if < 24 h old and made by the current probe
+    (PROBE_VERSION), else None."""
     c = kv_get_json(session, KV_PROBE.format(addr.lower()))
-    return c if _fresh(c, _ms(_now(now))) and isinstance(c.get("verdict"), str) else None
+    return (c if _fresh(c, _ms(_now(now))) and isinstance(c.get("verdict"), str)
+            and c.get("v") == PROBE_VERSION else None)
 
 
 async def probe_activity(session: Session, client: HLClient, addr: str,
@@ -338,7 +364,7 @@ async def probe_activity(session: Session, client: HLClient, addr: str,
     if szd is None:
         cached = kv_get_json(session, KV_SZ_DECIMALS)
         szd = dict(cached["sz_decimals"]) if isinstance(cached, dict) else None
-    res = {"fetched_at": _ms(now), **probe_verdict(addr, sample, now, szd)}
+    res = {"fetched_at": _ms(now), "v": PROBE_VERSION, **probe_verdict(addr, sample, now, szd)}
     kv_set_json(session, KV_PROBE.format(addr), res)
     session.commit()
     return res
@@ -348,7 +374,8 @@ async def discover(
     session: Session, client: HLClient, limit: int = 200, *, now: datetime | None = None
 ) -> Discovered:
     """Up to ``limit`` non-vault leaderboard candidates, in month-PnL order, that pass
-    the activity probe (ruling P30), upserted into ``wallets`` (leaderboard fields
+    the activity probe (ruling P30; since P62 it also rejects wallets with too few
+    closed trades to be scored, reason ``n<30``), upserted into ``wallets`` (leaderboard fields
     under ``stats_json['leaderboard']``, informational only). Rejected candidates are
     not stored. Probing stops once ``limit`` are accepted or ``10 x limit`` probe
     requests were spent (ruling P33; cached verdicts, < 24 h old, are free); on HLRateLimited it
@@ -650,7 +677,7 @@ class RescoreResult:
 
 def rescore(
     session: Session, now: datetime | None = None, *,
-    sz_decimals: dict[str, int] | None = None, window_days: float = 30,
+    sz_decimals: dict[str, int] | None = None, window_days: float = SCORE_WINDOW_DAYS,
 ) -> RescoreResult:
     """Recompute stats + score for every wallet and persist them (caller commits).
 

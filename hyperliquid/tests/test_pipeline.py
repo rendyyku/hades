@@ -715,3 +715,87 @@ async def test_load_sz_decimals_bad_meta_not_cached(session):
     async with make_client() as c:
         assert await pipeline.load_sz_decimals(session, c, NOW) == {}
     assert pipeline.kv_get_json(session, "hl:sz_decimals") is None
+
+
+# -- Task 13 fix round 1 / P62: the probe rejects wallets rescore cannot score ---------
+
+def scaling_in_sample(n: int, span_days: float) -> list[dict]:
+    """``n`` taker fills evenly spread over the last ``span_days`` that only ever add to
+    one BTC long: human pace, no closed position at all."""
+    step = int(span_days * DAY_MS) // n
+    return [mk("BTC", "B", "1", "100", str(i), NOW_MS - (n - i) * step, tid=50_000 + i)
+            for i in range(n)]
+
+
+def test_probe_verdict_rejects_fewer_than_30_closed_in_30d():  # P62
+    v = pipeline.probe_verdict(A, human_sample(days=10, per_day=1), NOW)
+    assert v["verdict"] == "n<30" == pipeline.REASON_FEW
+    assert v["closed_30d"] == 10 and v["closed_window_complete"] is True
+    v = pipeline.probe_verdict(A, human_sample(days=29, per_day=1), NOW)
+    assert v["verdict"] == "n<30" and v["closed_30d"] == 29
+
+
+def test_probe_verdict_accepts_30_closed_in_30d():  # P62: the scoring threshold itself
+    v = pipeline.probe_verdict(A, human_sample(days=15, per_day=2), NOW)
+    assert v["verdict"] == "ok" and v["closed_30d"] == 30 == pipeline.MIN_CLOSED_POSITIONS
+
+
+def test_probe_verdict_counts_only_closes_inside_the_30d_window():  # P62
+    old = human_sample(NOW_MS - 31 * DAY_MS, days=20, per_day=2)  # 40 closed, 32..51 d ago
+    v = pipeline.probe_verdict(A, old + human_sample(days=5, per_day=1), NOW)
+    assert v["verdict"] == "n<30" and v["closed_30d"] == 5
+
+
+def test_probe_verdict_closed_count_matches_the_scoring_stat():  # P62: same definition
+    sample = human_sample(days=12, per_day=2)
+    st = pipeline.wallet_stats(A, sample, [], NOW, pipeline.SCORE_WINDOW_DAYS)
+    assert pipeline.probe_verdict(A, sample, NOW)["closed_30d"] == st["n"] == 24
+
+
+def test_probe_verdict_full_sample_shorter_than_30d_is_not_decisive():  # P62 careful rule
+    # 2000 fills (the userFills cap) spanning only 20 days: older fills of the 30-day
+    # window are unseen, so < 30 closed here proves nothing -> not rejected
+    v = pipeline.probe_verdict(A, scaling_in_sample(2000, 20), NOW)
+    assert v["verdict"] == "ok"
+    assert v["closed_30d"] == 0 and v["closed_window_complete"] is False
+    # the same capped sample reaching back >= 30 days covers the window: rejected
+    v = pipeline.probe_verdict(A, scaling_in_sample(2000, 40), NOW)
+    assert v["verdict"] == "n<30" and v["closed_window_complete"] is True
+    # an uncapped sample is the wallet's whole history, however short: rejected
+    v = pipeline.probe_verdict(A, scaling_in_sample(500, 20), NOW)
+    assert v["verdict"] == "n<30" and v["closed_window_complete"] is True
+
+
+@respx.mock
+async def test_discover_skips_unscoreable_and_continues_down_the_ranking(session):  # P62
+    few1, few2, ok1, ok2 = hfmt(0x81), hfmt(0x82), hfmt(0x83), hfmt(0x84)
+    lb_route(lb_row(few1, "400"), lb_row(ok1, "300"), lb_row(few2, "200"),
+             lb_row(ok2, "100"))
+    calls: list[str] = []
+    respx.post(INFO).mock(side_effect=sim_router(probes={
+        few1: human_sample(days=10, per_day=1), few2: human_sample(days=29, per_day=1),
+        ok1: human_sample(days=15, per_day=2)}, probe_calls=calls))
+    async with make_client() as c:
+        got = await pipeline.discover(session, c, limit=2, now=NOW)
+    assert list(got) == [ok1, ok2]  # limit reached by going further down the ranking
+    assert calls == [few1, ok1, few2, ok2]
+    assert got.probe["probed"] == 4 and got.probe["accepted"] == 2
+    assert got.probe["rejected"] == {"n<30": 2}
+    assert set(session.scalars(select(Wallet.address))) == {ok1, ok2}
+    assert pipeline.kv_get_json(session, f"hl:probe:{few1}")["verdict"] == "n<30"
+
+
+@respx.mock
+async def test_discover_reprobes_cached_verdicts_from_before_p62(session):
+    a = hfmt(0x91)
+    lb_route(lb_row(a, "100"))
+    # an 'ok' verdict cached by the pre-P62 probe (no version): must not be trusted
+    pipeline.kv_set_json(session, f"hl:probe:{a}", {"fetched_at": NOW_MS, "verdict": "ok"})
+    session.commit()
+    calls: list[str] = []
+    respx.post(INFO).mock(side_effect=sim_router(
+        probes={a: human_sample(days=10, per_day=1)}, probe_calls=calls))
+    async with make_client() as c:
+        got = await pipeline.discover(session, c, limit=5, now=NOW)
+    assert calls == [a] and list(got) == []
+    assert got.probe["cached"] == 0 and got.probe["rejected"] == {"n<30": 1}

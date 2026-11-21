@@ -38,7 +38,11 @@ fi
 
 pids=()
 cleanup() {
-  trap - INT TERM EXIT
+  # Ignore (not reset) INT/TERM while stopping: `timeout -s INT` and a terminal Ctrl-C
+  # signal the whole process group, so a second signal arrives right after the first
+  # and with the default action it would kill this shell before the children are stopped.
+  trap '' INT TERM
+  trap - EXIT
   echo "stopping engine, hyperliquid head and web..."
   for pid in "${pids[@]}"; do
     if command -v taskkill >/dev/null 2>&1; then

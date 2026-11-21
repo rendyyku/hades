@@ -46,7 +46,12 @@ hades-hl serve                        # API on 127.0.0.1:8010 + background runti
 - Each candidate then gets a one-request activity probe (`userFills`, latest <= 2000
   fills), cached 24 h in kv `hl:probe:<address>`. It is rejected if it has no fill in
   30 days, or if fills/day > 300, median hold < 60 s or maker share > 70% (the bot
-  rule). Probing stops at `--limit` accepted or 5 x `--limit` probe requests.
+  rule), or (reason `n<30`) if it shows fewer than 30 closed positions in the last 30
+  days: the same count and threshold `rescore` uses, so discovery only keeps wallets
+  that can be scored. That last check applies only when the sample covers the 30 days
+  (under 2000 fills = the whole history, or an oldest fill >= 30 days back); a full
+  2000-fill sample spanning less is undecided and passes. Probing stops at `--limit`
+  accepted or 10 x `--limit` probe requests.
 - **Paper runtime (`serve`).** Daily (in the background): incremental backfill of the
   follows and the top 50 candidates, rescore, auto-follow sync, then hourly marks and
   pruning of raw prices older than 2 days. Every 60 s: a paper run for follows with new

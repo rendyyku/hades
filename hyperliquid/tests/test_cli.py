@@ -85,9 +85,10 @@ def test_full_flow_never_prints_key_and_backfill_all_survives_429(env):
         body = json.loads(request.content)
         if body["type"] == "meta":
             return httpx.Response(200, json={"universe": [{"name": "BTC", "szDecimals": 5}]})
-        if body["type"] == "userFills":  # the discovery activity probe (P30): human pace
-            return httpx.Response(200, json=[fill(i, now_ms - 86_400_000 + i * 3_600_000)
-                                             for i in range(4)])
+        if body["type"] == "userFills":  # the discovery activity probe (P30): human pace,
+            # 30 closed round trips in the last 20 days (P62: scoreable)
+            return httpx.Response(200, json=[fill(i, now_ms - 20 * 86_400_000 + i * 28_800_000)
+                                             for i in range(60)])
         if body["user"] == A:  # wallet A: one partial page, then rate limited (M12)
             a_calls[0] += 1
             if a_calls[0] == 1 and body["type"] == "userFillsByTime":

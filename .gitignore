@@ -11,6 +11,9 @@ node_modules/
 dist/
 build/
 *.egg-info/
+# uv lock files of the python packages are intentionally untracked
+core/uv.lock
+hyperliquid/uv.lock
 .superpowers/
 # Archify receipts and review scratch (the diagram JSON + HTML are committed)
 .archify/

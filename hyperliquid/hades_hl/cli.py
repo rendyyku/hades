@@ -106,7 +106,8 @@ def init_db_cmd() -> None:
 @app.command()
 def discover(limit: int = typer.Option(200, "--limit", min=1, help="max candidates")) -> None:
     """Pick candidate wallets from the HL leaderboard (cached 24 h), vaults excluded;
-    each must pass a one-request activity probe (the bot rule on its latest fills)."""
+    each must pass a one-request activity probe (the bot rule on its latest fills, and
+    >= 30 closed positions in the last 30 days so that rescore can score it)."""
     _setup_logging()
     settings = get_settings()
     with _session(settings) as session:
