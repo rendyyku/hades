@@ -13,7 +13,13 @@ No hindsight (spec section 7, 12a):
   were disconnected are re-fetched by REST recovery and emitted with the recovery time.
 - Only fills at or after ``max(watcher start, follow start)`` become paper events.
 - Our copy fills at the recorded mid ``price_at(coin, observed_time + 1 s)``: the first
-  mid we recorded in ``[observed + 1 s, observed + 31 s]``; none means missed.
+  mid we recorded in ``[observed + 1 s, observed + 30 s]`` (ruling P45); none means
+  missed.
+- A failed REST recovery sets a per-address ``recovery_floor_ms`` (the pre-gap
+  ``last_seen``); ``last_seen`` stays there until a recovery succeeds. Recovery is
+  retried on a timer (RECOVERY_RETRY_S, doubling up to RECOVERY_RETRY_MAX_S) and on
+  every reconnect; the successful retry emits every not-yet-emitted fill since the floor
+  (source_ref dedupe) with the retry response time as ``observed_time`` (P44).
 
 Limits (verified 2026-11-21 against
 https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/rate-limits-and-user-limits):
@@ -71,10 +77,15 @@ PING_INTERVAL_S = 50.0  # server closes after 60 s without a message
 RECONNECT_BASE_S = 1.0
 RECONNECT_MAX_S = 60.0
 LEVERAGE_TTL_S = 60.0
+RECOVERY_RETRY_S = 10.0  # failed recovery: retry after 10 s, doubling ...
+RECOVERY_RETRY_MAX_S = 60.0  # ... up to 60 s
 
 # -- execution model constants ---------------------------------------------------------
 PRICE_WINDOW_S = 30  # spec 12a: no live price within 30 s -> missed
 FILL_DELAY = timedelta(seconds=1)  # spec 8.2: mid at observed_time + 1 s
+# ruling P45: the window is [observed + 1 s, observed + 30 s], i.e. 29 s after the
+# observed + 1 s anchor (the spec's literal "within 30 s" of observation)
+MODEL_WINDOW_S = PRICE_WINDOW_S - int(FILL_DELAY.total_seconds())
 HALF_SPREAD = Decimal("0.0002")  # 0.02%
 SLIPPAGE_COEF = Decimal("0.0005")  # slippage = 0.0005 * sqrt(notional / 100k)
 SLIPPAGE_REF_USD = Decimal("100000")
@@ -225,7 +236,8 @@ class PriceRecorder:
                     await ws.send(json.dumps({"method": "subscribe",
                                               "subscription": {"type": self.feed}}))
                     self._mids.clear()  # fastAssetCtxs restarts with a snapshot
-                    hb = asyncio.create_task(_heartbeat(ws, self.ping_interval_s))
+                    hb = asyncio.create_task(
+                        _heartbeat(ws, self.ping_interval_s, f"hl {self.feed}"))
                     try:
                         async for raw in ws:
                             at = self._now()
@@ -241,12 +253,12 @@ class PriceRecorder:
                             self.messages += 1
                             self.record(mids, at)
                     finally:
-                        hb.cancel()
-                log.warning("hl allMids WS closed; reconnecting")
+                        await _stop_task(hb)
+                log.warning("hl %s WS closed; reconnecting", self.feed)
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # network, protocol, DB: keep recording
-                log.warning("hl allMids WS error: %s: %s", type(e).__name__, e)
+                log.warning("hl %s WS error: %s: %s", self.feed, type(e).__name__, e)
             await asyncio.sleep(min(self.reconnect_max_s, self.reconnect_base_s * 2 ** attempt))
             attempt += 1
 
@@ -266,10 +278,25 @@ class PriceRecorder:
         return self._mids
 
 
-async def _heartbeat(ws: Any, interval: float) -> None:
+async def _heartbeat(ws: Any, interval: float, name: str = "hl") -> None:
+    """Ping every ``interval``; a failed ping closes ``ws`` so its reader ends and the
+    owner reconnects (a silent half-open socket would otherwise hang the reader)."""
     while True:
         await asyncio.sleep(interval)
-        await ws.send(json.dumps({"method": "ping"}))
+        try:
+            await ws.send(json.dumps({"method": "ping"}))
+        except Exception as e:
+            log.warning("%s WS ping failed (%s); closing to reconnect", name, type(e).__name__)
+            try:
+                await ws.close()
+            except Exception:
+                pass
+            return
+
+
+async def _stop_task(task: asyncio.Task) -> None:
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
 
 
 # -- FillWatcher -----------------------------------------------------------------------
@@ -298,7 +325,9 @@ class FillWatcher:
                  reconnect_max_s: float = RECONNECT_MAX_S,
                  ping_interval_s: float = PING_INTERVAL_S,
                  fetch_leverage: bool = True,
-                 sz_decimals: Mapping[str, int] | None = None) -> None:
+                 sz_decimals: Mapping[str, int] | None = None,
+                 recovery_retry_s: float = RECOVERY_RETRY_S,
+                 recovery_retry_max_s: float = RECOVERY_RETRY_MAX_S) -> None:
         self.engine = engine
         self.client = client
         self.ws_url = ws_url
@@ -315,6 +344,14 @@ class FillWatcher:
         # newest non-snapshot fill time seen per address: REST recovery / polling restart
         # here (inclusive; duplicates are dropped by source_ref)
         self.last_seen_ms = dict(self.live_from_ms)
+        # set by a failed recovery: the pre-gap last_seen; last_seen stays here until a
+        # recovery succeeds (fills after it may be missing)
+        self.recovery_floor_ms: dict[str, int] = {}
+        self._newest_ms: dict[str, int] = {}  # newest committed fill time (any path)
+        self.recovery_retry_s = recovery_retry_s
+        self.recovery_retry_max_s = recovery_retry_max_s
+        self._retry_delay: dict[str, float] = {}
+        self._retry_due: dict[str, float] = {}  # loop.time() of the next retry
         self.poll_interval_s = poll_interval_s
         self.weight_per_min = weight_per_min
         self.poll_weight_share = poll_weight_share
@@ -335,23 +372,49 @@ class FillWatcher:
         the live start with ``observed_time = observed``. ``via``: ws | poll | recovery."""
         addr = addr.lower()
         fills = [dict(f) for f in fills]
+        if not fills:
+            return []
+        newest = max(int(f["time"]) for f in fills)
+        live_from = self.live_from_ms.get(addr, _ms(self.start_time))
+        cand = [] if snapshot else [
+            f for f in fills if int(f["time"]) >= live_from and not is_spot(f)]
+        # leverage BEFORE any DB session: no session is held across the network call
+        lev = await self._leverage_for(addr) if cand and self.fetch_leverage else {}
+        out = self._store_and_emit(addr, fills, cand, lev, observed, via)
+        # only now is everything up to ``newest`` committed
+        if not snapshot:
+            self._advance(addr, newest)
+        for ev in out:
+            self.events.append(ev)
+            if self.on_fill is not None:
+                try:
+                    res = self.on_fill(ev)
+                    if asyncio.iscoroutine(res):
+                        await res
+                except Exception:  # a consumer bug must not stop the watcher
+                    log.exception("hl watcher: on_fill failed for %s", ev.source_ref)
+        return out
+
+    def _advance(self, addr: str, newest: int) -> None:
+        if newest > self._newest_ms.get(addr, 0):
+            self._newest_ms[addr] = newest
+        if addr in self.recovery_floor_ms:
+            return  # held at the floor until a recovery succeeds
+        if newest > self.last_seen_ms.get(addr, 0):
+            self.last_seen_ms[addr] = newest
+
+    def _store_and_emit(self, addr: str, fills: list[dict], cand: list[dict],
+                        lev: Mapping[str, Decimal], observed: datetime,
+                        via: str) -> list[TradeEvent]:
+        """Synchronous (no await): store fills, persist the new legs' events, commit."""
         with Session(self.engine) as s:
-            if fills:
-                insert_fills(s, addr, fills)
-                s.commit()
-            if snapshot or not fills:
-                return []
-            newest = max(int(f["time"]) for f in fills)
-            if newest > self.last_seen_ms.get(addr, 0):
-                self.last_seen_ms[addr] = newest
-            live_from = self.live_from_ms.get(addr, _ms(self.start_time))
-            cand = [f for f in fills if int(f["time"]) >= live_from and not is_spot(f)]
+            insert_fills(s, addr, fills)
+            s.commit()
             if not cand:
                 return []
             legs = self._new_legs(s, addr, cand)
             if not legs:
                 return []
-            lev = await self._leverage_for(addr) if self.fetch_leverage else {}
             key = KV_SEQ.format(addr)
             seq = int(pipeline.kv_get_json(s, key) or 0)
             out: list[TradeEvent] = []
@@ -371,15 +434,6 @@ class FillWatcher:
                 out.append(ev)
             pipeline.kv_set_json(s, key, seq)
             s.commit()
-        for ev in out:
-            self.events.append(ev)
-            if self.on_fill is not None:
-                try:
-                    res = self.on_fill(ev)
-                    if asyncio.iscoroutine(res):
-                        await res
-                except Exception:  # a consumer bug must not stop the watcher
-                    log.exception("hl watcher: on_fill failed for %s", ev.source_ref)
         return out
 
     def _new_legs(self, s: Session, addr: str, cand: list[dict]):
@@ -409,9 +463,9 @@ class FillWatcher:
             return hit[1]
         try:
             lev = leverage_by_coin(await self.client.clearinghouse_state(addr))
-        except HLError as e:
-            log.warning("hl watcher %s: clearinghouseState unavailable (%s); leverage unknown",
-                        addr, type(e).__name__)
+        except Exception as e:  # HL down or a malformed answer: leverage unknown (None)
+            log.warning("hl watcher %s: clearinghouseState unusable (%s: %s); leverage unknown",
+                        addr, type(e).__name__, e)
             lev = {}
         self._leverage[addr] = (loop.time(), lev)
         return lev
@@ -436,6 +490,7 @@ class FillWatcher:
         tasks = []
         if self.ws_addresses:
             tasks.append(asyncio.create_task(self._ws_loop()))
+            tasks.append(asyncio.create_task(self._retry_loop()))
         if self.poll_addresses:
             tasks.append(asyncio.create_task(self._poll_loop()))
         try:
@@ -446,16 +501,45 @@ class FillWatcher:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _recover(self, addrs: Iterable[str]) -> None:
-        """REST backfill since the last seen fill; observed = when the response arrived
-        (the recovery time: never before the fill, never the leader time)."""
+        """REST backfill since the last seen fill (the floor after a failed recovery);
+        observed = when the response arrived (the recovery time: never before the fill,
+        never the leader time). A failure keeps the floor and schedules a retry."""
+        loop = asyncio.get_running_loop()
         for a in addrs:
+            since = self.recovery_floor_ms.get(a, self.last_seen_ms[a])
             try:
-                page = await self.client.user_fills_by_time(a, self.last_seen_ms[a])
-            except HLError as e:
-                log.warning("hl watcher %s: recovery failed (%s); retried on reconnect",
-                            a, type(e).__name__)
+                page = await self.client.user_fills_by_time(a, since)
+                await self.ingest(a, page.fills, observed=self._now(), via="recovery")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.recovery_floor_ms.setdefault(a, since)
+                prev = self._retry_delay.get(a)
+                delay = self.recovery_retry_s if prev is None else \
+                    min(self.recovery_retry_max_s, prev * 2)
+                self._retry_delay[a] = delay
+                self._retry_due[a] = loop.time() + delay
+                log.warning("hl watcher %s: recovery since %d failed (%s: %s); retry in %.0f s",
+                            a, since, type(e).__name__, e, delay)
                 continue
-            await self.ingest(a, page.fills, observed=self._now(), via="recovery")
+            if self.recovery_floor_ms.pop(a, None) is not None:
+                log.info("hl watcher %s: recovery succeeded; floor cleared", a)
+            self._retry_delay.pop(a, None)
+            self._retry_due.pop(a, None)
+            newest = self._newest_ms.get(a, 0)
+            if newest > self.last_seen_ms.get(a, 0):
+                self.last_seen_ms[a] = newest
+
+    async def _retry_loop(self) -> None:
+        """Re-run failed recoveries when due (without waiting for a reconnect)."""
+        loop = asyncio.get_running_loop()
+        tick = min(1.0, self.recovery_retry_s / 2)
+        while True:
+            await asyncio.sleep(tick)
+            now = loop.time()
+            due = [a for a, t in self._retry_due.items() if t <= now]
+            if due:
+                await self._recover(due)
 
     async def _ws_loop(self) -> None:
         attempt = 0
@@ -467,7 +551,8 @@ class FillWatcher:
                         await ws.send(json.dumps({"method": "subscribe", "subscription": {
                             "type": "userFills", "user": a}}))
                     self.connects.append(self._now())
-                    hb = asyncio.create_task(_heartbeat(ws, self.ping_interval_s))
+                    hb = asyncio.create_task(
+                        _heartbeat(ws, self.ping_interval_s, "hl userFills"))
                     try:
                         # messages queue meanwhile; fills of the gap come back here
                         await self._recover(self.ws_addresses)
@@ -476,7 +561,7 @@ class FillWatcher:
                             received = self._now()
                             await self._on_ws(raw, received, subs)
                     finally:
-                        hb.cancel()
+                        await _stop_task(hb)
                 log.warning("hl userFills WS closed; reconnecting")
             except asyncio.CancelledError:
                 raise
@@ -507,13 +592,13 @@ class FillWatcher:
             for a in self.poll_addresses:
                 try:
                     page = await self.client.user_fills_by_time(a, self.last_seen_ms[a])
+                    await self.ingest(a, page.fills, observed=self._now(), via="poll")
+                except asyncio.CancelledError:
+                    raise
                 except HLError as e:
                     log.warning("hl watcher %s: poll failed (%s)", a, type(e).__name__)
-                    continue
-                try:
-                    await self.ingest(a, page.fills, observed=self._now(), via="poll")
-                except Exception:
-                    log.exception("hl watcher %s: ingest failed", a)
+                except Exception:  # malformed answer, DB error: log, keep polling
+                    log.exception("hl watcher %s: poll iteration failed", a)
             await asyncio.sleep(max(0.0, self.poll_interval() - (loop.time() - t0)))
 
 
@@ -604,8 +689,8 @@ def is_buy(ev: TradeEvent) -> bool:
 class HLExecutionModel:
     """core ``ExecutionModel`` for Hyperliquid perps (spec 8.2, 12a).
 
-    - ``fill_price``: the recorded mid at ``observed_time + 1 s`` (first mid within
-      30 s, else None = missed), moved AGAINST us by half-spread 0.02% plus slippage
+    - ``fill_price``: the recorded mid at ``observed_time + 1 s`` (first mid in
+      ``[observed + 1 s, observed + 30 s]``, ruling P45; else None = missed), moved AGAINST us by half-spread 0.02% plus slippage
       ``0.0005 * sqrt(notional / 100_000)``. ``notional`` is OUR copy's notional: the
       fixed ``copy_notional_usd`` when given, else ``stake_usd x min(leverage, 10)``
       (the simulator sizes after pricing, so the model can only estimate it).
@@ -613,6 +698,8 @@ class HLExecutionModel:
     - ``holding_cost``: funding while held: ``notional x sum(hourly rates in [start,
       end))``; a long pays positive rates, a short receives them (needs
       ``FundingRates.ensure`` beforehand; uncached hours count 0 and are logged).
+      Approximation: the notional is the ENTRY notional (``qty x entry_price``), not
+      the hourly mark notional, so funding drifts from HL's as the price moves.
     """
 
     def __init__(self, prices: Any, funding: FundingRates | None = None, *,
@@ -636,7 +723,7 @@ class HLExecutionModel:
         return HALF_SPREAD + SLIPPAGE_COEF * (max(notional, Decimal(0)) / SLIPPAGE_REF_USD).sqrt()
 
     def fill_price(self, ev: TradeEvent) -> Decimal | None:
-        mid = self.prices.price_at(ev.market_id, ev.observed_time + FILL_DELAY, PRICE_WINDOW_S)
+        mid = self.prices.price_at(ev.market_id, ev.observed_time + FILL_DELAY, MODEL_WINDOW_S)
         if mid is None:
             return None
         adj = self.adjustment(self.notional(ev))

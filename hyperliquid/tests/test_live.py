@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import zlib
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -17,7 +18,7 @@ from websockets.asyncio.server import serve
 from hades_core.events import TradeEvent
 from hades_core.paper import OpenPosition, PaperConfig, simulate
 from hades_hl import live
-from hades_hl.client import FundingPage, HLPage
+from hades_hl.client import FundingPage, HLError, HLPage
 from hades_hl.db import Fill, Kv, PaperEvent, Price, init_db, make_engine
 from hades_hl.live import (
     FillWatcher,
@@ -281,8 +282,8 @@ def test_model_uses_price_at_observed_plus_one_second(engine):
     rec = PriceRecorder(engine)
     rec.record({"BTC": "50"}, at=T0 + timedelta(milliseconds=500))  # before observed + 1 s
     m = HLExecutionModel(rec)
-    assert m.fill_price(ev()) is None  # nothing recorded in [obs + 1 s, obs + 31 s]
-    rec.record({"BTC": "100"}, at=T0 + timedelta(seconds=31))
+    assert m.fill_price(ev()) is None  # nothing recorded in [obs + 1 s, obs + 30 s]
+    rec.record({"BTC": "100"}, at=T0 + timedelta(seconds=30))
     assert m.fill_price(ev()) is not None
     eng2 = make_engine("sqlite://")
     init_db(eng2)
@@ -536,3 +537,275 @@ def test_poll_interval_respects_weight_budget(engine):
     assert w.poll_interval() == pytest.approx(30.0)
     w2 = watcher(engine, follows={a: None for a in addrs[:11]})
     assert w2.poll_interval() == pytest.approx(5.0)  # 1 polled: the 5 s floor
+
+
+
+# -- fix round 1 regressions ------------------------------------------------------------
+
+def test_model_window_p45_boundary(engine):
+    """Ruling P45: the copy window is [observed + 1 s, observed + 30 s]."""
+    rec = PriceRecorder(engine, min_interval_s=0)
+    m = HLExecutionModel(rec)
+    rec.record({"BTC": "101"}, at=T0 + timedelta(seconds=30, milliseconds=1))
+    assert m.fill_price(ev()) is None  # just past observed + 30 s: missed
+    rec.record({"BTC": "100"}, at=T0 + timedelta(seconds=30))
+    assert m.fill_price(ev()) is not None  # exactly observed + 30 s: inside
+    assert live.MODEL_WINDOW_S == 29
+
+
+def test_model_window_lower_bound_is_observed_plus_one_s(engine):
+    rec = PriceRecorder(engine)
+    m = HLExecutionModel(rec)
+    rec.record({"BTC": "50"}, at=T0 + timedelta(milliseconds=999))
+    assert m.fill_price(ev()) is None
+    rec.record({"BTC": "100"}, at=T0 + timedelta(seconds=1))
+    assert m.fill_price(ev()) == Decimal("100") * (1 + m.adjustment(m.notional(ev())))
+
+
+class FailRecovery(FakeClient):
+    """userFillsByTime fails the first ``n`` calls."""
+
+    def __init__(self, n=1, exc=None):
+        super().__init__()
+        self.n = n
+        self.exc = exc or HLError("boom")
+
+    async def user_fills_by_time(self, addr, start_ms, end_ms=None, *, on_page=None):
+        if self.n > 0:
+            self.n -= 1
+            self.calls.append((addr, int(start_ms)))
+            raise self.exc
+        return await super().user_fills_by_time(addr, start_ms, end_ms)
+
+
+async def test_recovery_failure_keeps_floor_and_emits_gap_later(engine):
+    """Important 1 (reviewer probe): a failed recovery must not lose the gap fills."""
+    start = datetime.now(UTC) - timedelta(hours=1)
+    c = FailRecovery()
+    w = FillWatcher(engine, c, {A: None}, start_time=start, fetch_leverage=False,
+                    sz_decimals={})
+    gap = mk("BTC", "B", "1", "100", "0", ms(start) + 60_000, tid=40)
+    c.fills[A] = [gap]
+    await w._recover([A])  # reconnect recovery fails
+    assert w.recovery_floor_ms[A] == ms(start)
+    await w.ingest(A, [gap], observed=datetime.now(UTC), via="ws", snapshot=True)
+    later = mk("BTC", "B", "1", "100", "1", ms(start) + 120_000, tid=41)
+    c.fills[A] = [gap, later]
+    await w.ingest(A, [later], observed=datetime.now(UTC), via="ws")
+    assert w.last_seen_ms[A] == ms(start)  # not past the floor
+    await w._recover([A])  # retry from the floor succeeds
+    refs = [e.source_ref for e in w.events]
+    assert sorted(refs) == ["0xh40:40", "0xh41:41"]  # each exactly once
+    assert A not in w.recovery_floor_ms
+    assert w.last_seen_ms[A] == ms(start) + 120_000
+    with Session(engine) as s:
+        row = s.get(PaperEvent, "0xh40:40")
+        assert row.json["via"] == "recovery"
+    # no chain gap: tid 40 opens, tid 41 increases the same episode
+    e40 = next(e for e in w.events if e.source_ref.endswith(":40"))
+    e41 = next(e for e in w.events if e.source_ref.endswith(":41"))
+    assert e40.side == "open" and e41.side == "increase"
+    assert e40.position_id == e41.position_id
+
+
+async def test_recovery_retry_backoff_schedule(engine):
+    c = FailRecovery(n=10)
+    w = watcher(engine, c, recovery_retry_s=10.0, recovery_retry_max_s=60.0)
+    delays = []
+    for _ in range(5):
+        await w._recover([A])
+        delays.append(w._retry_delay[A])
+    assert delays == [10.0, 20.0, 40.0, 60.0, 60.0]
+    assert w.recovery_floor_ms[A] == T0_MS  # the floor is the first pre-gap last_seen
+
+
+async def test_recovery_retried_on_timer_without_reconnect(engine):
+    start = datetime.now(UTC) - timedelta(hours=1)
+    gap = mk("BTC", "B", "1", "100", "0", ms(start) + 60_000, tid=60)
+    c = FailRecovery(n=2)
+    c.fills[A] = [gap]
+    got: list[TradeEvent] = []
+    async with FakeHL() as hl:  # one connection that stays open
+        w = watcher(engine, c, ws_url=hl.url, on_fill=got.append, start_time=start,
+                    follows={A: None}, recovery_retry_s=0.05, recovery_retry_max_s=0.1)
+        stop = asyncio.Event()
+        task = asyncio.create_task(w.run(stop))
+        await wait_for(lambda: len(got) >= 1)
+        stop.set()
+        await task
+    assert hl.connections == 1
+    assert [e.source_ref for e in got] == ["0xh60:60"]
+    assert len([a for a, _ in c.calls if a == A]) == 3  # 2 failures, then success
+    assert A not in w.recovery_floor_ms
+
+
+async def test_last_seen_not_advanced_when_ingest_fails(engine):
+    """Important 2 (reviewer probe): last_seen moves only after the commit."""
+    start = datetime.now(UTC) - timedelta(hours=1)
+    c = FakeClient()
+    w = FillWatcher(engine, c, {A: None}, start_time=start, sz_decimals={})
+    f1 = mk("BTC", "B", "1", "100", "0", ms(start) + 60_000, tid=50)
+    f2 = mk("BTC", "B", "1", "100", "1", ms(start) + 90_000, tid=51)
+
+    async def bad(addr):
+        raise RuntimeError("malformed clearinghouseState")
+    w._leverage_for = bad
+    with pytest.raises(RuntimeError):
+        await w.ingest(A, [f1, f2], observed=datetime.now(UTC), via="poll")
+    assert w.last_seen_ms[A] == ms(start)
+    w.fetch_leverage = False
+    c.fills[A] = [f1, f2]
+    page = await c.user_fills_by_time(A, w.last_seen_ms[A])
+    await w.ingest(A, page.fills, observed=datetime.now(UTC), via="poll")
+    assert sorted(e.source_ref for e in w.events) == ["0xh50:50", "0xh51:51"]
+    assert w.last_seen_ms[A] == ms(start) + 90_000
+
+
+async def test_leverage_error_of_any_kind_degrades_to_none(engine):
+    class BadState(FakeClient):
+        async def clearinghouse_state(self, addr):
+            return {"assetPositions": [{"position": "garbage"}]}
+
+    w = watcher(engine, BadState(), fetch_leverage=True)
+    evs = await w.ingest(A, [mk("BTC", "B", "1", "100", "0", T0_MS + 1, tid=70)],
+                         observed=T0 + timedelta(seconds=1), via="ws")
+    assert len(evs) == 1 and evs[0].leverage is None
+
+
+async def test_leverage_fetched_before_db_session(engine, monkeypatch):
+    w = watcher(engine, fetch_leverage=True)
+    opened = []
+    real = live.Session
+
+    def spy(*a, **k):
+        opened.append("session")
+        return real(*a, **k)
+    monkeypatch.setattr(live, "Session", spy)
+
+    async def lev(addr):
+        assert len(opened) == 0, "leverage fetched while a DB session is open"
+        return {}
+    w._leverage_for = lev
+    await w.ingest(A, [mk("BTC", "B", "1", "100", "0", T0_MS + 1, tid=71)],
+                   observed=T0 + timedelta(seconds=1), via="ws")
+    assert opened
+
+
+async def test_poll_loop_survives_unexpected_errors(engine):
+    """M2: a non-HL error and a malformed fill do not stop polling."""
+    addrs = [f"0x{i:040x}" for i in range(1, 3)]
+    polled = addrs[-1]
+    start = datetime.now(UTC) - timedelta(minutes=1)
+    good = mk("BTC", "B", "1", "100", "0", ms(start) + 1000, tid=80)
+
+    class Flaky(FakeClient):
+        n = 0
+
+        async def user_fills_by_time(self, addr, start_ms, end_ms=None, *, on_page=None):
+            if addr == polled:
+                self.n += 1
+                if self.n == 1:
+                    raise ValueError("unexpected payload")
+                if self.n == 2:
+                    return HLPage([{"coin": "BTC", "tid": 1}])  # malformed fill
+            return await super().user_fills_by_time(addr, start_ms, end_ms)
+
+    c = Flaky()
+    c.fills[polled] = [good]
+    got: list[TradeEvent] = []
+    w = watcher(engine, c, follows={a: None for a in addrs}, ws_max_user_subs=0,
+                on_fill=got.append, start_time=start, poll_interval_s=0.01,
+                weight_per_min=10**9)
+    stop = asyncio.Event()
+    task = asyncio.create_task(w.run(stop))
+    await wait_for(lambda: len(got) >= 1)
+    stop.set()
+    await task
+    assert got[0].source_ref == "0xh80:80" and c.n >= 3
+
+
+class FakeWS:
+    def __init__(self, fail=True):
+        self.fail = fail
+        self.closed = False
+        self.sent = []
+
+    async def send(self, msg):
+        if self.fail:
+            raise ConnectionError("ping failed")
+        self.sent.append(msg)
+
+    async def close(self):
+        self.closed = True
+
+
+async def test_failed_ping_tears_down_connection():
+    """M3: a failed heartbeat closes the WS so the read loop ends and reconnects."""
+    ws = FakeWS()
+    await asyncio.wait_for(live._heartbeat(ws, 0.01), timeout=2)
+    assert ws.closed
+
+
+async def test_heartbeat_awaited_on_teardown(engine):
+    """M3: the heartbeat task is cancelled AND awaited when a connection ends."""
+    seen = []
+    real = live._heartbeat
+
+    async def hb(ws, interval, *a):
+        try:
+            await real(ws, interval, *a)
+        except asyncio.CancelledError:
+            seen.append("cancelled")
+            raise
+        finally:
+            seen.append("done")
+
+    async def closer(ws, subs):
+        await wait_subs(subs, 1)
+        await ws.close()
+
+    import unittest.mock as um
+    with um.patch.object(live, "_heartbeat", hb):
+        async with FakeHL([closer]) as hl:
+            rec = PriceRecorder(engine, ws_url=hl.url, reconnect_base_s=10.0)
+            stop = asyncio.Event()
+            task = asyncio.create_task(rec.run(stop))
+            await wait_for(lambda: hl.connections >= 1 and "done" in seen)
+            stop.set()
+            await task
+    assert seen[:2] == ["cancelled", "done"]
+
+
+async def test_recorder_logs_name_actual_feed(engine, caplog):
+    """M4."""
+    async def closer(ws, subs):
+        await wait_subs(subs, 1)
+        await ws.close()
+
+    caplog.set_level(logging.WARNING, logger="hades_hl.live")
+    async with FakeHL([closer]) as hl:
+        rec = PriceRecorder(engine, ws_url=hl.url, feed="fastAssetCtxs",
+                            reconnect_base_s=10.0)
+        stop = asyncio.Event()
+        task = asyncio.create_task(rec.run(stop))
+        await wait_for(lambda: "WS closed" in caplog.text)
+        stop.set()
+        await task
+    assert "fastAssetCtxs WS closed" in caplog.text
+    assert "allMids" not in caplog.text
+
+
+async def test_ws_redelivery_of_recovered_fill_not_reemitted(engine):
+    """M9: recovery emitted a fill; the live WS then re-delivers it -> no second event."""
+    start = datetime.now(UTC) - timedelta(hours=1)
+    c = FakeClient()
+    f = mk("BTC", "B", "1", "100", "0", ms(start) + 60_000, tid=90)
+    c.fills[A] = [f]
+    got: list[TradeEvent] = []
+    w = watcher(engine, c, on_fill=got.append, start_time=start, follows={A: None})
+    await w._recover([A])
+    assert [e.source_ref for e in got] == ["0xh90:90"]
+    await w._on_ws(fills_msg(A, [f]), datetime.now(UTC), {A})
+    assert len(got) == 1
+    with Session(engine) as s:
+        assert len(s.scalars(select(PaperEvent)).all()) == 1
