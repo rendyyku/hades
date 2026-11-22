@@ -230,12 +230,12 @@ async def test_interleaved_orders_aggregate_independently(engine):
     (btc,) = await w.flush_due()
     assert (btc.market_id, btc.side, btc.size, btc.price, btc.seq) == (
         "BTC", "open", D(2), D(60001), 1)
-    assert btc.observed_time == NOW + 0.4 * S and w.has_buffered(A)
+    assert btc.observed_time == NOW + 2.45 * S and w.has_buffered(A)  # P73: the flush
     clock.t = NOW + 2.6 * S
     (eth,) = await w.flush_due()
     assert (eth.market_id, eth.side, eth.size, eth.price, eth.seq) == (
         "ETH", "open", D(4), D(3001), 2)
-    assert eth.observed_time == NOW + 0.6 * S and not w.has_buffered(A)
+    assert eth.observed_time == NOW + 2.6 * S and not w.has_buffered(A)
     r1, r2 = rows(engine)
     assert (r1.json["tids"], r1.json["oid"]) == ([1, 3], "50")
     assert (r2.json["tids"], r2.json["oid"]) == ([2, 4], "51")
@@ -251,7 +251,8 @@ async def test_another_order_on_the_same_position_ends_an_open_at_once(engine):
     # a sell order on that position: the open is complete as far as we can tell
     red = piece("0.4", "1", t + 1, 2, oid=51, side="A")
     (opn,) = await w.ingest(A, [red], observed=NOW + 0.5 * S, via="ws")
-    assert (opn.side, opn.size, opn.seq, opn.observed_time) == ("open", D(1), 1, NOW)
+    # P73: known complete when the sell piece arrived
+    assert (opn.side, opn.size, opn.seq, opn.observed_time) == ("open", D(1), 1, NOW + 0.5 * S)
     # one more piece of the opening order: it can no longer join the open
     late = piece("1", "0.6", t + 2, 3, oid=50)
     (r,) = await w.ingest(A, [late], observed=NOW + 1 * S, via="ws")
@@ -313,14 +314,15 @@ async def test_open_piece_5s_late_adjusts_the_ratio_and_later_orders_follow_it(e
     clock.t = late + 2 * S
     (adj,) = await w.flush_due()
     assert (adj.side, adj.size, adj.seq, adj.leverage) == ("adjust", D("1.2"), 2, D(10))
-    assert adj.position_id == opn.position_id and adj.observed_time == late
+    assert adj.position_id == opn.position_id and adj.observed_time == late + 2 * S  # P73
     assert adj.source_ref == "0xh9003:9003"
     js = rows(engine)[1].json  # the evidence
     assert (js["side"], js["oid"], js["tids"]) == ("adjust", "7001", [9003])
     assert (js["leader_start"], js["leader_end"]) == ("0.5002", "1.7002")
 
-    # only the open has a recorded price; the adjust's window [+6 s, +35 s] is empty
-    price(engine, "BTC", NOW + S, 60000)
+    # only the open has a recorded price (P73: [emit + 1 s, ..] = from NOW + 3 s); the
+    # adjust's window [+8 s, +37 s] is empty
+    price(engine, "BTC", NOW + 3 * S, 60000)
     with Session(engine) as s:
         pr.run_paper(s, A, NOW + 40 * S)
         snap = pr.snapshot(s, A)
@@ -346,7 +348,7 @@ async def test_open_piece_5s_late_adjusts_the_ratio_and_later_orders_follow_it(e
     clock.t = t_inc + 2 * S
     (e_inc,) = await w.flush_due()
     assert e_inc.side == "increase"
-    price(engine, "BTC", t_inc + S, 60000)
+    price(engine, "BTC", t_inc + 3 * S, 60000)
     with Session(engine) as s:
         pr.run_paper(s, A, t_inc + 40 * S)
         snap = pr.snapshot(s, A)
@@ -362,7 +364,7 @@ async def test_open_piece_5s_late_adjusts_the_ratio_and_later_orders_follow_it(e
     await w.ingest(A, [red], observed=t_red, via="ws")
     clock.t = t_red + 2 * S
     await w.flush_due()
-    price(engine, "BTC", t_red + S, 60000)
+    price(engine, "BTC", t_red + 3 * S, 60000)
     with Session(engine) as s:
         pr.run_paper(s, A, t_red + 40 * S)
         snap = pr.snapshot(s, A)

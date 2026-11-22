@@ -40,6 +40,24 @@ describe("PaperFillsTable", () => {
     expect(html).toContain("Reconcile close");
   });
 
+  it("shows a leader size adjust (P69) as a labelled row, not as a size-0 fill", () => {
+    const adjust = readPaperFills([
+      { ref: `${HASH}:13`, market_id: "DOGE", side: "adjust", direction: "long", size: "0", price: null, fee: "0", realized_pnl: "0", missed: false, reason: null, position_id: "DOGE:5", at: "2026-11-20T14:00:00+00:00" },
+    ]);
+    const out = renderToStaticMarkup(<PaperFillsTable fills={adjust} missedCount={0} />);
+    const row = out.slice(out.indexOf("<tbody>"));
+    expect(row).toContain("DOGE");
+    expect(row).toContain("Leader order completed (size adjust, no trade)");
+    // no size, price, fee or PnL cell, and it is neither a fill nor a missed copy
+    expect(row).not.toContain("$");
+    expect(row).not.toContain("adjust long");
+    expect(row).not.toContain("Missed");
+    expect(row).not.toContain("not copied");
+    expect(row.match(/<td/g)).toHaveLength(4); // when, coin, the label, source
+    // still traceable to the leader's transaction
+    expect(row).toContain(`href="https://app.hyperliquid.xyz/explorer/tx/${HASH}"`);
+  });
+
   it("says so when there is nothing yet", () => {
     expect(renderToStaticMarkup(<PaperFillsTable fills={[]} missedCount={0} />)).toContain("No paper fills yet");
   });

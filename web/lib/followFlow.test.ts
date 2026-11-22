@@ -17,6 +17,9 @@ describe("toggleIntent", () => {
     expect(UNFOLLOW_WARNING).toMatch(/28-day/);
     expect(UNFOLLOW_WARNING).toMatch(/paper history/);
     expect(UNFOLLOW_WARNING).toMatch(/restart/);
+    // follows.py: excluded from auto-follow only until it is re-added by hand
+    expect(UNFOLLOW_WARNING).toMatch(/not be auto-followed again until you re-add it by hand/);
+    expect(UNFOLLOW_WARNING).not.toMatch(/never auto-followed/);
   });
 });
 

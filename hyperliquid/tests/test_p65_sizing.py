@@ -279,15 +279,15 @@ async def test_smoke_split_order_is_one_copy_of_5pct_margin_times_leverage(engin
     assert got == [] and rows(engine) == [] and w.has_buffered(A)
     clock.t = last + 1.9 * S
     assert await w.flush_due() == []  # the order may still be filling
-    clock.t = last + AGG_WINDOW_S * S
+    emit = clock.t = last + AGG_WINDOW_S * S
     (ev,) = await w.flush_due()
     assert got == [ev] and not w.has_buffered(A)
     assert (ev.side, ev.size, ev.leverage) == ("open", D("1.7002"), D(10))
-    assert ev.observed_time == last  # when the LAST piece reached us
+    assert ev.observed_time == emit  # P73: when the buffer flushed, not the last piece
     assert ev.leader_time == ms_dt(ms(NOW) - 300)
     assert ev.source_ref == "0xh9001:9001" and ev.seq == 1
     (row,) = rows(engine)
-    assert row.observed_time == last and row.delay_ms == ms(last) - (ms(NOW) - 298)
+    assert row.observed_time == emit and row.delay_ms == ms(last) - (ms(NOW) - 298)
     js = row.json
     assert js["tids"] == [9001, 9002, 9003] and js["oid"] == "7001"
     assert [p["ref"] for p in js["pieces"]] == ["0xh9001:9001", "0xh9002:9002", "0xh9003:9003"]
@@ -296,8 +296,9 @@ async def test_smoke_split_order_is_one_copy_of_5pct_margin_times_leverage(engin
     with Session(engine) as s:
         assert sorted(s.scalars(select(PaperPiece.piece_ref))) == [
             "0xh9001:9001", "0xh9002:9002", "0xh9003:9003"]
-    # our price rule is unchanged (P45) and keyed to the event's observed_time
-    price(engine, "BTC", last + S, 60000)
+    # our price rule is unchanged (P45) and keyed to the event's observed_time (P73:
+    # the emit time)
+    price(engine, "BTC", emit + S, 60000)
     with Session(engine) as s:
         pr.run_paper(s, A, last + timedelta(minutes=1))
         snap = pr.snapshot(s, A)
@@ -320,7 +321,7 @@ async def test_smoke_split_order_without_oid_falls_back_to_the_same_millisecond(
     (ev,) = await w.flush_due()
     assert ev.side == "open" and ev.size == D("1.7002")
     assert rows(engine)[0].json["oid"] is None
-    price(engine, "BTC", NOW + S, 60000)
+    price(engine, "BTC", NOW + 3 * S, 60000)  # P73: emitted at NOW + 2 s
     with Session(engine) as s:
         pr.run_paper(s, A, NOW + timedelta(minutes=1))
         (pos,) = pr.snapshot(s, A)["open_positions"]
@@ -397,11 +398,12 @@ async def test_an_order_of_another_coin_does_not_flush_the_buffer(engine):
     clock.t = NOW + 2.5 * S
     (ev,) = await w.flush_due()  # the ETH order: 2 s after ITS last piece
     assert (ev.market_id, ev.side, ev.size, ev.seq) == ("ETH", "open", D(2), 1)
-    assert ev.observed_time == NOW + 0.5 * S and w.has_buffered(A)
+    assert ev.observed_time == NOW + 2.5 * S and w.has_buffered(A)  # P73: the flush
     clock.t = NOW + 3 * S
     (ev2,) = await w.flush_due()
     assert (ev2.market_id, ev2.side, ev2.size, ev2.seq) == ("BTC", "open", D(2), 2)
-    assert ev2.observed_time == obs_a2
+    assert ev2.observed_time == NOW + 3 * S
+    assert rows(engine)[1].json["last_piece_observed"] == ms(obs_a2)
     assert [r.seq for r in rows(engine)] == [1, 2]
 
 
@@ -463,7 +465,8 @@ async def test_cursor_never_passes_a_buffered_piece_and_a_restart_recovers_it(en
     clock2.t += 2 * S
     await w2.flush_due()
     (ev,) = got
-    assert ev.size == D("1.7002") and ev.observed_time == NOW + timedelta(minutes=1)
+    # P73: observed when the buffer flushed, 2 s after the recovery response
+    assert ev.size == D("1.7002") and ev.observed_time == NOW + timedelta(minutes=1) + 2 * S
     assert w2.last_seen_ms[A] == t + 2
     with Session(engine) as s:
         assert kv_get_json(s, f"hl:last_seen:{A}") == t + 2

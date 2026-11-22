@@ -15,7 +15,7 @@ export function toggleIntent(following: boolean): FollowIntent {
 
 /** Shown in the confirm step (hades_hl/follows.py: a re-follow is a NEW follow). */
 export const UNFOLLOW_WARNING =
-  "Stop paper-following this wallet? This cannot be undone: if you follow it again, the 28-day clock, the ladder and the paper history restart from zero, and it is never auto-followed again.";
+  "Stop paper-following this wallet? This cannot be undone: if you follow it again, the 28-day clock, the ladder and the paper history restart from zero, and it will not be auto-followed again until you re-add it by hand.";
 
 export type FollowOutcome = { ok: true } | { ok: false; error: string };
 

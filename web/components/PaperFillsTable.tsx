@@ -27,6 +27,11 @@ function Source({ f }: { f: PaperFillRow }) {
   );
 }
 
+/** P69: a late fill of the order that opened the position. No copy trade, so no numbers. */
+const ADJUST_LABEL = "Leader order completed (size adjust, no trade)";
+const ADJUST_HINT =
+  "A late fill of the order that opened this position. Our copy does not trade: its ratio follows the leader's new size.";
+
 /**
  * The paper fills behind the paper PnL (spec 1: every claim traceable): what we
  * copied, at which modelled price, and which leader events we missed.
@@ -67,15 +72,21 @@ export function PaperFillsTable({ fills, missedCount }: { fills: PaperFillRow[];
                   {f.at ? <time dateTime={f.at}>{f.at.replace("T", " ").slice(0, 19)} UTC</time> : "—"}
                 </td>
                 <td className={`${TD} font-mono text-fg`}>{f.coin}</td>
-                <td className={TD}>
-                  {f.side} {f.direction}
-                  {f.missed ? (
-                    <span className="ml-2 inline-flex items-center rounded border border-loss/50 px-1.5 py-0.5 font-mono text-[11px] uppercase tracking-wide text-loss">
-                      Missed
-                    </span>
-                  ) : null}
-                </td>
-                {f.missed ? (
+                {f.side === "adjust" ? (
+                  <td colSpan={5} title={ADJUST_HINT} className={`${TD} text-muted`}>
+                    {ADJUST_LABEL}
+                  </td>
+                ) : (
+                  <td className={TD}>
+                    {f.side} {f.direction}
+                    {f.missed ? (
+                      <span className="ml-2 inline-flex items-center rounded border border-loss/50 px-1.5 py-0.5 font-mono text-[11px] uppercase tracking-wide text-loss">
+                        Missed
+                      </span>
+                    ) : null}
+                  </td>
+                )}
+                {f.side === "adjust" ? null : f.missed ? (
                   <td colSpan={4} className={`${TD} text-right text-muted`}>
                     not copied
                   </td>

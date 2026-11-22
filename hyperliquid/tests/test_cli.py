@@ -1,6 +1,8 @@
 """Task 6: the hades-hl CLI (typer CliRunner, respx for HTTP)."""
 
 import json
+from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -12,7 +14,7 @@ from typer.testing import CliRunner
 from hades_hl import cli
 from hades_hl.client import HLClient
 from hades_hl.config import get_settings
-from hades_hl.db import Fill, Wallet, make_engine
+from hades_hl.db import Fill, PaperEvent, Wallet, init_db, make_engine
 
 INFO = "https://api.hyperliquid.xyz/info"
 LB = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
@@ -391,3 +393,37 @@ def test_watch_reports_summary(env, monkeypatch):
     assert res.exit_code == 0, res.output
     assert "watch done: ws 1 polled 0" in res.output
     assert "fills observed 0, median delay_ms None" in res.output
+
+
+def test_watch_median_delay_counts_each_watched_event_once(env, monkeypatch):
+    """Both wallets of one trade share the source_ref (hash:tid): the median is over
+    the watched events' own rows, looked up by (address, source_ref)."""
+    engine = make_engine(env)
+    init_db(engine)
+    t = datetime(2026, 11, 22, tzinfo=timezone.utc)
+    with Session(engine) as s:
+        # B is the other side of A's first trade, observed 900 ms late by its own head
+        for addr, ref, delay in [(A, "0xh1:1", 100), (A, "0xh2:2", 200), (B, "0xh1:1", 900)]:
+            s.add(PaperEvent(address=addr, source_ref=ref, json={}, observed_time=t,
+                             delay_ms=delay, seq=1))
+        s.commit()
+
+    class Rec:
+        messages = rows_written = 0
+
+        def __init__(self, *a, **kw) -> None:
+            pass
+
+        async def run(self, stop) -> None:
+            await stop.wait()
+
+    class Watcher(Rec):
+        ws_addresses, poll_addresses, connects = [A], [], []
+        events = [SimpleNamespace(wallet=A, source_ref="0xh1:1"),
+                  SimpleNamespace(wallet=A, source_ref="0xh2:2")]
+
+    monkeypatch.setattr(cli.live, "PriceRecorder", Rec)
+    monkeypatch.setattr(cli.live, "FillWatcher", Watcher)
+    res = invoke("watch", "--seconds", "0", "--address", A)
+    assert res.exit_code == 0, res.output
+    assert "fills observed 2, median delay_ms 150.0" in res.output

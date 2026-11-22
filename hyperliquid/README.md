@@ -37,6 +37,10 @@ CLI and the running head use two different databases.
   gives both counterparties of a trade the same `tid` and hash. `init-db` (and every
   command) migrates an older `tid`-only / `source_ref`-only table in place, in one
   transaction per table; a failure leaves the old table untouched.
+  **Back up `hades_hl.db` before upgrading: the `paper_events` re-key migration is
+  one-way.** Nothing converts the re-keyed table back, so the backup is the only way
+  to return to an older version: stop `serve` and copy the file (with its `-wal` /
+  `-shm` files, if present) first.
 - One leader order is one paper event. `fills.oid` (added in place to an older
   database; NULL on fills stored before) says which fills are one order; without it
   the fallback is the same coin and direction in the same millisecond. An event made
@@ -47,7 +51,11 @@ CLI and the running head use two different databases.
   orders of one wallet each become one event. A piece that arrives after its order
   was emitted is its own event; when that order opened the position its side is
   `adjust` (settled without a price, `missed` false, no alert): the copy does not
-  trade and its ratio follows the leader's new size.
+  trade and its ratio follows the leader's new size. An event's `observed_time` is
+  the time it was emitted (the buffer flush: when we could know the order was
+  complete), and the copy price is the first recorded mid in `[observed_time + 1 s,
+  observed_time + 30 s]`; when the last fill reached us is kept in the event JSON
+  (`last_piece_observed`), and `delay_ms` is that fill's feed delay.
 - Backfill fetches fills newest first and records the contiguous covered range in kv
   `hl:cov:<address>`; stats use only that range. Wallets with more than 10,000 fills
   in the window are capped (`history_partial`), keeping the newest 10,000. If the
@@ -91,5 +99,5 @@ CLI and the running head use two different databases.
   traded in 30 days, open paper positions) at most 1 row/s, every other perp coin at
   most every 5 s. A dead watcher or recorder is restarted. The fill watcher persists its
   cursor per wallet (kv `hl:last_seen:<address>`, `hl:floor:<address>`); after a
-  restart, fills made while it was down are recovered and copied with the recovery time
-  as `observed_time`.
+  restart, fills made while it was down are recovered and copied with an
+  `observed_time` no earlier than the recovery time.

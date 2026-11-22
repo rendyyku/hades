@@ -41,7 +41,9 @@ class TradeEvent:
       Informational only: the paper copy never fills at it, the ExecutionModel
       supplies our price.
     - ``leader_time``: when the leader's order started to fill; ``observed_time``: when
-      the head observed the last fill it merged (our price is keyed to it).
+      the head could act on the event (our price is keyed to it). For an order merged
+      from several fills that is when the head knew the order was complete (its emit
+      time), not when the last fill arrived.
     - ``position_id``: groups every event of one leader position episode (open ..
       close/resolve). When None the simulator keys by ``wallet:market_id:direction``.
     - ``group_id``: optional wider grouping for gate concentration checks (Polymarket:

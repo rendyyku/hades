@@ -38,8 +38,9 @@ says which legs belong together (same HL ``oid``; without ``oid`` the same coin 
 direction in the same millisecond), :class:`OrderBuffer` merges the legs with the same
 key, each observed at most ``AGG_WINDOW_S`` (2 s) after the previous piece, and
 :func:`order_event` is the merged TradeEvent (size = sum, price = size-weighted
-average, ``observed_time`` = the last piece's, ``source_ref`` = the first piece's;
-the pieces stay available as :attr:`OrderLegs.tids` / ``refs``). A flip inside one
+average, ``observed_time`` = the last piece's on the historical path and the emit
+time on the live one (ruling P73, :mod:`hades_hl.live`), ``source_ref`` = the first
+piece's; the pieces stay available as :attr:`OrderLegs.tids` / ``refs``). A flip inside one
 order gives one close and one open.
 
 Per order, not per run (ruling P69): every order has its own buffer, so orders of one
@@ -657,9 +658,10 @@ def group_legs(legs: Iterable[Leg], observed: Callable[[Leg], datetime] | None =
 
 def order_event(addr: str, order: OrderLegs, *, observed: datetime,
                 leverage: Decimal | None = None, seq: int = 0) -> TradeEvent:
-    """The TradeEvent of one leader order (ruling P65). ``observed``: when the LAST of
-    its pieces was observed. ``leader_time`` is the FIRST piece's: an order that
-    started before a follow did is not ours to copy."""
+    """The TradeEvent of one leader order (ruling P65). ``observed``: the event's
+    observed time; live it is the emit time (ruling P73: when the buffer flushed the
+    order), on the historical path the last piece's. ``leader_time`` is the FIRST
+    piece's: an order that started before a follow did is not ours to copy."""
     return TradeEvent(
         head=HEAD,
         wallet=addr,

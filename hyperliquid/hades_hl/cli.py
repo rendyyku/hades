@@ -14,6 +14,7 @@ import asyncio
 import logging
 import statistics
 from collections import Counter
+from collections.abc import Iterable
 from typing import Any, Optional
 
 import typer
@@ -21,6 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 
+from hades_core.events import TradeEvent
 from hades_hl import __version__, follows, insider, live, pipeline
 from hades_hl import paper_runtime as pr
 from hades_hl import runtime as rt
@@ -463,14 +465,20 @@ def watch(
 
     typer.echo(f"watch: {len(follows)} wallets for {seconds:g}s on {settings.WS_URL}")
     rec, w = asyncio.run(_with_client(settings, run))
-    refs = [e.source_ref for e in w.events]
     with Session(engine) as s:
-        delays = sorted(d for d in s.scalars(select(PaperEvent.delay_ms).where(
-            PaperEvent.source_ref.in_(refs))) if d is not None) if refs else []
+        delays = watch_delays(s, w.events)
     med = statistics.median(delays) if delays else None
     typer.echo(f"watch done: ws {len(w.ws_addresses)} polled {len(w.poll_addresses)} "
                f"connects {len(w.connects)}; {price_feed} messages {rec.messages}, price rows "
                f"{rec.rows_written}; fills observed {len(w.events)}, median delay_ms {med}")
+
+
+def watch_delays(session: Session, events: Iterable[TradeEvent]) -> list[int]:
+    """The stored ``delay_ms`` of the watched events, one per event: the rows are
+    looked up by ``(address, source_ref)``, since both wallets of one trade share the
+    ``source_ref``."""
+    rows = (session.get(PaperEvent, (e.wallet.lower(), e.source_ref)) for e in events)
+    return sorted(r.delay_ms for r in rows if r is not None and r.delay_ms is not None)
 
 
 @app.command("paper-run")

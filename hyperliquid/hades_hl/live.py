@@ -3,10 +3,15 @@ execution model the core paper simulator prices copies with.
 
 No hindsight (spec section 7, 12a):
 
-- ``observed_time`` is OUR clock when a fill reached us: ``now()`` when a WS message or
+- A fill is observed on OUR clock when it reaches us: ``now()`` when a WS message or
   a poll response arrives; for fills recovered by REST after a (re)connect or a gap,
   the time that recovery response arrived. Never the leader's fill time.
-  ``delay_ms = observed_time - fill.time`` is stored per event.
+- An event's ``observed_time`` is its EMIT time (ruling P73): when the aggregation
+  buffer flushed the order, i.e. the first moment we could know the order was complete
+  and size the copy. Never the arrival of its last piece, which is up to the window
+  plus a timer tick earlier (kept in the row as ``json.last_piece_observed``).
+  ``delay_ms`` is the feed delay of the last piece (its arrival - its leader time); the
+  buffer wait is not in it.
 - The WS ``userFills`` subscription first sends a snapshot (``isSnapshot: true``) of
   historical fills. Those are stored (``fills`` dedupes by ``(address, tid)``) but are
   NEVER emitted as live paper events. Fills the snapshot covers that happened while we
@@ -19,13 +24,14 @@ No hindsight (spec section 7, 12a):
   ``last_seen``); ``last_seen`` stays there until a recovery succeeds. Recovery is
   retried on a timer (RECOVERY_RETRY_S, doubling up to RECOVERY_RETRY_MAX_S) and on
   every reconnect; the successful retry emits every not-yet-emitted fill since the floor
-  (source_ref dedupe) with the retry response time as ``observed_time`` (P44).
+  (source_ref dedupe), observed at the retry response time (P44).
 - While a recovery is pending (floor set), live fills (WS or poll) of that address are
   stored but HELD, not emitted (P46): an emitted close could otherwise precede the
   open the recovery returns later. The successful recovery emits the gap fills and the
-  held fills as ONE chain-ordered batch (seq in that order), every event with the
-  recovery response time as ``observed_time``; then the floor clears and ``last_seen``
-  advances. Held fills are not emitted if the watcher stops first.
+  held fills as ONE chain-ordered batch (seq in that order), every piece observed at
+  the recovery response time (so no event's ``observed_time`` is before it); then the
+  floor clears and ``last_seen`` advances. Held fills are not emitted if the watcher
+  stops first.
 - Max age (P47): a fill whose leader time is more than RECOVERY_MAX_AGE_S (10 min)
   before the time we observe it is emitted as MISSED: stored already settled
   (``missed=True``), never priced. Copying a days-old open at today's price would be
@@ -37,9 +43,9 @@ One order, one event (ruling P65): a leader order fills in pieces, and a copy si
 the first piece is wrong by orders of magnitude. The watcher therefore buffers the
 pieces per (address, order) (ruling P69; same key: :func:`normalize.order_key`, i.e.
 coin, position, growing/shrinking, HL ``oid``; without ``oid`` the same millisecond)
-and emits ONE event per order (size = sum, leader price = size-weighted average,
-``observed_time`` = when the LAST piece reached us) ``AGG_WINDOW_S`` (2 s) after its
-last piece. Orders of one wallet that fill in turns each have their own buffer and
+and emits ONE event per order (size = sum, leader price = size-weighted average)
+``AGG_WINDOW_S`` (2 s) after its last piece; ``observed_time`` = that emit time
+(P73). Orders of one wallet that fill in turns each have their own buffer and
 do not end each other, with one exception that keeps a position's chain intact
 (:class:`normalize.OrderBuffer`): on the SAME position, a piece of an order going the
 other way, or any other order while the opening order is filling, ends the buffered
@@ -48,8 +54,16 @@ arrival) with ``seq`` in that order (P21/P26): a complete order waits while an o
 with an earlier last piece is still filling. A P46 release is still one chain-ordered
 batch, and stale pieces (P47) are never merged with fresh ones. Buffered pieces are
 stored fills but not yet events, so the persisted cursor never moves past them (a
-crash re-fetches them) and a stopping watcher emits them. The copy price rule is
-unchanged: ``price_at(coin, observed_time + 1 s)`` of the merged event.
+crash re-fetches them) and a stopping watcher emits them.
+
+Price window from order completion (ruling P73): the copy price rule is
+``price_at(coin, observed_time + 1 s)`` with ``observed_time`` = the emit time, so the
+window is ``[emit + 1 s, emit + 30 s]``. The emit time is the flush that emitted the
+order: the timer's ``now`` (window + tick after the last piece), the arrival of the
+batch whose piece ended the order (or, with a zero window, of its own batch), or the
+stop. It is never before the order's last piece nor before an event of that wallet
+already emitted, so ``(observed_time, seq)`` is the emission order. A mid recorded
+between the last piece and the emit is hindsight and is never used.
 
 Late pieces (ruling P69): a piece that arrives after its order was emitted is its own
 event. If that order OPENED the position, the event's side is ``adjust``: our copy
@@ -453,6 +467,7 @@ class FillWatcher:
         # P65/P69: per address the orders not yet emitted, each with its own buffer
         self.aggregate_window_s = aggregate_window_s
         self._agg: dict[str, OrderBuffer] = {}
+        self._emitted_at: dict[str, datetime] = {}  # P73: newest emit time per address
         self.stale_missed = 0  # P47: fills too old when observed, emitted as missed
         self._retry_delay: dict[str, float] = {}
         self._retry_due: dict[str, float] = {}  # loop.time() of the next retry
@@ -615,7 +630,8 @@ class FillWatcher:
         """Synchronous (no await): store fills, put the new legs into their orders (one
         chain-ordered batch, all observed at ``observed``) and persist the events of
         the orders that are complete (P65/P69: :class:`normalize.OrderBuffer`; all of
-        them when ``aggregate_window_s`` is 0). ``vias``: tid -> via. Legs with a
+        them when ``aggregate_window_s`` is 0), emitted at ``observed`` (P73: this
+        batch is what completed them). ``vias``: tid -> via. Legs with a
         leader time before ``stale_before_ms`` are stale (P47): they are never merged
         with fresh ones and are stored settled as missed."""
         with Session(self.engine) as s:
@@ -630,35 +646,40 @@ class FillWatcher:
             g = buf.add(lg, observed, stale=stale)
             g.vias.append(vias.get(int(lg.fill["tid"]), ""))
             g.leverage = lev.get(lg.coin, g.leverage)
-        return self._flush(addr)
+        return self._flush(addr, observed)
 
-    def _flush(self, addr: str, *, now: datetime | None = None,
+    def _flush(self, addr: str, at: datetime, *, now: datetime | None = None,
                force: bool = False) -> list[TradeEvent]:
         """Synchronous: persist the events of ``addr``'s complete orders, in emission
         order (:meth:`normalize.OrderBuffer.ready`: an order is complete ``force``d,
         with a zero window, or when ``now`` is at least ``aggregate_window_s`` after
-        its last piece). If the write fails nothing is dequeued (the next flush
-        retries)."""
+        its last piece), emitted at ``at`` (P73). If the write fails nothing is
+        dequeued (the next flush retries, with its own emit time)."""
         buf = self._agg.get(addr)
         orders = buf.ready(now, force=force) if buf else []
         if not orders:
             return []
         with Session(self.engine) as s:
-            out = self._emit(s, addr, orders)
+            out = self._emit(s, addr, orders, at)
         self.stale_missed += sum(1 for g, ev in zip(orders, out)
                                  if g.stale and ev.side != "adjust")
         buf.drop(orders)
         return out
 
-    def _emit(self, s: Session, addr: str, orders: list[PendingOrder]) -> list[TradeEvent]:
-        """One event per order, ``seq`` in the given (emission) order; commits."""
+    def _emit(self, s: Session, addr: str, orders: list[PendingOrder],
+              at: datetime) -> list[TradeEvent]:
+        """One event per order, ``seq`` in the given (emission) order; commits.
+        ``at``: the emit time of this flush = every event's ``observed_time`` (ruling
+        P73; never before the order's last piece or an event already emitted)."""
         key = KV_SEQ.format(addr)
         seq = int(pipeline.kv_get_json(s, key) or 0)
+        at = max(at, self._emitted_at.get(addr, at))
         out: list[TradeEvent] = []
         for g in orders:
             seq += 1
+            at = max(at, g.observed)
             order = OrderLegs(tuple(g.legs))
-            ev = order_event(addr, order, observed=g.observed, leverage=g.leverage, seq=seq)
+            ev = order_event(addr, order, observed=at, leverage=g.leverage, seq=seq)
             # the feed delay: observing the last piece vs the leader making it
             delay = _ms(g.observed) - order.last_time_ms
             # P69: an adjust is no trade, so a stale one is settled but never missed
@@ -673,7 +694,10 @@ class FillWatcher:
                   # P49: the leader's realized PnL on this order
                   "leader_closed_pnl": str(order.closed_pnl),
                   # P65 evidence: the order and the fills this event is made of
-                  "oid": order.oid, "tids": order.tids}
+                  "oid": order.oid, "tids": order.tids,
+                  # P73 evidence: when the last piece reached us (observed_time is
+                  # the emit time)
+                  "last_piece_observed": _ms(g.observed)}
             if len(g.legs) > 1:
                 js["pieces"] = [{"ref": lg.source_ref, "tid": int(lg.fill["tid"]),
                                  "sz": str(lg.size), "px": str(lg.price),
@@ -685,12 +709,13 @@ class FillWatcher:
             if g.stale:
                 js["stale_recovery"] = True
             s.add(PaperEvent(source_ref=ev.source_ref, address=addr, json=js,
-                             observed_time=g.observed, delay_ms=delay, seq=seq,
+                             observed_time=at, delay_ms=delay, seq=seq,
                              missed=missed,
-                             settled_at=g.observed if g.stale else None))
+                             settled_at=at if g.stale else None))
             out.append(ev)
         pipeline.kv_set_json(s, key, seq)
         s.commit()
+        self._emitted_at[addr] = at
         return out
 
     def has_buffered(self, addr: str) -> bool:
@@ -707,7 +732,7 @@ class FillWatcher:
         out: list[TradeEvent] = []
         for addr in list(self._agg):
             try:
-                evs = self._flush(addr, now=now, force=force)
+                evs = self._flush(addr, now, now=now, force=force)
             except Exception:  # a DB error: the orders stay queued, retried next tick
                 log.exception("hl watcher %s: emitting the buffered order failed", addr)
                 continue
@@ -1030,7 +1055,9 @@ class HLExecutionModel:
     """core ``ExecutionModel`` for Hyperliquid perps (spec 8.2, 12a).
 
     - ``fill_price``: the recorded mid at ``observed_time + 1 s`` (first mid in
-      ``[observed + 1 s, observed + 30 s]``, ruling P45; else None = missed), moved AGAINST us by half-spread 0.02% plus slippage
+      ``[observed + 1 s, observed + 30 s]``, ruling P45; ``observed_time`` is the
+      event's emit time, ruling P73; else None = missed), moved AGAINST us by
+      half-spread 0.02% plus slippage
       ``0.0005 * sqrt(notional / 100_000)``. ``notional`` is OUR copy's notional: the
       fixed ``copy_notional_usd`` when given, else ``stake_usd x min(leverage, 10)``
       (the simulator sizes after pricing, so the model can only estimate it).
