@@ -26,6 +26,10 @@ order into one event before it gets here.
 - increase: we add ``r`` x the leader's size delta. reduce: we cut the leader's
   fraction (delta / leader size) of OUR actual position, so a reduce can never take
   more than we hold or flip us. reduce / close / resolve are never capped.
+- adjust (ruling P69): a late piece of the order that opened the position. No copy
+  trade, no fee, never priced so never missed, no closed trade: the leader's size grows
+  and ``r`` becomes our qty / the leader's size after that piece. It is listed in
+  ``fills`` with size 0 and no price. Later increases scale by the new ``r``.
 - hard caps on every margin we add (open or increase), measured against the equity at
   that moment: one position's margin never exceeds ``max_position_margin_fraction``
   (20%) of the equity, and the margin committed over all open positions never exceeds
@@ -148,7 +152,8 @@ class OpenPosition:
     margin: Decimal
     leverage: Decimal
     leader_size: Decimal
-    # P65: our qty / the leader's size after the opening order; fixed at open
+    # P65: our qty / the leader's size after the opening order; fixed at open, re-based
+    # only by a late piece of that order (P69 ``adjust``)
     ratio: Decimal = ZERO
 
 
@@ -240,7 +245,7 @@ def simulate(
             if size <= ZERO:
                 ignored.pop(key, None)
                 return
-        else:  # open / increase
+        else:  # open / increase / adjust
             size += lead
         ignored[key] = size
 
@@ -356,6 +361,16 @@ def simulate(
             continue
 
         lead = abs(ev.size)
+        if ev.side == "adjust":
+            # P69: the opening order filled some more. Not a trade: no price, no fee.
+            pos = book[key].pos
+            pos.leader_size += lead
+            if pos.leader_size > ZERO:
+                pos.ratio = pos.qty / pos.leader_size
+            res.fills.append(PaperFill(ev.source_ref, ev.market_id, ev.side, ev.direction,
+                                       ZERO, None, ZERO, ZERO, False, key, at))
+            res.equity_curve.append((at, equity()))
+            continue
         price = model.fill_price(ev)
         if price is None:
             missed(ev, ZERO, None, "no_price", at)

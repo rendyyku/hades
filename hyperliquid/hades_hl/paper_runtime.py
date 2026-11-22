@@ -9,6 +9,8 @@
   row (``fill_price``), or the row is marked ``missed``. It is never re-priced: the
   simulation reads the stored price through :class:`SettledModel`. Younger events
   wait for the next run. Stale recovered fills (P47) arrive already settled as missed.
+  An ``adjust`` event (P69: a late piece of the order that opened the position) is no
+  trade: it is settled without a price and is never missed.
 - hourly marks (P48/P52): for every hour with a recorded price, the mark (latest mid at
   or before the hour, at most ``MARK_MAX_AGE_S`` old) is persisted in ``marks`` BEFORE
   the raw prices are pruned (2 days). simulate (core) gets ``mark_times`` = every final
@@ -183,9 +185,10 @@ def settle(session: Session, addr: str, now: datetime, model: Any) -> int:
             PaperEvent.address == addr, PaperEvent.settled_at.is_(None),
             PaperEvent.observed_time <= now - timedelta(seconds=SETTLE_S))):
         ev = _event(addr, r)
-        px = None if ev is None else model.fill_price(ev)
+        adjust = ev is not None and ev.side == "adjust"  # P69: no trade, no price
+        px = None if ev is None or adjust else model.fill_price(ev)
         r.fill_price = px
-        r.missed = px is None
+        r.missed = px is None and not adjust
         r.settled_at = now
         n += 1
     if n:
@@ -317,11 +320,13 @@ def gap_report(session: Session, addr: str, start: datetime, rows: list[PaperEve
 
     - gap: over the copied positions closed by ``now``, the sum of (the leader's
       closedPnl on that position x our open qty / the leader's open size) minus our pnl
-      on it.
+      on it. The leader's open size is the whole opening order: its ``open`` event plus
+      its late pieces (P69 ``adjust``).
     - leader_realized: the leader's raw closedPnl on positions opened since ``start``.
     Pre-follow positions are in neither; missed / uncopied positions are not in the gap.
     """
     by_pos: dict[str, Decimal] = {}
+    late: dict[str, Decimal] = {}  # P69: late pieces of the opening order, per position
     post_follow: set[str] = set()
     for r in rows:
         ev = events.get(r.source_ref)
@@ -329,6 +334,8 @@ def gap_report(session: Session, addr: str, start: datetime, rows: list[PaperEve
             continue
         if ev.side == "open" and ev.leader_time >= start:
             post_follow.add(ev.position_id)
+        if ev.side == "adjust":
+            late[ev.position_id] = late.get(ev.position_id, ZERO) + abs(ev.size)
         cp = _leader_cpnl(session, addr, r)
         if cp:
             by_pos[ev.position_id] = by_pos.get(ev.position_id, ZERO) + cp
@@ -343,7 +350,8 @@ def gap_report(session: Session, addr: str, start: datetime, rows: list[PaperEve
         ev = events.get(f.ev_ref) if f is not None else None
         if f is None or ev is None or not ev.size:
             continue
-        scaled += by_pos.get(ct.position_id, ZERO) * f.size / abs(ev.size)
+        lead = abs(ev.size) + late.get(ct.position_id, ZERO)
+        scaled += by_pos.get(ct.position_id, ZERO) * f.size / lead
         ours += ct.pnl_usd
     return gap(scaled, ours), leader_realized
 

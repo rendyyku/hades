@@ -136,14 +136,14 @@ def test_different_orders_are_not_merged():
     a = piece("1", "0", T0, 1, oid=10)
     b = piece("1", "1", T0, 2, oid=11)  # same ms, another order
     assert [e.size for e in fills_to_events(ADDR, [a, b])] == [D(1), D(1)]
-    # an order of another coin in between ends the run (the live rule: "until a
-    # different oid arrives for that address")
+    # P69: an order of another coin in between does NOT end the order (each order has
+    # its own buffer); events come out by their last piece
     x1 = piece("1", "0", T0, 3, oid=20)
     y = piece("5", "0", T0 + 1, 4, oid=21, coin="ETH", px="3000")
     x2 = piece("1", "1", T0 + 2, 5, oid=20)
     evs = fills_to_events(ADDR, [x1, y, x2])
     assert [(e.market_id, e.side, e.size) for e in evs] == [
-        ("BTC", "open", D(1)), ("ETH", "open", D(5)), ("BTC", "increase", D(1))]
+        ("ETH", "open", D(5)), ("BTC", "open", D(2))]
 
 
 def test_pieces_more_than_the_window_apart_are_separate_events():
@@ -152,8 +152,8 @@ def test_pieces_more_than_the_window_apart_are_separate_events():
     a, b, c = smoke(T0, step_ms=gap)  # exactly 2 s apart: still one order
     assert len(fills_to_events(ADDR, [a, b, c])) == 1
     a, b, c = smoke(T0, step_ms=gap + 1)
-    assert [e.side for e in fills_to_events(ADDR, [a, b, c])] == ["open", "increase",
-                                                                 "increase"]
+    # P69: late pieces of the order that opened the position adjust, they do not add
+    assert [e.side for e in fills_to_events(ADDR, [a, b, c])] == ["open", "adjust", "adjust"]
 
 
 def test_one_order_that_flips_gives_one_close_and_one_open():
@@ -208,14 +208,15 @@ def test_real_fixture_aggregates_without_losing_a_leg(fixture):
     evs = fills_to_events(addr, fills)
     assert len(evs) == len(groups) < len(legs)  # real orders do fill in pieces
     assert sum(len(g.legs) for g in groups) == len(legs)
-    assert [lg for g in groups for lg in g.legs] == legs  # same order, nothing moved
+    # P69: orders that fill in turns are merged across each other; no leg is lost
+    assert sorted(id(lg) for g in groups for lg in g.legs) == sorted(id(lg) for lg in legs)
     assert len({e.source_ref for e in evs}) == len(evs)
     for g, e in zip(groups, evs):
         assert e.size == sum(lg.size for lg in g.legs)
         assert e.notional_usd == sum(lg.size * lg.price for lg in g.legs)
         assert len({order_key(lg) for lg in g.legs}) == 1
         assert min(lg.price for lg in g.legs) <= e.price <= max(lg.price for lg in g.legs)
-    # core's processing order keeps every position's events in chain order
+    # core's processing order is the emitted order
     resorted = sorted(evs, key=event_sort_key)
     assert [e.source_ref for e in resorted] == [e.source_ref for e in evs]
     # an episode still starts with its open
@@ -380,24 +381,27 @@ def test_snapshot_and_api_split_missed_by_reason(tmp_path):
 
 # -- live path: the buffer ---------------------------------------------------------------
 
-async def test_a_different_order_flushes_the_buffer_at_once(engine):
+async def test_an_order_of_another_coin_does_not_flush_the_buffer(engine):
+    """P69 (was: a different order flushes the buffer at once): each order has its own
+    buffer and its own 2 s."""
     clock = Clock(NOW)
     w = watcher(engine, clock)
     t = ms(NOW) - 500
     a1 = piece("1", "0", t, 1, oid=50)
-    a2 = piece("1", "1", t + 1, 2, oid=50)
-    b = piece("2", "0", t + 2, 3, oid=51, coin="ETH", px="3000")
+    a2 = piece("1", "1", t + 2, 3, oid=50)
+    b = piece("2", "0", t + 1, 2, oid=51, coin="ETH", px="3000")
     await w.ingest(A, [a1], observed=NOW, via="ws")
-    obs_a2 = NOW + 0.2 * S
-    await w.ingest(A, [a2], observed=obs_a2, via="ws")
-    out = await w.ingest(A, [b], observed=NOW + 0.5 * S, via="ws")
-    (ev,) = out  # the BTC order, complete as far as we can tell
-    assert (ev.market_id, ev.side, ev.size, ev.seq) == ("BTC", "open", D(2), 1)
-    assert ev.observed_time == obs_a2  # its own last piece, not the ETH fill's time
-    assert w.has_buffered(A)  # the ETH order now waits for its own pieces
+    assert await w.ingest(A, [b], observed=NOW + 0.5 * S, via="ws") == []
+    obs_a2 = NOW + 1 * S
+    assert await w.ingest(A, [a2], observed=obs_a2, via="ws") == []  # still one BTC order
     clock.t = NOW + 2.5 * S
+    (ev,) = await w.flush_due()  # the ETH order: 2 s after ITS last piece
+    assert (ev.market_id, ev.side, ev.size, ev.seq) == ("ETH", "open", D(2), 1)
+    assert ev.observed_time == NOW + 0.5 * S and w.has_buffered(A)
+    clock.t = NOW + 3 * S
     (ev2,) = await w.flush_due()
-    assert (ev2.market_id, ev2.seq, ev2.observed_time) == ("ETH", 2, NOW + 0.5 * S)
+    assert (ev2.market_id, ev2.side, ev2.size, ev2.seq) == ("BTC", "open", D(2), 2)
+    assert ev2.observed_time == obs_a2
     assert [r.seq for r in rows(engine)] == [1, 2]
 
 
@@ -409,8 +413,8 @@ async def test_a_piece_arriving_after_the_window_is_a_separate_event(engine):
     out = await w.ingest(A, [b], observed=NOW + 2.001 * S, via="ws")
     assert [(e.side, e.size) for e in out] == [("open", D("0.0002"))]
     clock.t = NOW + 10 * S
-    (inc,) = await w.flush_due()
-    assert (inc.side, inc.size) == ("increase", D("0.5"))
+    (late,) = await w.flush_due()
+    assert (late.side, late.size) == ("adjust", D("0.5"))  # P69: no second copy trade
 
 
 async def test_window_zero_flushes_every_ingest_but_still_merges_a_batch(engine):
@@ -535,7 +539,8 @@ async def test_p47_stale_pieces_are_missed_and_not_merged_with_fresh_ones(engine
     pieces = [piece("1", "0", old, 1, oid=60), piece("1", "1", old + 1, 2, oid=60),
               piece("1", "2", fresh, 3, oid=60)]  # a resting order, filled over 20 min
     out = await w.ingest(A, pieces, observed=NOW, via="recovery")
-    assert [(e.side, e.size) for e in out] == [("open", D(2)), ("increase", D(1))]
+    # P69: the fresh piece belongs to the order that opened: an adjust
+    assert [(e.side, e.size) for e in out] == [("open", D(2)), ("adjust", D(1))]
     r_old, r_new = rows(engine)
     assert r_old.missed is True and r_old.settled_at == NOW and r_old.json["stale_recovery"]
     assert r_new.missed is None and r_new.settled_at is None
@@ -544,7 +549,7 @@ async def test_p47_stale_pieces_are_missed_and_not_merged_with_fresh_ones(engine
     with Session(engine) as s:
         pr.run_paper(s, A, NOW + timedelta(minutes=1))
         snap = pr.snapshot(s, A)
-    # the open was missed, so the fresh increase is not ours either: no position
+    # the open was missed, so the fresh piece is not ours either: no position
     assert snap["open_positions"] == [] and snap["missed_reasons"] == {"stale": 1}
 
 

@@ -43,7 +43,11 @@ CLI and the running head use two different databases.
   of several fills keeps the first fill's `hash:tid` as `source_ref`, lists all of
   them in its JSON (`tids`, `pieces`) and has one `paper_event_pieces` row per fill,
   so a fill delivered again is never emitted twice. Events stored before this are one
-  per fill and stay so.
+  per fill and stay so. Orders are buffered per (address, order), so interleaved
+  orders of one wallet each become one event. A piece that arrives after its order
+  was emitted is its own event; when that order opened the position its side is
+  `adjust` (settled without a price, `missed` false, no alert): the copy does not
+  trade and its ratio follows the leader's new size.
 - Backfill fetches fills newest first and records the contiguous covered range in kv
   `hl:cov:<address>`; stats use only that range. Wallets with more than 10,000 fills
   in the window are capped (`history_partial`), keeping the newest 10,000. If the

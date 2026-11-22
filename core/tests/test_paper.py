@@ -753,3 +753,83 @@ def test_p65_caps_are_measured_after_the_fill_s_own_fee():
                                     fee_rate=Decimal("0.001")), cfg, FOLLOW)
     assert margins(res) <= final_equity(res)
     assert margins(res) > Decimal("0.99") * final_equity(res)
+
+
+# --- ruling P69: a late piece of the opening order adjusts the ratio, it is no trade ---
+
+def test_p69_adjust_keeps_our_size_and_updates_the_ratio():
+    events = [
+        ev("o", "open", 1, size="1"),       # qty 5, r = 5
+        ev("a", "adjust", 2, size="1"),     # the same order filled 1 more: leader 2
+    ]
+    # no price for the adjust: it is not priced, so it cannot be missed
+    model = FakeModel({"o": Decimal("100")}, fee_rate=Decimal("0.001"))
+    res = simulate(events, model, CFG, FOLLOW)
+    pos = res.open_positions["p1"]
+    assert (pos.qty, pos.margin, pos.leader_size) == (Decimal("5"), Decimal("500"), Decimal("2"))
+    assert pos.ratio == Decimal("2.5")  # our qty / the leader's size after that piece
+    opn, adj = res.fills
+    assert (adj.ev_ref, adj.side, adj.size, adj.price) == ("a", "adjust", Decimal("0"), None)
+    assert (adj.fee, adj.realized_pnl, adj.missed, adj.reason) == (0, 0, False, None)
+    assert adj.position_id == "p1" and adj.at == events[1].observed_time
+    assert final_equity(res) == Decimal("10000") - opn.fee  # the open's fee, nothing else
+
+
+def test_p69_increase_after_an_adjust_scales_by_the_new_ratio_and_reduce_is_proportional():
+    events = [
+        ev("o", "open", 1, size="1"),       # qty 5, r = 5
+        ev("a", "adjust", 2, size="1"),     # leader 2, r = 2.5
+        ev("i", "increase", 3, size="2"),   # + 2.5 x 2 = 5 (the old r would add 10)
+        ev("r", "reduce", 4, size="1"),     # the leader cuts 1 of 4: we cut a quarter
+    ]
+    res = simulate(events, flat(["o", "i", "r"]), CFG, FOLLOW)
+    assert [(f.ev_ref, f.side, f.size) for f in res.fills] == [
+        ("o", "open", Decimal("5")), ("a", "adjust", Decimal("0")),
+        ("i", "increase", Decimal("5")), ("r", "reduce", Decimal("2.5"))]
+    pos = res.open_positions["p1"]
+    assert (pos.qty, pos.leader_size, pos.margin) == (Decimal("7.5"), Decimal("3"), Decimal("750"))
+    assert pos.ratio == Decimal("2.5")  # an increase or a reduce does not move it
+    assert not [f for f in res.fills if f.missed]
+
+
+def test_p69_adjust_is_not_a_trade():
+    events = [
+        ev("o", "open", 1, size="1"),
+        ev("a", "adjust", 2, size="3"),
+        ev("c", "close", 3, size="4"),
+    ]
+    model = FakeModel({"o": Decimal("100"), "c": Decimal("110")}, fee_rate=Decimal("0.001"))
+    res = simulate(events, model, CFG, FOLLOW)
+    assert [f.side for f in res.fills] == ["open", "adjust", "close"]
+    assert not any(f.missed for f in res.fills)
+    assert len(res.closed_trades) == 1 and res.open_positions == {}
+    assert sum(f.fee for f in res.fills) == Decimal("0.5") + Decimal("0.55")
+    assert res.closed_trades[0].pnl_usd == Decimal("50") - Decimal("1.05")  # 5 x (110 - 100)
+    assert len(res.equity_curve) == 4  # start + one point per event, the adjust too
+
+
+def test_p69_adjust_without_our_copy_is_a_no_op_but_the_leader_is_tracked():
+    # never held: nothing happens
+    res = simulate([ev("a", "adjust", 1, size="1")], flat([]), CFG, FOLLOW)
+    assert res.fills == [] and res.open_positions == {}
+    # the open was missed: the episode is ignored, the adjust grows the leader's size in
+    # it, so a reduce of the first piece's size does not end the episode early
+    events = [
+        ev("o", "open", 1, size="1"),      # no price: missed
+        ev("a", "adjust", 2, size="1"),
+        ev("r", "reduce", 3, size="1"),    # leader 2 -> 1: still the ignored episode
+        ev("o2", "open", 4, size="1"),     # a head bug would have to send this; ignored
+    ]
+    res = simulate(events, FakeModel({"o": None, "o2": Decimal("100")}), CFG, FOLLOW)
+    assert [(f.ev_ref, f.missed) for f in res.fills] == [("o", True)]
+    assert res.open_positions == {}
+
+
+def test_p69_adjust_on_a_position_opened_at_a_cap():
+    cfg = PaperConfig(risk_fraction=Decimal("0.5"))  # wants 5,000, the cap gives 2,000
+    events = [ev("o", "open", 1, size="1"), ev("a", "adjust", 2, size="1")]
+    res = simulate(events, flat(["o"]), cfg, FOLLOW)
+    pos = res.open_positions["p1"]
+    assert (pos.qty, pos.margin, pos.ratio) == (Decimal("20"), Decimal("2000"), Decimal("10"))
+    assert [(f.side, f.missed, f.reason) for f in res.fills] == [
+        ("open", False, None), ("open", True, "cap"), ("adjust", False, None)]

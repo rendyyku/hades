@@ -34,18 +34,28 @@ No hindsight (spec section 7, 12a):
   its persisted cursor, so its first poll after an outage returns the whole gap.
 
 One order, one event (ruling P65): a leader order fills in pieces, and a copy sized on
-the first piece is wrong by orders of magnitude. The watcher therefore buffers, per
-address, the pieces of the order being filled (same key: :func:`normalize.order_key`,
-i.e. coin, position, growing/shrinking, HL ``oid``; without ``oid`` the same
-millisecond) and emits ONE event (size = sum, leader price = size-weighted average,
-``observed_time`` = when the LAST piece reached us) when a fill of another order
-arrives for that address, or ``AGG_WINDOW_S`` (2 s) after the last piece. Events are
-still emitted in the leader's order with ``seq`` in that order (P21/P26), a P46
-release is still one chain-ordered batch, and stale pieces (P47) are never merged
-with fresh ones. Buffered pieces are stored fills but not yet events, so the
-persisted cursor never moves past them (a crash re-fetches them) and a stopping
-watcher emits them. The copy price rule is unchanged: ``price_at(coin, observed_time +
-1 s)`` of the merged event.
+the first piece is wrong by orders of magnitude. The watcher therefore buffers the
+pieces per (address, order) (ruling P69; same key: :func:`normalize.order_key`, i.e.
+coin, position, growing/shrinking, HL ``oid``; without ``oid`` the same millisecond)
+and emits ONE event per order (size = sum, leader price = size-weighted average,
+``observed_time`` = when the LAST piece reached us) ``AGG_WINDOW_S`` (2 s) after its
+last piece. Orders of one wallet that fill in turns each have their own buffer and
+do not end each other, with one exception that keeps a position's chain intact
+(:class:`normalize.OrderBuffer`): on the SAME position, a piece of an order going the
+other way, or any other order while the opening order is filling, ends the buffered
+order at once. Events are emitted in the simulator's order (last piece observed, then
+arrival) with ``seq`` in that order (P21/P26): a complete order waits while an order
+with an earlier last piece is still filling. A P46 release is still one chain-ordered
+batch, and stale pieces (P47) are never merged with fresh ones. Buffered pieces are
+stored fills but not yet events, so the persisted cursor never moves past them (a
+crash re-fetches them) and a stopping watcher emits them. The copy price rule is
+unchanged: ``price_at(coin, observed_time + 1 s)`` of the merged event.
+
+Late pieces (ruling P69): a piece that arrives after its order was emitted is its own
+event. If that order OPENED the position, the event's side is ``adjust``: our copy
+does not trade, its ratio is re-based on the leader's new size (core), and the row is
+never missed (it needs no price; a stale one is stored settled, not missed). A late
+piece of an increase / reduce order is a plain increase / reduce.
 
 Limits (verified 2026-11-21 against
 https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/rate-limits-and-user-limits):
@@ -85,8 +95,8 @@ from hades_hl import pipeline
 from hades_hl.client import INFO_WEIGHT_DEFAULT, WEIGHT_PER_MIN, HLError, info_weight, item_weight
 from hades_hl.db import (Fill, Kv, PaperEvent, PaperPiece, Price, _insert_ignore, insert_fills,
                          utcnow)
-from hades_hl.normalize import (AGG_WINDOW_S, Leg, OrderLegs, fill_legs, is_spot,
-                                leverage_by_coin, order_event, order_key)
+from hades_hl.normalize import (AGG_WINDOW_S, OrderBuffer, OrderLegs, PendingOrder, fill_legs,
+                                is_spot, leverage_by_coin, order_event)
 
 log = logging.getLogger(__name__)
 
@@ -381,25 +391,14 @@ async def _stop_task(task: asyncio.Task) -> None:
 OnFill = Callable[[TradeEvent], Any]
 
 
-@dataclass
-class _Order:
-    """P65: the pieces of one leader order seen so far (not yet an event)."""
-
-    key: tuple  # normalize.order_key + the P47 stale flag
-    legs: list[Leg]
-    vias: list[str]
-    observed: datetime  # when the last piece reached us
-    leverage: Decimal | None
-    stale: bool
-
-
 class FillWatcher:
     """Watches followed wallets' fills: WS ``userFills`` for the first
     ``ws_max_user_subs`` follows (by follow start, then address), REST polling for the
     rest. Every new fill is stored; each new leg at or after the wallet's live start
-    is merged with the other pieces of its order (P65: ``aggregate_window_s``, see the
-    module doc) into ONE TradeEvent (``seq`` from kv ``hl:seq:{addr}``), which is
-    persisted in ``paper_events`` (idempotent per piece) and handed to ``on_fill``.
+    is merged with the other pieces of its order (P65, P69: one buffer per order,
+    ``aggregate_window_s``, see the module doc) into ONE TradeEvent (``seq`` from kv
+    ``hl:seq:{addr}``), which is persisted in ``paper_events`` (idempotent per piece)
+    and handed to ``on_fill``.
     ``aggregate_window_s=0`` emits at the end of every ``ingest`` (pieces delivered
     together are still merged); otherwise ``run`` flushes on a timer, or call
     :meth:`flush_due`.
@@ -451,10 +450,9 @@ class FillWatcher:
         self.recovery_retry_s = recovery_retry_s
         self.recovery_retry_max_s = recovery_retry_max_s
         self.recovery_max_age_s = recovery_max_age_s
-        # P65: per address the orders not yet emitted, oldest first; only the last one
-        # can still take pieces, the others are complete and wait for the next flush
+        # P65/P69: per address the orders not yet emitted, each with its own buffer
         self.aggregate_window_s = aggregate_window_s
-        self._agg: dict[str, list[_Order]] = {}
+        self._agg: dict[str, OrderBuffer] = {}
         self.stale_missed = 0  # P47: fills too old when observed, emitted as missed
         self._retry_delay: dict[str, float] = {}
         self._retry_due: dict[str, float] = {}  # loop.time() of the next retry
@@ -600,72 +598,60 @@ class FillWatcher:
             newest = self._newest_ms.get(addr, 0)
             # P65: ... but never past a piece that is buffered, not yet an event: a
             # restart then re-fetches it (inclusive) instead of losing it
-            for g in self._agg.get(addr, ()):
+            for g in self._buffered(addr):
                 newest = min(newest, min(lg.time_ms for lg in g.legs))
             if newest > self.last_seen_ms.get(addr, 0):
                 self.last_seen_ms[addr] = newest
         self._persist_cursor(addr)
 
+    def _buffered(self, addr: str) -> list[PendingOrder]:
+        buf = self._agg.get(addr)
+        return buf.orders if buf is not None else []
+
     def _store_and_emit(self, addr: str, fills: list[dict], cand: list[dict],
                         lev: Mapping[str, Decimal], observed: datetime,
                         vias: Mapping[int, str],
                         stale_before_ms: int | None = None) -> list[TradeEvent]:
-        """Synchronous (no await): store fills, queue the new legs order by order (one
-        chain-ordered batch, all observed at ``observed``) and persist the events of the
-        orders that are complete (P65: every queued order but the last, which waits
-        for more pieces unless ``aggregate_window_s`` is 0). ``vias``: tid -> via.
-        Legs with a leader time before ``stale_before_ms`` are stale (P47): they are
-        never merged with fresh ones and are stored settled as missed."""
+        """Synchronous (no await): store fills, put the new legs into their orders (one
+        chain-ordered batch, all observed at ``observed``) and persist the events of
+        the orders that are complete (P65/P69: :class:`normalize.OrderBuffer`; all of
+        them when ``aggregate_window_s`` is 0). ``vias``: tid -> via. Legs with a
+        leader time before ``stale_before_ms`` are stale (P47): they are never merged
+        with fresh ones and are stored settled as missed."""
         with Session(self.engine) as s:
             insert_fills(s, addr, fills)
             s.commit()
             if not cand:
                 return []
             legs = self._new_legs(s, addr, cand)
+        buf = self._agg.setdefault(addr, OrderBuffer(self.aggregate_window_s))
         for lg in legs:
             stale = stale_before_ms is not None and lg.time_ms < stale_before_ms
-            key = (*order_key(lg), stale)
-            via = vias.get(int(lg.fill["tid"]), "")
-            q = self._agg.setdefault(addr, [])
-            g = q[-1] if q else None
-            if (g is not None and g.key == key and
-                    (observed - g.observed).total_seconds() <= self.aggregate_window_s):
-                g.legs.append(lg)  # one more piece of the order being filled
-                g.vias.append(via)
-                g.observed = max(g.observed, observed)
-                g.leverage = lev.get(lg.coin, g.leverage)
-            else:  # another order: the previous one is complete
-                q.append(_Order(key, [lg], [via], observed, lev.get(lg.coin), stale))
+            g = buf.add(lg, observed, stale=stale)
+            g.vias.append(vias.get(int(lg.fill["tid"]), ""))
+            g.leverage = lev.get(lg.coin, g.leverage)
         return self._flush(addr)
 
     def _flush(self, addr: str, *, now: datetime | None = None,
                force: bool = False) -> list[TradeEvent]:
-        """Synchronous: persist the events of ``addr``'s complete orders, oldest first:
-        every queued order but the last, and the last too when it is due (``force``, a
-        zero window, or ``now`` at least ``aggregate_window_s`` after its last piece).
-        If the write fails nothing is dequeued (the next flush retries)."""
-        q = self._agg.get(addr)
-        if not q:
-            self._agg.pop(addr, None)
-            return []
-        n = len(q) - 1
-        due = force or self.aggregate_window_s <= 0 or (
-            now is not None
-            and (now - q[-1].observed).total_seconds() >= self.aggregate_window_s)
-        if due:
-            n += 1
-        if not n:
+        """Synchronous: persist the events of ``addr``'s complete orders, in emission
+        order (:meth:`normalize.OrderBuffer.ready`: an order is complete ``force``d,
+        with a zero window, or when ``now`` is at least ``aggregate_window_s`` after
+        its last piece). If the write fails nothing is dequeued (the next flush
+        retries)."""
+        buf = self._agg.get(addr)
+        orders = buf.ready(now, force=force) if buf else []
+        if not orders:
             return []
         with Session(self.engine) as s:
-            out = self._emit(s, addr, q[:n])
-        self.stale_missed += sum(1 for g in q[:n] if g.stale)
-        del q[:n]
-        if not q:
-            del self._agg[addr]
+            out = self._emit(s, addr, orders)
+        self.stale_missed += sum(1 for g, ev in zip(orders, out)
+                                 if g.stale and ev.side != "adjust")
+        buf.drop(orders)
         return out
 
-    def _emit(self, s: Session, addr: str, orders: list[_Order]) -> list[TradeEvent]:
-        """One event per order, ``seq`` in the given (leader) order; commits."""
+    def _emit(self, s: Session, addr: str, orders: list[PendingOrder]) -> list[TradeEvent]:
+        """One event per order, ``seq`` in the given (emission) order; commits."""
         key = KV_SEQ.format(addr)
         seq = int(pipeline.kv_get_json(s, key) or 0)
         out: list[TradeEvent] = []
@@ -675,7 +661,9 @@ class FillWatcher:
             ev = order_event(addr, order, observed=g.observed, leverage=g.leverage, seq=seq)
             # the feed delay: observing the last piece vs the leader making it
             delay = _ms(g.observed) - order.last_time_ms
-            if g.stale:
+            # P69: an adjust is no trade, so a stale one is settled but never missed
+            missed = (ev.side != "adjust") if g.stale else None
+            if missed:
                 log.info("hl watcher %s: fill %s is %.0f min old when observed; missed",
                          addr, ev.source_ref, delay / 60_000)
             js = {**event_to_json(ev), "via": g.vias[-1],
@@ -698,7 +686,7 @@ class FillWatcher:
                 js["stale_recovery"] = True
             s.add(PaperEvent(source_ref=ev.source_ref, address=addr, json=js,
                              observed_time=g.observed, delay_ms=delay, seq=seq,
-                             missed=True if g.stale else None,
+                             missed=missed,
                              settled_at=g.observed if g.stale else None))
             out.append(ev)
         pipeline.kv_set_json(s, key, seq)
@@ -758,7 +746,7 @@ class FillWatcher:
         done.update(s.scalars(select(PaperPiece.piece_ref)
                               .where(PaperPiece.address == addr,
                                      PaperPiece.piece_ref.in_(refs))))
-        done.update(lg.source_ref for g in self._agg.get(addr, ()) for lg in g.legs)
+        done.update(lg.source_ref for g in self._buffered(addr) for lg in g.legs)
         return [lg for lg in legs if lg.source_ref not in done]
 
     async def _leverage_for(self, addr: str) -> dict[str, Decimal]:

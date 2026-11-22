@@ -35,20 +35,36 @@ One order, one event (ruling P65): a leader order usually fills in several piece
 scaled by the later ones is wrong by orders of magnitude, so the legs of one order on
 one position are merged into ONE event before anything is sized: :func:`order_key`
 says which legs belong together (same HL ``oid``; without ``oid`` the same coin and
-direction in the same millisecond), :func:`group_legs` merges consecutive legs with
-the same key observed at most ``AGG_WINDOW_S`` (2 s) after the previous piece, and
+direction in the same millisecond), :class:`OrderBuffer` merges the legs with the same
+key, each observed at most ``AGG_WINDOW_S`` (2 s) after the previous piece, and
 :func:`order_event` is the merged TradeEvent (size = sum, price = size-weighted
 average, ``observed_time`` = the last piece's, ``source_ref`` = the first piece's;
 the pieces stay available as :attr:`OrderLegs.tids` / ``refs``). A flip inside one
-order gives one close and one open. The live watcher merges the same way, piece by
-piece as they arrive (:class:`hades_hl.live.FillWatcher`).
+order gives one close and one open.
+
+Per order, not per run (ruling P69): every order has its own buffer, so orders of one
+wallet that fill in turns each become one event. Only where merging across another
+order would break a position's chain is an order ended early (:meth:`OrderBuffer.add`):
+by a piece of an order of the OTHER direction on the same position, and whenever the
+order that opened the position is involved. Events come out in the simulator's order
+(last piece observed, then arrival).
+
+Late pieces (ruling P69): a piece that can no longer join its order is its own event.
+If its order OPENED the position (:attr:`Leg.open_piece`: same ``oid`` as the episode's
+opening fill) the event's side is ``adjust``: the copy trades nothing and its ratio is
+re-based on the leader's new size. A late piece of an increase / reduce order is a
+plain increase / reduce (the copy scales it by the ratio, under the caps).
+
+:func:`group_legs` / :func:`fills_to_events` (history) and the live watcher
+(:class:`hades_hl.live.FillWatcher`, piece by piece as they arrive) share the buffer,
+so both emit the same structure.
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 
@@ -293,6 +309,8 @@ class Leg:
     end: Decimal  # signed position after this leg
     liquidation: bool
     ref_suffix: str  # "" or ":close" / ":open" for flip legs
+    # P69: an increase filled by the order (HL ``oid``) that opened this episode
+    open_piece: bool = False
 
     @property
     def time_ms(self) -> int:
@@ -342,6 +360,7 @@ def normalize_fills(addr: str, fills: Iterable[Mapping], *,
     gaps = 0
     legs: list[Leg] = []
     cur: dict[str, str | None] = {}  # coin -> open episode id (None when flat)
+    opener: dict[str, tuple] = {}  # coin -> (episode id, oid of its opening fill), P69
     last_end: dict[str, Decimal] = {}
     for f in ordered:
         coin, tid = f["coin"], f["tid"]
@@ -375,10 +394,14 @@ def normalize_fills(addr: str, fills: Iterable[Mapping], *,
         cpnl = Decimal(str(f.get("closedPnl") or "0"))
         liq = is_own_liquidation(f, addr)
         sz = abs(d)
+        oid = f.get("oid")
 
         def leg(side, direction, size, fee_, cpnl_, pid_, st, en, liq_, suffix="") -> Leg:
+            if side == "open":
+                opener[coin] = (pid_, oid)
+            late = side == "increase" and oid is not None and opener.get(coin) == (pid_, oid)
             return Leg(f, coin, side, direction, size, px, fee_, cpnl_, pid_, st, en, liq_,
-                       suffix)
+                       suffix, late)
 
         if s == 0:
             legs.append(leg("open", _dir(d), sz, fee, cpnl, pid, s, e, liq))
@@ -447,8 +470,11 @@ class OrderLegs:
     @property
     def side(self) -> str:
         """open / increase by the first leg; reduce, or close when the last leg ends
-        the position."""
+        the position. ``adjust`` (P69) when the first leg is a late piece of the order
+        that opened the position."""
         first, last = self.legs[0].side, self.legs[-1].side
+        if first == "increase" and self.legs[0].open_piece:
+            return "adjust"
         return first if first in ("open", "increase") else last
 
     @property
@@ -508,23 +534,125 @@ class OrderLegs:
         return None if oid is None else str(oid)
 
 
+def piece_kind(lg: Leg) -> str:
+    """``open``: a piece of the order that opened the episode; else ``grow`` /
+    ``shrink``."""
+    if lg.side == "open" or lg.open_piece:
+        return "open"
+    return "grow" if lg.side == "increase" else "shrink"
+
+
+@dataclass
+class PendingOrder:
+    """The pieces of one leader order seen so far (not yet an event)."""
+
+    key: tuple  # order_key + the caller's ``stale`` flag
+    legs: list[Leg]
+    observed: datetime  # when the last piece was observed
+    n: int  # arrival index of the last piece
+    stale: bool = False
+    done: bool = False  # complete: it takes no more pieces
+    # the live watcher's bookkeeping
+    vias: list[str] = field(default_factory=list)
+    leverage: Decimal | None = None
+
+    @property
+    def position_id(self) -> str:
+        return self.legs[0].position_id
+
+    @property
+    def kind(self) -> str:
+        return piece_kind(self.legs[0])
+
+
+class OrderBuffer:
+    """One wallet's orders that are still filling (rulings P65, P69): a buffer per
+    order, so orders that fill in turns do not cut each other short.
+
+    :meth:`add` puts a piece into its order: the pending order with the same
+    :func:`order_key` whose last piece was observed at most ``window_s`` before. An
+    order is complete (``done``) when a piece of it comes later than that, when
+    :meth:`ready` finds it quiet for ``window_s``, or when the piece of ANOTHER order
+    arrives on the same position and merging across it would break the position's
+    chain: the two go in opposite directions (a sell summed over a buy that came in
+    between could look bigger than the position was), or one of them is the order
+    that opened the position (nothing may be sized before its open, and the ratio
+    moves with it). Two buy orders, or two sell orders, on one position commute and
+    stay independent.
+
+    :meth:`ready` returns the complete orders in the simulator's order (last piece
+    observed, then arrival). A complete order waits while an order with an earlier
+    last piece is still filling, so events never come out against that order.
+    """
+
+    def __init__(self, window_s: float = AGG_WINDOW_S) -> None:
+        self.window = timedelta(seconds=window_s)
+        self.orders: list[PendingOrder] = []  # not yet taken, by first piece
+        self._filling: dict[str, list[PendingOrder]] = {}  # position id -> not done
+        self._n = 0
+
+    def __bool__(self) -> bool:
+        return bool(self.orders)
+
+    def _finish(self, g: PendingOrder) -> None:
+        g.done = True
+        live = self._filling.get(g.position_id, [])
+        if g in live:
+            live.remove(g)
+            if not live:
+                del self._filling[g.position_id]
+
+    def add(self, lg: Leg, at: datetime, *, stale: bool = False) -> PendingOrder:
+        """Put the piece ``lg``, observed at ``at``, into its order; returns it."""
+        key = (*order_key(lg), stale)
+        kind = piece_kind(lg)
+        self._n += 1
+        hit = None
+        for g in list(self._filling.get(lg.position_id, ())):
+            if at - g.observed > self.window:
+                self._finish(g)  # quiet for longer than the window
+            elif g.key == key:
+                hit = g
+            elif kind == "open" or g.kind != kind:
+                self._finish(g)
+        if hit is None:
+            hit = PendingOrder(key, [], at, self._n, stale)
+            self.orders.append(hit)
+            self._filling.setdefault(lg.position_id, []).append(hit)
+        hit.legs.append(lg)
+        hit.observed = max(hit.observed, at)
+        hit.n = self._n
+        return hit
+
+    def ready(self, now: datetime | None = None, *, force: bool = False) -> list[PendingOrder]:
+        """The complete orders that may be emitted now, in emission order; they stay
+        in the buffer until :meth:`drop`. An order is also complete when ``force``,
+        with a zero window, or when ``now`` is at least the window after its last
+        piece."""
+        for g in self.orders:
+            if not g.done and (force or self.window <= timedelta(0) or (
+                    now is not None and now - g.observed >= self.window)):
+                self._finish(g)
+        out: list[PendingOrder] = []
+        for g in sorted(self.orders, key=lambda g: (g.observed, g.n)):
+            if not g.done:
+                break
+            out.append(g)
+        return out
+
+    def drop(self, orders: Iterable[PendingOrder]) -> None:
+        gone = {id(g) for g in orders}
+        self.orders = [g for g in self.orders if id(g) not in gone]
+
+
 def group_legs(legs: Iterable[Leg], observed: Callable[[Leg], datetime] | None = None,
                window_s: float = AGG_WINDOW_S) -> list[OrderLegs]:
-    """Merge consecutive legs with the same :func:`order_key`, each observed at most
-    ``window_s`` after the previous piece (``observed(leg)``; default its leader time).
-    The order of the legs is kept; a leg of another order ends the run."""
-    window = timedelta(seconds=window_s)
-    out: list[list[Leg]] = []
-    key = last = None
+    """The legs merged order by order (:class:`OrderBuffer`; ``observed(leg)``: default
+    its leader time), in emission order: by the last piece of each order."""
+    buf = OrderBuffer(window_s)
     for lg in legs:
-        k = order_key(lg)
-        at = observed(lg) if observed is not None else ms_to_dt(lg.time_ms)
-        if out and k == key and at - last <= window:
-            out[-1].append(lg)
-        else:
-            out.append([lg])
-        key, last = k, at
-    return [OrderLegs(tuple(g)) for g in out]
+        buf.add(lg, observed(lg) if observed is not None else ms_to_dt(lg.time_ms))
+    return [OrderLegs(tuple(g.legs)) for g in buf.ready(force=True)]
 
 
 def order_event(addr: str, order: OrderLegs, *, observed: datetime,
@@ -560,8 +688,10 @@ def fills_to_events(
     leverage: Mapping[str, Decimal] | None = None,
     sz_decimals: SzDecimals = None,
 ) -> list[TradeEvent]:
-    """Map raw HL fills of ``addr`` to TradeEvents, in execution order: one event per
-    leader order and position (ruling P65, :func:`group_legs`).
+    """Map raw HL fills of ``addr`` to TradeEvents: one event per leader order and
+    position (ruling P65, :func:`group_legs`), in the simulator's order (by the last
+    piece of each order; ``seq`` in that order). A late piece of the order that opened
+    a position is an ``adjust`` event (ruling P69).
 
     ``observed_time_fn(fill) -> datetime`` gives the observed time; by default it is the
     leader time (historical normalization; the live watcher merges its own way). An

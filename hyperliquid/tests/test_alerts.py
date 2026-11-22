@@ -98,6 +98,16 @@ def test_previous_size_reconstructed_from_episode_when_not_stored(session):
     assert [a.source_ref for a in out] == [inc.source_ref]
 
 
+def test_adjust_event_is_no_alert_but_counts_in_the_episode_size(session):
+    """P69: a late piece of the opening order is no new decision of the leader."""
+    set_ladder(session, "NOTIF")
+    ev("open", "4", s=session, pid="BTC:9")
+    adj = ev("adjust", "4", s=session, pid="BTC:9")
+    inc = ev("increase", "1.6", s=session, pid="BTC:9")  # 1.6 / 8 = 20%, not 1.6 / 4
+    assert al.emit_alerts(session, A, [adj, inc], None) == []
+    assert kinds(session) == []
+
+
 def test_unknown_previous_size_alerts(session):
     """A pre-follow episode (size unknown): the change cannot be ruled small -> alert."""
     set_ladder(session, "NOTIF")

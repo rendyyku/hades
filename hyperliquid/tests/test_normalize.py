@@ -257,11 +257,13 @@ def test_real_fixture_events(fixture, caplog):
     assert n_flips == 29
     legs = fill_legs(meta["address"], fills)
     assert len(legs) == len(fills) + n_flips
-    # P65: one event per leader order and position, not per fill
-    assert len(evs) == len(group_legs(legs)) == 1033
+    # P65: one event per leader order and position, not per fill (P69: per order even
+    # when another order fills in between, so one event fewer than the 1033 runs)
+    assert len(evs) == len(group_legs(legs)) == 1032
     assert len({e.source_ref for e in evs}) == len(evs)
     assert {e.side for e in evs} <= {"open", "increase", "reduce", "close"}
-    times = [e.leader_time for e in evs]
+    # P69: emitted by the last piece of each order (the simulator's order)
+    times = [e.observed_time for e in evs]
     assert times == sorted(times)
     # the startPosition chain is continuous after ordering: no fill contradicts it
     pos: dict[str, Decimal] = {}

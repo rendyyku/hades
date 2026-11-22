@@ -60,7 +60,7 @@ def _episode_size_before(session: Session, addr: str, ev: TradeEvent) -> Decimal
             size = sz
         elif size is None:
             continue
-        elif side == "increase":
+        elif side in ("increase", "adjust"):
             size += sz
         elif side == "reduce":
             size = max(size - sz, ZERO)
@@ -92,6 +92,8 @@ def _insert(session: Session, values: dict) -> Alert | None:
 
 def _event_alert(session: Session, addr: str, ev: TradeEvent, ladder: str,
                  at: datetime) -> dict | None:
+    if ev.side == "adjust":  # P69: a late piece of the opening order, no new decision
+        return None
     kind = "close" if ev.side == "resolve" else ev.side
     payload: dict[str, Any] = {
         "head": HEAD, "side": ev.side, "direction": ev.direction, "coin": ev.market_id,

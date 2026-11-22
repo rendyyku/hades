@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Literal
 
-Side = Literal["open", "increase", "reduce", "close", "resolve"]
+Side = Literal["open", "increase", "reduce", "close", "resolve", "adjust"]
 Direction = Literal["long", "short", "yes", "no"]
 
 
@@ -33,6 +33,10 @@ class TradeEvent:
     - ``size``: the leader's absolute size delta of *this* event (not the resulting
       position size), always >= 0 in meaning; the simulator uses ``abs(size)``. For an
       ``open`` it is the leader's position size after the opening order.
+    - ``side`` ``adjust`` (ruling P69): a piece of the order that OPENED the position,
+      seen after its ``open`` event was emitted. The leader's position grew by ``size``
+      but it is no new decision: the simulator trades nothing and re-bases the copy
+      ratio on the leader's new size.
     - ``price``: the leader's own fill price (size-weighted over the merged fills).
       Informational only: the paper copy never fills at it, the ExecutionModel
       supplies our price.
