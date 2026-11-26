@@ -117,3 +117,8 @@ def test_counts_and_mark(store):
     store.insert_listing(ListingEvent("kraken", "CAT/USD", "CAT", NOW, {}))
     assert store.counts_since(NOW - timedelta(days=1)) == {"signals": 1, "alerts": 1, "listings": 1}
     assert store.get_signal(sid)["listed_on"][0]["exchange"] == "coinbase"
+
+
+def test_record_ok_for_new_watcher(store):
+    store.record_ok("fresh", NOW)
+    assert store.watchers()[0]["last_ok"] == NOW

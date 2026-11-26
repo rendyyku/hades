@@ -149,7 +149,7 @@ class Store:
         with self.engine.begin() as c:
             n = c.execute(update(watcher_state).where(watcher_state.c.name == name).values(**values)).rowcount
             if not n:
-                c.execute(insert(watcher_state).values(name=name, fail_count=0, **values))
+                c.execute(insert(watcher_state).values(**{"name": name, "fail_count": 0, **values}))
 
     def save_state(self, name: str, state: dict) -> None:
         self._upsert_state(name, cursor=state)
