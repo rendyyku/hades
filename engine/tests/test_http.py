@@ -45,9 +45,10 @@ async def test_get_json_html_body_raises(http):
 @respx.mock
 async def test_get_json_404_no_retry(http):
     route = respx.get(URL).mock(return_value=httpx.Response(404))
-    with pytest.raises(SourceError):
+    with pytest.raises(SourceError) as e:
         await http.get_json(URL)
     assert route.call_count == 1
+    assert e.value.status == 404
 
 
 @respx.mock

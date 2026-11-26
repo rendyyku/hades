@@ -27,6 +27,10 @@ SleepFn = Callable[[float], Awaitable[Any]]
 class SourceError(Exception):
     """A request failed for good (4xx, exhausted retries, network, or a non-JSON body)."""
 
+    def __init__(self, msg: str, status: int | None = None) -> None:
+        super().__init__(msg)
+        self.status = status
+
 
 class TokenBucket:
     """Async token bucket: `rate` tokens/sec, burst capacity max(1, rate)."""
@@ -86,7 +90,7 @@ class Http:
                 if resp.status_code < 400:
                     return resp
                 if resp.status_code != 429 and resp.status_code < 500:
-                    raise SourceError(f"HTTP {resp.status_code} for {urlsplit(url).hostname}")
+                    raise SourceError(f"HTTP {resp.status_code} for {urlsplit(url).hostname}", resp.status_code)
                 err = f"HTTP {resp.status_code}"
                 wait = _retry_after(resp)
             if attempt == max_retries:
