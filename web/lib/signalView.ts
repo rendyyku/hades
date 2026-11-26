@@ -70,3 +70,17 @@ export function safeHref(url: string | null | undefined): string | null {
 export function shortUrl(url: string): string {
   return url.replace(/^https?:\/\//, "").replace(/\/$/, "");
 }
+
+function leadAmount(hours: number): string {
+  return hours >= 72 ? `${Math.floor(hours / 24)} hari` : `${Math.round(hours)} jam`;
+}
+
+/** `50 jam setelah sinyal`; from 72 h on, whole days: `3 hari setelah sinyal`. */
+export function leadText(hours: number): string {
+  return `${leadAmount(hours)} setelah sinyal`;
+}
+
+/** Same lead, worded from the listing's side: `50 jam sebelum listing`. */
+export function leadBeforeListing(hours: number): string {
+  return `${leadAmount(hours)} sebelum listing`;
+}

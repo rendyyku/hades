@@ -69,3 +69,11 @@ describe("signalLabel", () => {
     expect(signalLabel({ ...base, symbol: null, name: null })).toBe("—");
   });
 });
+
+describe("leadBeforeListing", () => {
+  it("words the lead from the listing's point of view", async () => {
+    const { leadBeforeListing } = await import("./signalView");
+    expect(leadBeforeListing(50)).toBe("50 jam sebelum listing");
+    expect(leadBeforeListing(80)).toBe("3 hari sebelum listing");
+  });
+});
