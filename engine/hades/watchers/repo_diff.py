@@ -88,7 +88,7 @@ class RepoDiffWatcher(Watcher):
                 chain = self._chain(g.get("chain"))
                 if chain and g.get("symbol"):
                     out.append({"chain": chain, "address": g.get("address"), "symbol": g["symbol"],
-                                "name": None, "website": None})
+                                "name": g.get("name"), "website": None})
         return out
 
     async def _dir_entries(self, files: list[dict], ref: str) -> list[dict]:

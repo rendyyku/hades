@@ -192,3 +192,39 @@ async def test_regex_entries(gh):
     _no_prs("BitGo/BitGoJS")
     res = await _run(w, {"head": "s0", "prs": {}, "keys": []})
     assert [(s.symbol, s.chain, s.address) for s in res.signals] == [("CAT", "monad", "0xabc")]
+
+
+@respx.mock
+async def test_regex_bitgo_hoodeth_format(gh):
+    # real BitGo statics shape (hoodethTokens.ts), regex from config.example.yaml
+    import yaml
+    from pathlib import Path
+    cfg = yaml.safe_load((Path(__file__).resolve().parents[2] / "config.example.yaml").read_text(encoding="utf-8"))
+    tgt = next(t for t in cfg["repo_diff"]["targets"] if t["repo"] == "BitGo/BitGoJS")
+    t = RepoTarget(**tgt)
+    [w] = build_repo_watchers(t, gh, 900, {"robinhood": ChainCfg(evm=True)})
+    text = """
+  erc20Token(
+    'uuid-1',
+    'hoodeth:cat',
+    "Cash Cat's Coin",
+    18,
+    '0x86923f96303d656e4aa86d9d42d1e57ad2023fdc',
+    UnderlyingAsset['hoodeth:cat'],
+  ),
+  erc20Token(
+    'uuid-2',
+    'thoodeth:tsla',
+    'Tesla',
+    18,
+    '0xc9f9c86933092bbbfff3ccb4b105a4a94bf3bd4e',
+  ),
+"""
+    path = tgt["path"]
+    _commits("BitGo/BitGoJS", "s1", "s0")
+    respx.get(f"{API}/repos/BitGo/BitGoJS/contents/{path}", params={"ref": "s1"}).mock(
+        return_value=httpx.Response(200, text=text))
+    _commit_pulls("BitGo/BitGoJS", "s1")
+    _no_prs("BitGo/BitGoJS")
+    res = await _run(w, {"head": "s0", "prs": {}, "keys": []})
+    assert [(s.symbol, s.name, s.chain) for s in res.signals] == [("cat", "Cash Cat's Coin", "robinhood")]

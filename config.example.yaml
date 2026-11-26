@@ -2,7 +2,7 @@
 
 chains:
   # priority: true = new ecosystems we care most about (score bonus)
-  # network ids: verify (Task 15)
+  # GeckoTerminal + DexScreener network ids verified 2026-11-27
   robinhood: {geckoterminal: robinhood, dexscreener: robinhood, evm: true, priority: true}
   megaeth:   {geckoterminal: megaeth, dexscreener: megaeth, evm: true, priority: true}
   monad:     {geckoterminal: monad, dexscreener: monad, evm: true, priority: true}
@@ -18,17 +18,21 @@ repo_diff:
     - repo: trustwallet/assets
       path: blockchains/{chain}/assets
       mode: dir_added
-      chains: [robinhood, megaeth, monad, hyperevm]   # verify folder names (Task 15)
-    # Uniswap token-list schema: tokens[].{chainId,address,symbol,name}
-    - repo: Uniswap/default-token-list
-      path: src/tokens/mainnet.json
-      mode: json_tokenlist
-      chain_map: {"1": ethereum, "8453": base}
-    # BitGo coin definitions; path and regex verified in Task 15
+      chains: [robinhoodchain, megaeth, monad, hyperevm]   # Trust Wallet folder names (verified 2026-11-27)
+      chain_map: {robinhoodchain: robinhood}
+    # Any repo with a Uniswap-schema token list (tokens[].{chainId,address,symbol,name}) works like this.
+    # Uniswap/default-token-list itself returned 404 on 2026-11-27, so no list is enabled by default.
+    # - repo: <owner>/<repo>
+    #   path: path/to/tokenlist.json
+    #   mode: json_tokenlist
+    #   chain_map: {"1": ethereum, "8453": base}
+    # BitGo (custodian) Robinhood Chain token definitions: the file from the Cash Cat story.
+    # Verified 2026-11-27 against the live file: 307/307 mainnet entries match, testnet (thoodeth:) skipped.
     - repo: BitGo/BitGoJS
-      path: modules/statics/src/coins/erc20Coins.ts
+      path: modules/statics/src/coins/hoodethTokens.ts
       mode: regex_entries
-      regex: "'(?P<symbol>[a-z0-9:]+)',\\s*'[^']*',\\s*\\d+,\\s*'(?P<address>0x[0-9a-fA-F]{40})'"
+      chain_map: {"*": robinhood}
+      regex: 'erc20Token\(\s*''[^'']*'',\s*''hoodeth:(?P<symbol>[A-Za-z0-9._-]+)'',\s*[''"](?P<name>.*?)[''"],\s*\d+,\s*''(?P<address>0x[0-9a-fA-F]{40})'''
 
 ct:
   interval_s: 21600

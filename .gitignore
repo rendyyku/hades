@@ -26,3 +26,4 @@ docs/architecture/*.browser-check.json
 docs/architecture/*.delivery.json
 engine/uv.lock
 reports/
+config.yaml

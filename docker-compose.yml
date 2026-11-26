@@ -1,0 +1,27 @@
+# HADES v2 on a VPS: `docker compose up -d`. Needs .env and config.yaml next to this file.
+services:
+  engine:
+    build: {context: ., dockerfile: engine/Dockerfile}
+    env_file: .env
+    environment:
+      DATABASE_URL: sqlite:////data/hades.db
+      HADES_CONFIG: /app/config.yaml
+    volumes:
+      - hades-data:/data
+      - ./config.yaml:/app/config.yaml:ro
+    # no ports: the API is only reachable by the web container on the internal network
+    restart: unless-stopped
+
+  web:
+    build: {context: web}
+    env_file: .env
+    environment:
+      HADES_API_URL: http://engine:8000
+      HADES_PUBLIC_ORIGIN: ${HADES_PUBLIC_ORIGIN:-http://localhost:3200}
+    ports:
+      - "127.0.0.1:3200:3200"
+    depends_on: [engine]
+    restart: unless-stopped
+
+volumes:
+  hades-data:
