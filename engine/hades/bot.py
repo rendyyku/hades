@@ -45,10 +45,12 @@ def _e(v: object) -> str:
     return html.escape(str(v))
 
 
-def _status(store: Store, now: datetime) -> str:
+def _status(store: Store, now: datetime, intervals: dict[str, int] | None = None) -> str:
     lines = ["<b>Status HADES</b>"]
-    for w in store.watchers():
-        if w["fail_count"]:
+    for w in store.watchers(now=now, intervals=intervals):
+        if w["stale"]:
+            lines.append(f"⚠️ {_e(w['name'])} · macet, sukses terakhir {rel_time(w['last_ok'], now)}")
+        elif w["fail_count"]:
             lines.append(f"⚠️ {_e(w['name'])} · gagal ×{w['fail_count']}: {_e(w['last_err'] or '')}")
         else:
             ok = rel_time(w["last_ok"], now) if w["last_ok"] else "belum pernah"
@@ -96,7 +98,8 @@ def _mute(store: Store, args: list[str], now: datetime) -> str:
     return f"Mute {_e(args[0])} selama {hours} jam (sampai {to_wib(until)})."
 
 
-def handle_command(text: str, chat_id: str, *, owner_chat_id: str, store: Store, now: datetime) -> str | None:
+def handle_command(text: str, chat_id: str, *, owner_chat_id: str, store: Store, now: datetime,
+                   intervals: dict[str, int] | None = None) -> str | None:
     if not owner_chat_id or str(chat_id) != str(owner_chat_id):
         return None
     parts = (text or "").strip().split()
@@ -104,7 +107,7 @@ def handle_command(text: str, chat_id: str, *, owner_chat_id: str, store: Store,
         return None
     cmd, args = parts[0].split("@", 1)[0].lower(), parts[1:]
     if cmd == "/status":
-        return _status(store, now)
+        return _status(store, now, intervals)
     if cmd == "/watchlist":
         return _watchlist(store, args)
     if cmd == "/mute":
@@ -115,7 +118,7 @@ def handle_command(text: str, chat_id: str, *, owner_chat_id: str, store: Store,
 
 
 async def poll_once(http: Http, notifier: Notifier, store: Store, token: str, owner_chat_id: str,
-                    now: datetime, timeout: int = 30) -> int:
+                    now: datetime, timeout: int = 30, intervals: dict[str, int] | None = None) -> int:
     """One getUpdates long-poll. Returns how many commands were answered."""
     offset = (store.get_state(STATE_NAME) or {}).get("offset", 0)
     res = await http.get_json(f"{TG_API}/bot{token}/getUpdates", params={"offset": offset, "timeout": timeout},
@@ -125,7 +128,7 @@ async def poll_once(http: Http, notifier: Notifier, store: Store, token: str, ow
         offset = max(offset, u.get("update_id", 0) + 1)
         msg = u.get("message") or {}
         reply = handle_command(msg.get("text", ""), str((msg.get("chat") or {}).get("id", "")),
-                               owner_chat_id=owner_chat_id, store=store, now=now)
+                               owner_chat_id=owner_chat_id, store=store, now=now, intervals=intervals)
         if reply:
             await notifier.send_text(reply)
             answered += 1
@@ -134,13 +137,17 @@ async def poll_once(http: Http, notifier: Notifier, store: Store, token: str, ow
 
 
 async def poll_loop(http: Http, notifier: Notifier, store: Store, token: str, owner_chat_id: str,
-                    stop: asyncio.Event) -> None:
+                    stop: asyncio.Event, intervals: dict[str, int] | None = None) -> None:
     if not token or not owner_chat_id:
         log.info("telegram bot disabled (no TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)")
         return
     while not stop.is_set():
         try:
-            await poll_once(http, notifier, store, token, owner_chat_id, datetime.now(timezone.utc))
+            await poll_once(http, notifier, store, token, owner_chat_id, datetime.now(timezone.utc),
+                            intervals=intervals)
         except SourceError as e:
             log.warning("telegram getUpdates failed: %s", e)
+            await asyncio.sleep(10)
+        except Exception:  # noqa: BLE001 - the bot must outlive one bad update
+            log.exception("telegram bot iteration failed")
             await asyncio.sleep(10)

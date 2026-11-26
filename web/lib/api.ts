@@ -101,6 +101,8 @@ export interface WatcherRow {
   last_err: string | null;
   last_err_at: string | null;
   fail_count: number;
+  /** No success for 3+ intervals (the loop may be stuck). */
+  stale: boolean;
   healthy: boolean;
 }
 

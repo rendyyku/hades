@@ -11,7 +11,7 @@ export function WatcherHealth({ watchers }: { watchers: WatcherRow[] }) {
   return (
     <ul className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
       {watchers.map((w) => {
-        const failing = w.fail_count > 0;
+        const failing = w.fail_count > 0 || w.stale;
         return (
           <li
             key={w.name}
@@ -25,7 +25,9 @@ export function WatcherHealth({ watchers }: { watchers: WatcherRow[] }) {
               )}
               {w.name}
             </p>
-            {failing ? (
+            {w.stale ? (
+              <p className="mt-2 text-sm text-fg">Macet · sukses terakhir {relTime(w.last_ok)}</p>
+            ) : failing ? (
               <>
                 <p className="mt-2 text-sm text-fg">
                   Gagal ×{w.fail_count} sejak {wib(w.last_err_at)}

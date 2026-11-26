@@ -59,7 +59,7 @@ class Services:
 def build_watchers(cfg: AppConfig, store: Store, gh: GitHub) -> list[Watcher]:
     watchers: list[Watcher] = []
     for t in cfg.repo_diff.targets:
-        watchers += build_repo_watchers(t, gh, cfg.repo_diff.interval_s, cfg.chains)
+        watchers += build_repo_watchers(t, gh, cfg.repo_diff.interval_s, cfg.chains, cfg.ct.domain_denylist)
     watchers.append(CtWatcher(store, cfg.ct.hot_labels, cfg.ct.interval_s))
     watchers += [GroundTruthWatcher(ex, cfg.ground_truth.interval_s) for ex in cfg.ground_truth.exchanges]
     return watchers
@@ -93,14 +93,15 @@ async def _recheck_loop(pipeline: Pipeline, stop: asyncio.Event) -> None:
 
 async def serve(s: Services, host: str = "127.0.0.1", port: int = 8000) -> None:
     stop = asyncio.Event()
-    api = create_app(s.store, s.bus, s.settings)
+    intervals = {w.name: w.interval_s for w in s.watchers}
+    api = create_app(s.store, s.bus, s.settings, intervals=intervals)
     server = uvicorn.Server(uvicorn.Config(api, host=host, port=port, log_level="warning"))
     tasks = [
         asyncio.create_task(s.runner.run_forever(stop)),
         asyncio.create_task(_recheck_loop(s.pipeline, stop)),
         asyncio.create_task(digest_loop(s.notifier, s.store, s.cfg, stop)),
         asyncio.create_task(poll_loop(s.http, s.notifier, s.store, s.settings.TELEGRAM_BOT_TOKEN,
-                                      s.settings.TELEGRAM_CHAT_ID, stop)),
+                                      s.settings.TELEGRAM_CHAT_ID, stop, intervals)),
     ]
     log.info("HADES v2 running: %d watchers, API on http://%s:%d", len(s.watchers), host, port)
     try:

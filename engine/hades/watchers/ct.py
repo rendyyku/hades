@@ -22,6 +22,7 @@ CRT_URL = "https://crt.sh/"
 RUN_EVERY_S = 600
 MAX_DOMAINS_PER_RUN = 20
 TIMEOUT_S = 60.0
+BACKOFF_BASE_S = 1200  # a failing domain waits 20 min, 40, 80 … capped at the normal interval
 
 
 def _not_after(value: Any) -> datetime | None:
@@ -37,32 +38,50 @@ class CtWatcher(Watcher):
     interval_s = RUN_EVERY_S
 
     def __init__(self, store: Store, hot_labels: list[str], per_domain_interval_s: int = 21600,
-                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
+                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+                 max_per_run: int = MAX_DOMAINS_PER_RUN) -> None:
         self.store = store
         self.hot_labels = {h.lower() for h in hot_labels}
         self.per_domain = timedelta(seconds=per_domain_interval_s)
         self.clock = clock
+        self.max_per_run = max_per_run
+        # in-memory per-domain backoff: domain -> (consecutive failures, retry not before)
+        self._backoff: dict[str, tuple[int, datetime]] = {}
+
+    def _fail(self, domain: str, now: datetime) -> None:
+        n = self._backoff.get(domain, (0, now))[0] + 1
+        wait = min(self.per_domain, timedelta(seconds=BACKOFF_BASE_S * 2 ** (n - 1)))
+        self._backoff[domain] = (n, now + wait)
 
     def _due(self, state: dict | None) -> list[str]:
+        """Due domains, never-checked first, then the longest-unchecked; failing ones wait out their backoff."""
         now = self.clock()
         known = (state or {}).get("domains", {})
-        due = []
+        due: list[tuple[str, str]] = []
         for row in self.store.domains():
             d = row["domain"]
+            if d in self._backoff and self._backoff[d][1] > now:
+                continue
             checked = known.get(d, {}).get("checked")
             if checked is None or now - datetime.fromisoformat(checked) >= self.per_domain:
-                due.append(d)
-        return due[:MAX_DOMAINS_PER_RUN]
+                due.append((checked or "", d))
+        return [d for _, d in sorted(due)][: self.max_per_run]
 
     async def fetch(self, http: Http, state: dict | None) -> dict:
         due = self._due(state)
+        now = self.clock()
         results: dict[str, Any] = {}
         for d in due:
             try:
-                data = await http.get_json(CRT_URL, params={"q": f"%.{d}", "output": "json"}, timeout=TIMEOUT_S)
+                data = await http.get_json(CRT_URL, params={"q": f"%.{d}", "output": "json"}, timeout=TIMEOUT_S,
+                                           max_retries=1)
                 results[d] = data if isinstance(data, list) else SourceError("crt.sh answer is not a list")
             except SourceError as e:
                 results[d] = e
+            if isinstance(results[d], Exception):
+                self._fail(d, now)
+            else:
+                self._backoff.pop(d, None)
         if due and all(isinstance(v, Exception) for v in results.values()):
             raise SourceError(f"crt.sh failed for all {len(due)} due domains: {next(iter(results.values()))}")
         return results
@@ -100,6 +119,7 @@ class CtWatcher(Watcher):
             prev = known.get(d)
             if prev is not None and not names and prev["names"]:
                 log.warning("ct %s: empty answer after %d names, treating as outage", d, len(prev["names"]))
+                self._fail(d, now)
                 failed.append(d)
                 continue
             if prev is not None and state is not None:

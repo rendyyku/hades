@@ -20,6 +20,7 @@ TG_MAX = 4096
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 DIGEST_MAX_LINES = 30
 FUSION_MAX = 3
+FIELD_MAX = 100  # names/symbols come from third-party files (PR info.json): clip before escaping
 
 
 def to_wib(dt: datetime) -> str:
@@ -50,8 +51,18 @@ def short_addr(a: str) -> str:
     return a if len(a) <= 12 else f"{a[:6]}…{a[-4:]}"
 
 
+def _clip(v: Any, n: int = FIELD_MAX) -> str:
+    v = str(v)
+    return v if len(v) <= n else v[: n - 1] + "…"
+
+
 def _e(v: Any) -> str:
     return html.escape(str(v), quote=True)
+
+
+def _ec(v: Any) -> str:
+    """Clip, then escape: never cuts through an entity or a tag."""
+    return _e(_clip(v))
 
 
 def buyable_line(enr: dict | None) -> str:
@@ -70,7 +81,8 @@ def buyable_line(enr: dict | None) -> str:
 
 
 def _label(row: dict) -> str:
-    return row.get("name") if row.get("source") == "ct" else (row.get("symbol") or row.get("name") or "?")
+    raw = row.get("name") if row.get("source") == "ct" else (row.get("symbol") or row.get("name"))
+    return _clip(raw or "?")
 
 
 def format_signal(row: dict, enr: dict | None, fusion: list[dict], prefix: str = "",
@@ -86,43 +98,58 @@ def format_signal(row: dict, enr: dict | None, fusion: list[dict], prefix: str =
         head += f"  ·  {_e(row['chain'])}"
     lines.append(head)
     if row.get("source") == "ct":
-        ident = _e(row.get("name") or "")
+        ident = _ec(row.get("name") or "")
     else:
-        ident = " — ".join(_e(x) for x in (row.get("symbol"), row.get("name")) if x)
+        ident = " — ".join(_ec(x) for x in (row.get("symbol"), row.get("name")) if x)
         if row.get("address"):
             ident += f"   <code>{_e(short_addr(row['address']))}</code>"
     lines.append(ident)
     lines.append(buyable_line(enr))
     url = row["evidence_url"]
-    lines.append(f'Bukti: <a href="{_e(url)}">{_e(url.split("://", 1)[-1])}</a>')
-    for f in fusion[:FUSION_MAX]:
-        lines.append(f"Fusion: {_e(f['source'])} {_e(_label(f))} ({rel_time(f['observed_at'], now)})")
-    lines.append(to_wib(row["observed_at"]))
-    text = "\n".join(lines)
-    return text if len(text) <= TG_MAX else text[: TG_MAX - 1] + "…"
+    lines.append(f'Bukti: <a href="{_e(url)}">{_e(_clip(url.split("://", 1)[-1], 200))}</a>')
+    fusion_lines = [f"Fusion: {_e(f['source'])} {_e(_label(f))} ({rel_time(f['observed_at'], now)})"
+                    for f in fusion[:FUSION_MAX]]
+    footer = [to_wib(row["observed_at"])]
+    # every field is clipped, so this fits; fusion lines are the first thing to go if it ever does not
+    while fusion_lines and len("\n".join(lines + fusion_lines + footer)) > TG_MAX:
+        fusion_lines.pop()
+    return "\n".join(lines + fusion_lines + footer)
+
+
+def _section(title: str, items: list[str], budget: int) -> list[str]:
+    """Header + as many whole item lines as fit in `budget` chars, then `…dan N lainnya`."""
+    out = [f"\n<b>{title} ({len(items)})</b>"]
+    used = len(out[0]) + 40  # room for the "lainnya" line
+    shown = 0
+    for line in items[:DIGEST_MAX_LINES]:
+        if used + len(line) + 1 > budget:
+            break
+        out.append(line)
+        used += len(line) + 1
+        shown += 1
+    if shown < len(items):
+        out.append(f"…dan {len(items) - shown} lainnya")
+    return out
 
 
 def format_digest(low: list[dict], rechecks: list[tuple[dict, dict]], now: datetime) -> str | None:
     if not low and not rechecks:
         return None
     w = now.astimezone(WIB)
-    lines = [f"<b>Ringkasan harian HADES</b> · {w.day} {MONTHS[w.month - 1]} {w.year}"]
-    if low:
-        lines.append(f"\n<b>Sinyal lemah ({len(low)})</b>")
-        for r in low[:DIGEST_MAX_LINES]:
-            lines.append(f'• {_e(r["kind"])} {_e(_label(r))} — <a href="{_e(r["evidence_url"])}">bukti</a>')
-        if len(low) > DIGEST_MAX_LINES:
-            lines.append(f"…dan {len(low) - DIGEST_MAX_LINES} lainnya")
-    if rechecks:
-        lines.append(f"\n<b>Cek ulang 24 jam ({len(rechecks)})</b>")
-        for r, e in rechecks[:DIGEST_MAX_LINES]:
-            state = (f"Bisa dibeli · {format_usd(e.get('liquidity_usd'))}" if e.get("buyable")
-                     else "Belum bisa dibeli" if e.get("buyable") is False else "Cek gagal")
-            lines.append(f"• {_e(_label(r))}: {state}")
-        if len(rechecks) > DIGEST_MAX_LINES:
-            lines.append(f"…dan {len(rechecks) - DIGEST_MAX_LINES} lainnya")
-    text = "\n".join(lines)
-    return text if len(text) <= TG_MAX else text[: TG_MAX - 1] + "…"
+    head = f"<b>Ringkasan harian HADES</b> · {w.day} {MONTHS[w.month - 1]} {w.year}"
+    low_items = [f'• {_e(r["kind"])} {_e(_label(r))} — <a href="{_e(r["evidence_url"])}">bukti</a>' for r in low]
+    re_items = []
+    for r, e in rechecks:
+        state = (f"Bisa dibeli · {format_usd(e.get('liquidity_usd'))}" if e.get("buyable")
+                 else "Belum bisa dibeli" if e.get("buyable") is False else "Cek gagal")
+        re_items.append(f"• {_e(_label(r))}: {state}")
+    budget = (TG_MAX - len(head)) // (bool(low_items) + bool(re_items))
+    lines = [head]
+    if low_items:
+        lines += _section("Sinyal lemah", low_items, budget)
+    if re_items:
+        lines += _section("Cek ulang 24 jam", re_items, budget)
+    return "\n".join(lines)
 
 
 def next_digest_at(now: datetime, hour_wib: int) -> datetime:
@@ -189,7 +216,10 @@ async def digest_loop(notifier: Notifier, store: Store, cfg: AppConfig, stop: as
         await sleep((next_digest_at(now, cfg.alerts.digest_hour_wib) - now).total_seconds())
         if stop.is_set():
             return
-        now = notifier.clock()
-        text = format_digest(*digest_rows(store, now), now)
-        if text:
-            await notifier.send_text(text)
+        try:
+            now = notifier.clock()
+            text = format_digest(*digest_rows(store, now), now)
+            if text:
+                await notifier.send_text(text)
+        except Exception:  # noqa: BLE001 - one bad digest must not stop tomorrow's
+            log.exception("daily digest failed")

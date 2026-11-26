@@ -110,9 +110,18 @@ async def check(http: Http, chain: ChainCfg | None, address: str | None, symbol:
             errors = []
             if chain.geckoterminal:
                 try:
-                    return await _geckoterminal(http, chain.geckoterminal, address, min_liq, now, headers)
+                    gt = await _geckoterminal(http, chain.geckoterminal, address, min_liq, now, headers)
                 except SourceError as e:
                     errors.append(f"geckoterminal: {e}")
+                else:
+                    if gt.pool_count or not chain.dexscreener:
+                        return gt
+                    # GeckoTerminal does not know the token (yet): ask DexScreener before saying "not buyable"
+                    try:
+                        ds = await _dexscreener(http, chain.dexscreener, address, min_liq, now)
+                    except SourceError:
+                        return gt
+                    return ds if ds.pool_count else gt
             if chain.dexscreener:
                 try:
                     return await _dexscreener(http, chain.dexscreener, address, min_liq, now)

@@ -124,3 +124,10 @@ async def test_api_stream_pings_when_idle():
     ev = await asyncio.wait_for(gen.__anext__(), 1)
     assert ev["event"] == "ping"
     await gen.aclose()
+
+
+def test_api_watchers_stale(store):
+    store.record_ok("ct", NOW - timedelta(hours=5))
+    app = create_app(store, Bus(), Settings(HADES_API_KEY=KEY), clock=lambda: NOW, intervals={"ct": 600})
+    [w] = TestClient(app).get("/api/watchers", headers=H).json()
+    assert w["stale"] is True and w["healthy"] is False

@@ -60,6 +60,16 @@ class RepoDiffCfg(_Cfg):
     targets: list[RepoTarget] = []
 
 
+# Shared hosting / social / docs hosts: a token "website" on one of these says nothing about the project,
+# and watching it on crt.sh would fire on everyone else's subdomains.
+DOMAIN_DENYLIST = [
+    "linktr.ee", "x.com", "twitter.com", "t.me", "telegram.org", "telegram.me", "medium.com", "github.com",
+    "github.io", "gitbook.io", "gitbook.com", "discord.gg", "discord.com", "notion.site", "notion.so",
+    "google.com", "youtube.com", "facebook.com", "instagram.com", "linkedin.com", "reddit.com", "tiktok.com",
+    "coingecko.com", "coinmarketcap.com", "etherscan.io", "dexscreener.com", "vercel.app", "netlify.app",
+    "pages.dev", "carrd.co", "mirror.xyz", "substack.com", "wixsite.com", "webflow.io", "beacons.ai",
+]
+
 HOT_LABELS = ["claim", "airdrop", "stake", "staking", "points", "tge", "token", "bridge", "rewards", "app"]
 
 
@@ -67,6 +77,7 @@ class CtCfg(_Cfg):
     interval_s: int = 21600
     domains: list[str] = []
     hot_labels: list[str] = Field(default_factory=lambda: list(HOT_LABELS))
+    domain_denylist: list[str] = Field(default_factory=lambda: list(DOMAIN_DENYLIST))
 
 
 class GroundTruthCfg(_Cfg):

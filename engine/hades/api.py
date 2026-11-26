@@ -16,7 +16,7 @@ from sse_starlette.sse import EventSourceResponse
 from hades.bot import MAX_MUTE_H, normalize_domain
 from hades.bus import Bus
 from hades.config import Settings
-from hades.evaluate import WINDOW_DAYS, earliest_signal, evaluate
+from hades.evaluate import WINDOW_DAYS, earliest_signal, evaluate, with_match_symbols
 from hades.store import Store
 
 PING_INTERVAL_S = 15.0
@@ -69,7 +69,8 @@ def _list_row(store: Store, row: dict) -> dict:
 
 
 def create_app(store: Store, bus: Bus, settings: Settings,
-               clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> FastAPI:
+               clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+               intervals: dict[str, int] | None = None) -> FastAPI:
     app = FastAPI(title="HADES", version="2.0.0", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.settings = settings
     router = APIRouter(prefix="/api", dependencies=[Depends(require_key)])
@@ -81,7 +82,7 @@ def create_app(store: Store, bus: Bus, settings: Settings,
     @router.get("/overview")
     def overview() -> dict:
         since = clock() - timedelta(days=1)
-        return {"counts": store.counts_since(since), "watchers": store.watchers(),
+        return {"counts": store.counts_since(since), "watchers": store.watchers(clock(), intervals),
                 "top": [_list_row(store, r) for r in store.top_signals_since(since, 10)]}
 
     @router.get("/signals")
@@ -107,12 +108,12 @@ def create_app(store: Store, bus: Bus, settings: Settings,
         if not rows:
             return []
         oldest = min(r["first_seen_at"] for r in rows)
-        sigs = store.signals_since(oldest - timedelta(days=WINDOW_DAYS))
+        sigs = with_match_symbols(store, store.signals_since(oldest - timedelta(days=WINDOW_DAYS)))
         return [{**r, "earliest_signal": earliest_signal(sigs, r)} for r in rows]
 
     @router.get("/watchers")
     def watchers() -> list[dict]:
-        return store.watchers()
+        return store.watchers(clock(), intervals)
 
     @router.get("/watchlist")
     def watchlist() -> list[dict]:

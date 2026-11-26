@@ -70,7 +70,10 @@ class Runner:
         if delay:
             await self.sleep(delay)
         while not stop.is_set():
-            await self.run_once(w)
+            try:
+                await self.run_once(w)
+            except Exception:  # noqa: BLE001 - e.g. sqlite "database is locked" after the fetch
+                log.exception("watcher %s: unexpected error outside fetch/diff", w.name)
             await self.sleep(w.interval_s)
 
     async def run_forever(self, stop: asyncio.Event) -> None:

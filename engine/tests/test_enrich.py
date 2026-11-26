@@ -58,8 +58,9 @@ async def test_gt_below_threshold_not_buyable(http):
 @respx.mock
 async def test_gt_404_not_buyable(http):
     respx.get(f"{GT}/networks/monad/tokens/0xabc/pools").mock(return_value=httpx.Response(404))
+    respx.get(f"{DS}/token-pairs/v1/monad/0xabc").mock(return_value=httpx.Response(200, json=[]))
     e = await _check(http)
-    assert (e.buyable, e.pool_count, e.error) == (False, 0, None)
+    assert (e.buyable, e.pool_count, e.error, e.provider) == (False, 0, None, "geckoterminal")
 
 
 @respx.mock

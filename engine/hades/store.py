@@ -3,7 +3,7 @@
 Datetimes are stored as UTC ISO-8601 strings and come back timezone-aware.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import (
@@ -17,6 +17,7 @@ from hades.models import Enrichment, ListingEvent, Signal
 
 MAX_LIMIT = 200
 UNHEALTHY_AFTER = 3
+STALE_AFTER = 3  # intervals without a success
 
 
 class UtcDateTime(TypeDecorator):
@@ -166,14 +167,18 @@ class Store:
             if not n:
                 c.execute(insert(watcher_state).values(name=name, last_err=err[:500], last_err_at=at, fail_count=1))
 
-    def watchers(self) -> list[dict]:
+    def watchers(self, now: datetime | None = None, intervals: dict[str, int] | None = None) -> list[dict]:
+        """Health per watcher. With `now` + `intervals`, a watcher whose last success is older than
+        STALE_AFTER intervals is `stale` and unhealthy (its loop may have died without an error)."""
         with self.engine.connect() as c:
             rows = c.execute(select(watcher_state).order_by(watcher_state.c.name)).mappings().all()
         out = []
         for r in rows:
             d = dict(r)
             d.pop("cursor")
-            d["healthy"] = d["fail_count"] < UNHEALTHY_AFTER
+            iv = (intervals or {}).get(d["name"])
+            d["stale"] = bool(now and iv and d["last_ok"] and now - d["last_ok"] > timedelta(seconds=STALE_AFTER * iv))
+            d["healthy"] = d["fail_count"] < UNHEALTHY_AFTER and not d["stale"]
             out.append(d)
         return out
 

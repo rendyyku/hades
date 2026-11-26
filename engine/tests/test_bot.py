@@ -108,3 +108,9 @@ async def test_poll_once_replies_and_saves_offset(store):
         assert send.call_count == 1
         assert "cat.xyz" in json.loads(send.calls[0].request.content)["text"]
         assert store.get_state("telegram_bot") == {"offset": 12}
+
+
+def test_status_flags_stale_watcher(store):
+    store.record_ok("ct", NOW - timedelta(hours=5))
+    text = handle_command("/status", OWNER, owner_chat_id=OWNER, store=store, now=NOW, intervals={"ct": 600})
+    assert "⚠️ ct · macet, sukses terakhir 5 jam lalu" in text

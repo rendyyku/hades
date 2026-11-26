@@ -8,11 +8,12 @@ same token has the same dedupe key, so the pipeline upgrades it instead of alert
 import json
 import logging
 import re
+from dataclasses import replace
 from datetime import datetime
 from typing import Any
 from urllib.parse import urlsplit
 
-from hades.config import ChainCfg, RepoTarget
+from hades.config import DOMAIN_DENYLIST, ChainCfg, RepoTarget
 from hades.github import GitHub
 from hades.http import SourceError
 from hades.identity import dedupe_key, normalize_address, project_key, registered_domain
@@ -23,14 +24,19 @@ log = logging.getLogger(__name__)
 
 MAX_COMMITS_PER_RUN = 10
 MAX_PRS_PER_RUN = 20
+# full-mode snapshot below this share of the known keys = broken/refactored file, not a mass delisting
+SHRINK_RATIO = 0.5
+# more additions than this in one commit = a bulk onboarding batch: still recorded, but as low severity (digest)
+BATCH_LOW_AFTER = 25
 
 
-def build_repo_watchers(target: RepoTarget, gh: GitHub, interval_s: int,
-                        chains: dict[str, ChainCfg]) -> list["RepoDiffWatcher"]:
+def build_repo_watchers(target: RepoTarget, gh: GitHub, interval_s: int, chains: dict[str, ChainCfg],
+                        domain_denylist: list[str] | None = None) -> list["RepoDiffWatcher"]:
     """One watcher per expanded path: `{chain}` in the path becomes each folder in target.chains."""
+    deny = DOMAIN_DENYLIST if domain_denylist is None else domain_denylist
     if "{chain}" not in target.path:
-        return [RepoDiffWatcher(target, gh, interval_s, chains, target.path, None)]
-    return [RepoDiffWatcher(target, gh, interval_s, chains, target.path.replace("{chain}", f), f)
+        return [RepoDiffWatcher(target, gh, interval_s, chains, target.path, None, deny)]
+    return [RepoDiffWatcher(target, gh, interval_s, chains, target.path.replace("{chain}", f), f, deny)
             for f in target.chains]
 
 
@@ -43,7 +49,7 @@ def _website_domain(url: Any) -> str | None:
 
 class RepoDiffWatcher(Watcher):
     def __init__(self, target: RepoTarget, gh: GitHub, interval_s: int, chains: dict[str, ChainCfg],
-                 path: str, folder: str | None) -> None:
+                 path: str, folder: str | None, domain_denylist: list[str] | None = None) -> None:
         self.target = target
         self.gh = gh
         self.interval_s = interval_s
@@ -54,6 +60,7 @@ class RepoDiffWatcher(Watcher):
         # full = each snapshot is the whole list, diffed against the keys in state;
         # dir_added snapshots already contain only the additions
         self.full = target.mode != "dir_added"
+        self.denylist = [d.lower() for d in (DOMAIN_DENYLIST if domain_denylist is None else domain_denylist)]
 
     # -- entries ------------------------------------------------------------
 
@@ -123,6 +130,9 @@ class RepoDiffWatcher(Watcher):
         keys: list[str] = []
         if self.full:
             keys = sorted({self._key(e) for e in (await self._file_entries(head) or [])})
+            if not keys:
+                # an empty baseline would make every token in the next good commit "new"
+                raise SourceError(f"{self.name}: file parses to 0 entries at {head[:7]}; check path/regex")
         return {"kind": kind, "head": head, "keys": keys, "open_prs": open_prs, "commits": [], "prs": []}
 
     async def fetch(self, http: Any, state: dict | None) -> dict:
@@ -141,11 +151,15 @@ class RepoDiffWatcher(Watcher):
             new = list(reversed(commits[: shas.index(state["head"])]))
         else:
             try:
-                await self.gh.compare(repo, state["head"], newest)
+                cmp = await self.gh.compare(repo, state["head"], newest)
             except SourceError as e:
                 if e.status != 404:
                     raise
-                log.warning("%s: head %s gone (force-push?), re-baselining", self.name, state["head"])
+                cmp = {"status": "gone"}
+            # GitHub keeps orphaned commits reachable: after a force-push compare answers 200 "diverged"
+            if cmp.get("status") != "ahead":
+                log.warning("%s: head %s is %s relative to %s (force-push?), re-baselining",
+                            self.name, state["head"], cmp.get("status"), newest)
                 return await self._baseline("rebaseline", newest, open_prs)
             log.warning("%s: more than %d new commits since %s, older ones skipped",
                         self.name, len(commits), state["head"])
@@ -206,7 +220,13 @@ class RepoDiffWatcher(Watcher):
         if not self.full:
             return entries, running
         cur = {self._key(e): e for e in entries}
+        if running and len(cur) < SHRINK_RATIO * len(running):
+            log.warning("%s: snapshot has %d entries vs %d known; skipped as broken", self.name, len(cur), len(running))
+            return [], running
         return [cur[k] for k in sorted(set(cur) - running)], set(cur)
+
+    def _watchable(self, domain: str | None) -> bool:
+        return bool(domain) and not any(domain == d or domain.endswith("." + d) for d in self.denylist)
 
     def diff(self, state: dict | None, snap: dict, now: datetime) -> WatchResult:
         if snap["kind"] != "update":
@@ -215,11 +235,16 @@ class RepoDiffWatcher(Watcher):
         running = set(snap["keys"])
         for c in snap["commits"]:
             added, running = self._added(c["entries"], running)
-            signals += [self._signal(e, "merged", c["url"], {"sha": c["sha"]}, now) for e in added]
+            batch = [self._signal(e, "merged", c["url"], {"sha": c["sha"]}, now) for e in added]
+            if len(batch) > BATCH_LOW_AFTER:
+                log.info("%s: %d additions in %s, recorded as low severity", self.name, len(batch), c["sha"][:7])
+                batch = [replace(s, severity="low") for s in batch]
+            signals += batch
         for p in snap["prs"]:
             added, _ = self._added(p["entries"], running)
             signals += [self._signal(e, "pr_opened", p["url"], {"pr": int(p["number"]), "sha": p["sha"]}, now)
                         for e in added]
         new_state = {"head": snap["head"], "prs": snap["open_prs"], "keys": sorted(running)}
-        domains = sorted({s.website for s in signals if s.website})
+        # only merged entries feed the CT watchlist: anyone can open a PR with any "website"
+        domains = sorted({s.website for s in signals if s.kind == "merged" and self._watchable(s.website)})
         return WatchResult(signals=signals, new_state=new_state, domains=domains)
