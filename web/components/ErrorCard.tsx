@@ -10,7 +10,7 @@ export function ErrorCard({ error }: { error: string }) {
       <div>
         <p className="font-medium">Engine unreachable · {error}</p>
         <p className="mt-1 text-sm text-muted">
-          Check that the HADES engine is running (<code className="font-mono">hades serve</code>) and that
+          Check that the HADES engine is running (<code className="font-mono">python -m hades run</code>) and that
           HADES_API_URL / HADES_API_KEY are set for the web app.
         </p>
       </div>

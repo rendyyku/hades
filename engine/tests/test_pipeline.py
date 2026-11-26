@@ -56,7 +56,10 @@ async def test_pipeline_alerts_high_score(store, make):
     row = store.get_signal(sid)
     assert row["score"] == 70 and row["score_detail"]["total"] == 70
     assert store.counts_since(NOW - timedelta(days=1))["alerts"] == 1
-    assert q.get_nowait()[0] == "signal"
+    event, data = q.get_nowait()
+    assert event == "signal"
+    assert data["enrichment"]["buyable"] is False
+    assert "raw" not in data
 
 
 async def test_pipeline_below_threshold_no_alert(store, make):

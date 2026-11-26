@@ -61,13 +61,20 @@ class Pipeline:
                 symbol = None
         return chain, address, symbol
 
+    def _event_row(self, signal_id: int) -> dict:
+        """Signal row as pushed to the SSE stream: latest enrichment attached, raw dropped."""
+        row = {k: v for k, v in (self.store.get_signal(signal_id) or {}).items() if k != "raw"}
+        enrs = self.store.enrichments(signal_id)
+        row["enrichment"] = enrs[-1] if enrs else None
+        return row
+
     async def handle(self, sig: Signal) -> None:
         now = self.clock()
         sid = self.store.insert_signal(sig)
         if sid is None:
             upgraded = self.store.upgrade_signal(sig.dedupe_key, sig.kind, sig.evidence_url)
             if upgraded is not None:
-                self.bus.publish("signal_updated", self.store.get_signal(upgraded))
+                self.bus.publish("signal_updated", self._event_row(upgraded))
             return
         if sig.website:
             self.store.add_alias(sig.project_key, project_key(domain=sig.website))
@@ -81,7 +88,7 @@ class Pipeline:
             msg_id = await self.notifier.send_signal(sid)
             if msg_id is not None:
                 self.store.mark_sent(sid, msg_id, now)
-        self.bus.publish("signal", self.store.get_signal(sid))
+        self.bus.publish("signal", self._event_row(sid))
 
     async def recheck_due(self, now: datetime) -> None:
         for sid in self.store.due_rechecks(now, self.cfg.enrich.recheck_after_s):
@@ -89,7 +96,7 @@ class Pipeline:
             before = self.store.enrichments(sid)[-1]["buyable"]
             enr = await self._enrich(*self._target(row), now)
             self.store.add_enrichment(sid, enr)
-            self.bus.publish("signal_updated", self.store.get_signal(sid))
+            self.bus.publish("signal_updated", self._event_row(sid))
             if before is False and enr.buyable is True and not self.notifier.is_muted(row, now):
                 msg_id = await self.notifier.send_signal(sid, prefix=BUYABLE_NOW_PREFIX)
                 if msg_id is not None:
@@ -101,4 +108,4 @@ class Pipeline:
         for row in self.store.signals_since(since):
             if row["observed_at"] <= ev.first_seen_at and (row["symbol"] or "").lower() == base:
                 self.store.mark_listed(row["id"], ev.exchange, ev.first_seen_at)
-                self.bus.publish("signal_updated", self.store.get_signal(row["id"]))
+                self.bus.publish("signal_updated", self._event_row(row["id"]))
