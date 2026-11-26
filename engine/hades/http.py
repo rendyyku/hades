@@ -96,7 +96,7 @@ class Http:
             if attempt == max_retries:
                 raise SourceError(f"{err} for {urlsplit(url).hostname} after {attempt + 1} tries")
             delay = wait if wait is not None else min(MAX_DELAY_S, 2**attempt) * random.uniform(0.5, 1.5)
-            log.debug("retry %s %s in %.1fs (%s)", method, url, delay, err)
+            log.debug("retry %s %s in %.1fs (%s)", method, urlsplit(url).hostname, delay, err)
             await self._sleep(delay)
         raise AssertionError("unreachable")
 

@@ -71,3 +71,22 @@ async def test_post_json(http):
     route = respx.post(URL).mock(return_value=httpx.Response(200, json={"ok": True}))
     assert await http.post_json(URL, json={"a": 1}) == {"ok": True}
     assert route.calls[0].request.content == b'{"a":1}'
+
+
+@respx.mock
+async def test_retry_log_never_contains_url_path(http, caplog):
+    secret_url = "https://api.telegram.org/bot123:SECRET/sendMessage"
+    respx.post(secret_url).mock(side_effect=[httpx.Response(502), httpx.Response(200, json={"ok": True})])
+    with caplog.at_level("DEBUG", logger="hades.http"):
+        await http.post_json(secret_url, json={})
+    assert caplog.records
+    assert "SECRET" not in caplog.text
+
+
+@respx.mock
+async def test_error_message_never_contains_url_path(http):
+    secret_url = "https://api.telegram.org/bot123:SECRET/sendMessage"
+    respx.post(secret_url).mock(return_value=httpx.Response(401))
+    with pytest.raises(SourceError) as e:
+        await http.post_json(secret_url, json={})
+    assert "SECRET" not in str(e.value)
