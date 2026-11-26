@@ -1,0 +1,56 @@
+# HADES v2 config. Copy to config.yaml and edit. Secrets go in .env, never here.
+
+chains:
+  # priority: true = new ecosystems we care most about (score bonus)
+  # network ids: verify (Task 15)
+  robinhood: {geckoterminal: robinhood, dexscreener: robinhood, evm: true, priority: true}
+  megaeth:   {geckoterminal: megaeth, dexscreener: megaeth, evm: true, priority: true}
+  monad:     {geckoterminal: monad, dexscreener: monad, evm: true, priority: true}
+  hyperevm:  {geckoterminal: hyperevm, dexscreener: hyperevm, evm: true, priority: true}
+  ethereum:  {geckoterminal: eth, dexscreener: ethereum, evm: true}
+  base:      {geckoterminal: base, dexscreener: base, evm: true}
+  solana:    {geckoterminal: solana, dexscreener: solana, evm: false}
+
+repo_diff:
+  interval_s: 900
+  targets:
+    # one new folder blockchains/<chain>/assets/<address>/ = one new token
+    - repo: trustwallet/assets
+      path: blockchains/{chain}/assets
+      mode: dir_added
+      chains: [robinhood, megaeth, monad, hyperevm]   # verify folder names (Task 15)
+    # Uniswap token-list schema: tokens[].{chainId,address,symbol,name}
+    - repo: Uniswap/default-token-list
+      path: src/tokens/mainnet.json
+      mode: json_tokenlist
+      chain_map: {"1": ethereum, "8453": base}
+    # BitGo coin definitions; path and regex verified in Task 15
+    - repo: BitGo/BitGoJS
+      path: modules/statics/src/coins/erc20Coins.ts
+      mode: regex_entries
+      regex: "'(?P<symbol>[a-z0-9:]+)',\\s*'[^']*',\\s*\\d+,\\s*'(?P<address>0x[0-9a-fA-F]{40})'"
+
+ct:
+  interval_s: 21600
+  domains: []          # e.g. [projectx.xyz]; repo_diff adds token websites automatically
+
+ground_truth:
+  interval_s: 600
+  exchanges: [coinbase, kraken, okx, binance, bybit]
+
+enrich:
+  min_liquidity_usd: 1000
+  low_liquidity_usd: 50000
+  recheck_after_s: 86400
+
+scoring:
+  base: {pr_opened: 40, merged: 30, ct_high: 30, ct_low: 10}
+  priority_chain: 15
+  earliness: 15
+  fusion_per_source: 20
+  fusion_max: 40
+  fusion_window_days: 7
+
+alerts:
+  min_score: 40
+  digest_hour_wib: 8
