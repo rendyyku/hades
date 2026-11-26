@@ -24,45 +24,11 @@ jobs:
       - name: Test
         run: cd engine && pytest -q
 
-  core:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: core/pyproject.toml
-      - name: Install
-        run: pip install -e "core[dev]"
-      - name: Test
-        run: cd core && pytest -q
-
-  hyperliquid:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: |
-            core/pyproject.toml
-            hyperliquid/pyproject.toml
-      # hades-core is a uv path dependency of hades-hl ([tool.uv.sources]); plain pip
-      # ignores that table, so core is installed from the checkout in the same command.
-      - name: Install
-        run: pip install -e core -e "hyperliquid[dev]"
-      - name: Test
-        run: cd hyperliquid && pytest -q
-
   web:
     runs-on: ubuntu-latest
     env:
       HADES_API_URL: http://127.0.0.1:8000
       HADES_API_KEY: ci-dummy
-      HL_API_URL: http://127.0.0.1:8010
-      HL_API_KEY: ci-dummy
       NEXT_TELEMETRY_DISABLED: "1"
     steps:
       - uses: actions/checkout@v4
