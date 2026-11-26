@@ -20,8 +20,8 @@ const firaCode = Fira_Code({
 });
 
 export const metadata: Metadata = {
-  title: "HADES — Smart money intelligence",
-  description: "Solana memecoin smart-money & insider intelligence",
+  title: "HADES — Early signals",
+  description: "Sinyal awal dari data publik",
 };
 
 export default function RootLayout({

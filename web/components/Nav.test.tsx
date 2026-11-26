@@ -3,23 +3,16 @@ import { describe, expect, it } from "vitest";
 import { Nav, NAV_LINKS } from "./Nav";
 
 describe("Nav", () => {
-  it("follows the spec order, with Solana instead of Judgement", () => {
-    expect(NAV_LINKS.map((l) => l.label)).toEqual([
-      "Overview",
-      "Solana",
-      "Hyperliquid",
-      "Polymarket",
-      "Paper Arena",
-      "Cerberus",
-      "Watchlist",
-    ]);
+  it("lists the HADES v2 pages in spec 9b order", () => {
+    expect(NAV_LINKS.map((l) => l.label)).toEqual(["Overview", "Signals", "Listings", "Watchlist", "Eval"]);
   });
 
-  it("renders Polymarket disabled, without a link, and links the Paper Arena", () => {
+  it("links every page and drops the v1 heads", () => {
     const html = renderToStaticMarkup(<Nav />);
-    expect(html).not.toContain("Judgement");
-    expect(html).toMatch(/<span aria-disabled="true"[^>]*>Polymarket/);
-    expect(html).not.toContain('href="/polymarket"');
-    expect(html).toContain('href="/arena"');
+    for (const href of ["/", "/signals", "/listings", "/watchlist", "/eval"]) {
+      expect(html).toContain(`href="${href}"`);
+    }
+    expect(html).not.toContain("Hyperliquid");
+    expect(html).not.toContain("Polymarket");
   });
 });

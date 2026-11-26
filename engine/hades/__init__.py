@@ -1,3 +1,3 @@
-"""HADES - Solana memecoin smart-money analytics engine."""
+"""HADES v2 - early signals from public data."""
 
-__version__ = "0.1.0"
+__version__ = "2.0.0"

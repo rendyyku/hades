@@ -1,5 +1,7 @@
 # HADES — Solana Smart-Money & Insider Intelligence
 
+Status: superseded by 2026-11-27-hades-early-signals-design.md (code kept at tag `hades-solana-final`).
+
 Status: DRAFT, waiting for owner review
 Owner: rendyyku (Phantom Intelligence)
 Date: 2026-11-19

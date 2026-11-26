@@ -1,5 +1,7 @@
 # HADES Phase 2: Three Heads (Solana, Hyperliquid, Polymarket) + Paper Copy
 
+Status: superseded by 2026-11-27-hades-early-signals-design.md (code kept at tag `hades-solana-final`).
+
 Status: draft, awaiting owner approval. Date: 2026-11-20.
 
 ## 1. Intent

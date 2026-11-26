@@ -24,3 +24,5 @@ docs/architecture/*.finalize.json
 docs/architecture/*.finalize-summary.json
 docs/architecture/*.browser-check.json
 docs/architecture/*.delivery.json
+engine/uv.lock
+reports/
